@@ -19,6 +19,7 @@ import (
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
 	"backend/internal/provider/runway"
+	"backend/internal/provider/ycy"
 	"backend/internal/repo"
 	"backend/internal/service"
 	"backend/internal/storage"
@@ -122,8 +123,15 @@ func NewApp(ctx context.Context) (*App, error) {
 	kreaClient := krea.NewClient("")
 	imagineClient := imagine.NewClient("")
 	grokClient := grok.NewClient("")
-	customClient := custom.NewClient()
-	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, customClient, rustfsClient)
+
+	// Build upstream adapter registry for user-configured formats
+	upstreamAdapters := map[string]service.UpstreamAdapter{
+		"openai": custom.NewAdapter(),
+		"ycy":    ycy.NewAdapter(),
+		// Future formats registered here with one line each
+	}
+
+	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, upstreamAdapters, rustfsClient)
 	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
 	showcaseSvc := service.NewShowcaseService(showcaseRepo)
 	adminReadSvc := service.NewAdminReadService(cfg, userRepo, modelRepo, eventRepo, siteRepo, tokenRepo, cdkRepo, rustfsClient)

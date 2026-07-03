@@ -2,23 +2,23 @@ package service
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
+	"backend/internal/provider/grok"
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
-	"backend/internal/provider/grok"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 
@@ -34,6 +34,7 @@ var validTokenPools = map[string]string{
 	"krea":     "krea",
 	"imagine":  "imagine",
 	"grok":     "grok",
+	"ycy":      "ycy",
 	"custom":   "custom",
 }
 
@@ -890,7 +891,6 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 	return item, nil
 }
 
-
 func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1062,6 +1062,105 @@ func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey,
 		if updated, uerr := s.tokens.Update(ctx, "custom", tokenID, patch); uerr == nil {
 			item = updated
 		}
+	}
+	return item, nil
+}
+
+// ImportYCYAccount mirrors ImportCustomAccount for the YCY protocol. It stores
+// the API key in pool="ycy" and keeps routing metadata (base_url/models) on the
+// account, so scheduling can stay identical to custom upstream accounts.
+func (s *TokenService) ImportYCYAccount(ctx context.Context, baseURL, apiKey, models, name string, weight, concurrency int, tokenID string) (*model.TokenAccount, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	apiKey = strings.TrimSpace(apiKey)
+	if strings.TrimSpace(tokenID) != "" {
+		if _, gerr := s.tokens.Get(ctx, "ycy", tokenID); gerr != nil {
+			return nil, gerr
+		}
+		if baseURL == "" {
+			return nil, errors.New("base_url required")
+		}
+		meta := datatypes.JSONMap{"base_url": baseURL}
+		if m := strings.TrimSpace(models); m != "" {
+			meta["models"] = m
+		}
+		patch := map[string]any{"meta": meta, "weight": weight, "concurrency": concurrency, "account_email": strings.TrimSpace(name)}
+		if apiKey != "" {
+			patch["value"] = apiKey
+		}
+		return s.tokens.Update(ctx, "ycy", tokenID, patch)
+	}
+	if baseURL == "" || apiKey == "" {
+		return nil, errors.New("base_url and key required")
+	}
+	meta := datatypes.JSONMap{"base_url": baseURL}
+	if m := strings.TrimSpace(models); m != "" {
+		meta["models"] = m
+	}
+	tokenID = newTokenID("ycy")
+	item, err := s.createToken(ctx, "ycy", tokenID, apiKey, "active", meta)
+	if err != nil {
+		return nil, err
+	}
+	patch := map[string]any{}
+	if strings.TrimSpace(name) != "" {
+		patch["account_email"] = strings.TrimSpace(name)
+	}
+	if weight != 0 {
+		patch["weight"] = weight
+	}
+	if concurrency > 0 {
+		patch["concurrency"] = concurrency
+	}
+	if len(patch) > 0 {
+		if updated, uerr := s.tokens.Update(ctx, "ycy", tokenID, patch); uerr == nil {
+			item = updated
+		}
+	}
+	return item, nil
+}
+
+// ImportCustomAccountWithAdapter is the new version that accepts adapter_type.
+// It wraps ImportCustomAccount and adds adapter_type to metadata.
+func (s *TokenService) ImportCustomAccountWithAdapter(ctx context.Context, baseURL, apiKey, models, name string, weight, concurrency int, adapterType, tokenID string) (*model.TokenAccount, error) {
+	item, err := s.ImportCustomAccount(ctx, baseURL, apiKey, models, name, weight, concurrency, tokenID)
+	if err != nil {
+		return nil, err
+	}
+	// Add adapter_type to metadata
+	if adapterType != "" {
+		meta := cloneJSONMap(item.Meta)
+		if meta == nil {
+			meta = datatypes.JSONMap{}
+		}
+		meta["adapter_type"] = adapterType
+		updated, uerr := s.tokens.Update(ctx, "custom", item.ID, map[string]any{"meta": meta})
+		if uerr != nil {
+			return item, nil // Return original if update fails
+		}
+		return updated, nil
+	}
+	return item, nil
+}
+
+// ImportYCYAccountWithAdapter is the new version that accepts adapter_type.
+// It wraps ImportYCYAccount and adds adapter_type to metadata.
+func (s *TokenService) ImportYCYAccountWithAdapter(ctx context.Context, baseURL, apiKey, models, name string, weight, concurrency int, adapterType, tokenID string) (*model.TokenAccount, error) {
+	item, err := s.ImportYCYAccount(ctx, baseURL, apiKey, models, name, weight, concurrency, tokenID)
+	if err != nil {
+		return nil, err
+	}
+	// Add adapter_type to metadata
+	if adapterType != "" {
+		meta := cloneJSONMap(item.Meta)
+		if meta == nil {
+			meta = datatypes.JSONMap{}
+		}
+		meta["adapter_type"] = adapterType
+		updated, uerr := s.tokens.Update(ctx, "ycy", item.ID, map[string]any{"meta": meta})
+		if uerr != nil {
+			return item, nil // Return original if update fails
+		}
+		return updated, nil
 	}
 	return item, nil
 }
@@ -1532,8 +1631,8 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 	quotaAt, _ := jsonMapInt(item.Meta, "cached_quota_at")
 	typeLabel := poolToType(item.Pool)
 	return map[string]any{
-		"supported":       typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "grok",
-		"remaining":       valueOrNil((typeLabel == "openai" || typeLabel == "runway" || typeLabel == "grok") && hasRemaining, remaining),
+		"supported":       typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "ycy",
+		"remaining":       valueOrNil((typeLabel == "openai" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "ycy") && hasRemaining, remaining),
 		"total":           nil,
 		"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
 		"quota_cached_at": valueOrNil(quotaAt != 0, quotaAt),
@@ -1644,7 +1743,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 	if item.Meta != nil {
 		teamID = strings.TrimSpace(stringValue(item.Meta["team_id"]))
 	}
-	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok"
+	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok" || typeLabel == "ycy"
 	return map[string]any{
 		"id":                item.ID,
 		"pool":              item.Pool,
@@ -1830,6 +1929,9 @@ func newTokenID(pool string) string {
 	}
 	if pool == "imagine" {
 		prefix = "IM"
+	}
+	if pool == "ycy" {
+		prefix = "YC"
 	}
 	return prefix + randomUpper(10)
 }

@@ -3,13 +3,19 @@ import { ref, onMounted } from 'vue'
 import { api, jsonBody } from '../api'
 import Icon from './Icon.vue'
 
-const props = defineProps({ account: { type: Object, default: null } }) // edit mode when set
+const props = defineProps({
+  account: { type: Object, default: null }, // edit mode when set
+  mode: { type: String, default: 'custom' },
+})
 const emit = defineEmits(['close', 'imported'])
 
 const isEdit = !!props.account
+const providerMode = props.mode === 'ycy' ? 'ycy' : 'custom'
+const isYCY = providerMode === 'ycy'
 const name = ref(props.account?.email || '')
-const baseUrl = ref(props.account?.base_url || '')
+const baseUrl = ref(props.account?.base_url || (isYCY ? 'https://ycyapi.cn' : ''))
 const key = ref('')            // edit: blank = keep existing key
+const adapterType = ref(props.account?.adapter_type || (isYCY ? 'ycy' : 'openai')) // NEW: adapter type
 const allModels = ref([])      // existing models to pick from
 const selected = ref(props.account?.models ? String(props.account.models).split(',').map((x) => x.trim()).filter(Boolean) : [])
 const weight = ref(Number(props.account?.weight) || 0)
@@ -21,7 +27,9 @@ const submitting = ref(false)
 onMounted(async () => {
   try {
     const r = await api('/managed-models')
-    allModels.value = (r.data?.data || []).map((m) => ({ id: m.id, type: m.type }))
+    allModels.value = (r.data?.data || [])
+      .filter((m) => !isYCY || m.type === 'video')
+      .map((m) => ({ id: m.id, type: m.type }))
   } catch (_) {}
 })
 
@@ -37,7 +45,8 @@ async function submit() {
   }
   submitting.value = true; status.value = ''; isError.value = false
   try {
-    const r = await api('/tokens/import-custom-account', jsonBody('POST', {
+    const endpoint = isYCY ? '/tokens/import-ycy-account' : '/tokens/import-custom-account'
+    const r = await api(endpoint, jsonBody('POST', {
       id: isEdit ? props.account.id : undefined,
       name: name.value.trim(),
       base_url: baseUrl.value.trim(),
@@ -45,6 +54,7 @@ async function submit() {
       models: selected.value.join(','),
       weight: Number(weight.value) || 0,
       concurrency: Number(concurrency.value) || 1,
+      adapter_type: adapterType.value, // NEW: include adapter type
     }))
     if (r.ok) {
       status.value = isEdit ? '✓ 已保存' : '✓ 已添加上游'; emit('imported')
@@ -65,13 +75,16 @@ async function submit() {
        @click.self="emit('close')">
     <div class="card !shadow-xl mt-14 mb-14 w-full max-w-lg">
       <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
-        <h2 class="text-sm font-semibold">{{ isEdit ? '编辑上游' : '添加上游(自定义 OpenAI 兼容)' }}</h2>
+        <h2 class="text-sm font-semibold">{{ isYCY ? (isEdit ? '编辑 YCY 上游' : '添加 YCY 上游') : (isEdit ? '编辑上游' : '添加上游(自定义 OpenAI 兼容)') }}</h2>
         <button @click="emit('close')" class="text-slate-400 hover:text-slate-700 transition-colors">
           <Icon name="close" class="w-5 h-5" />
         </button>
       </div>
       <div class="p-5 space-y-3">
-        <p class="text-xs text-slate-500 leading-relaxed">
+        <p v-if="isYCY" class="text-xs text-slate-500 leading-relaxed">
+          YCY 上游账号使用 YCY 视频协议。填写 Base URL + Key，模型按 id 自动路由；支持的模型留空表示全部视频模型。
+        </p>
+        <p v-else class="text-xs text-slate-500 leading-relaxed">
           上游就是一个账号:填 v1 URL + Key。模型按 <strong class="text-slate-700">id 相同</strong>自动路由 ——
           在「模型管理」加一个 provider=custom、id 与上游一致的模型即可从这个上游调用。调用<strong class="text-slate-700">直连不走代理</strong>。
         </p>
@@ -80,12 +93,22 @@ async function submit() {
           <input v-model="name" class="field" placeholder="例如:我的中转 / xx-api" />
         </div>
         <div>
+          <label class="text-xs text-slate-500">协议格式 <span class="text-rose-500">*</span></label>
+          <select v-model="adapterType" class="field text-xs">
+            <option value="openai">OpenAI Compatible (标准)</option>
+            <option value="ycy">YCY Format (视频专用)</option>
+          </select>
+          <p class="text-[11px] text-slate-400 mt-1">
+            选择上游 API 使用的协议格式。后续新增格式会在此列表显示。
+          </p>
+        </div>
+        <div>
           <label class="text-xs text-slate-500">v1 URL <span class="text-rose-500">*</span></label>
-          <input v-model="baseUrl" class="field font-mono text-xs" placeholder="https://api.example.com(无需 /v1 结尾)" />
+          <input v-model="baseUrl" class="field font-mono text-xs" :placeholder="isYCY ? 'https://ycyapi.cn' : 'https://api.example.com(无需 /v1 结尾)'" />
         </div>
         <div>
           <label class="text-xs text-slate-500">Key <span v-if="!isEdit" class="text-rose-500">*</span><span v-else class="text-white/40">(留空=不改)</span></label>
-          <input v-model="key" class="field font-mono text-xs" :placeholder="isEdit ? '留空保持原 key' : 'sk-...'" />
+          <input v-model="key" class="field font-mono text-xs" :placeholder="isEdit ? '留空保持原 key' : (isYCY ? 'YCY API Key' : 'sk-...')" />
         </div>
         <div>
           <div class="flex items-center justify-between mb-1.5">

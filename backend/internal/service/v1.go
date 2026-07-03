@@ -27,6 +27,7 @@ import (
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
 	"backend/internal/provider/runway"
+	"backend/internal/provider/ycy"
 	"backend/internal/repo"
 	"backend/internal/storage"
 	"gorm.io/gorm"
@@ -77,8 +78,11 @@ type V1Service struct {
 	krea     *krea.Client
 	imagine  *imagine.Client
 	grok     *grok.Client
-	custom   *custom.Client
 	store    *storage.Client
+	// upstreamAdapters maps adapter type (e.g., "openai", "ycy") to its implementation.
+	// User-configured upstream accounts specify their adapter_type in metadata, and
+	// dispatch routes to the corresponding adapter. Replaces the old custom/ycy fields.
+	upstreamAdapters map[string]UpstreamAdapter
 	// refresh re-mints an Adobe access token from its cookie when a request hits a
 	// 401 mid-flight (set via SetRefresh — wired after construction to avoid an
 	// init cycle). nil for deployments without cookie refresh.
@@ -212,26 +216,26 @@ type V1VideoRequest struct {
 	BaseURL string
 }
 
-func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, customClient *custom.Client, store *storage.Client) *V1Service {
+func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, upstreamAdapters map[string]UpstreamAdapter, store *storage.Client) *V1Service {
 	return &V1Service{
-		cfg:      cfg,
-		models:   models,
-		users:    users,
-		events:   events,
-		tokens:   tokens,
-		settings: settings,
-		cgroups:  cgroups,
-		conc:     conc,
-		adobe:    adobeClient,
-		chatgpt:  chatGPTClient,
-		runway:   runwayClient,
-		leonardo: leonardoClient,
-		krea:     kreaClient,
-		imagine:  imagineClient,
-		grok:     grokClient,
-		custom:   customClient,
-		store:    store,
-		inflight: &InflightRegistry{},
+		cfg:              cfg,
+		models:           models,
+		users:            users,
+		events:           events,
+		tokens:           tokens,
+		settings:         settings,
+		cgroups:          cgroups,
+		conc:             conc,
+		adobe:            adobeClient,
+		chatgpt:          chatGPTClient,
+		runway:           runwayClient,
+		leonardo:         leonardoClient,
+		krea:             kreaClient,
+		imagine:          imagineClient,
+		grok:             grokClient,
+		upstreamAdapters: upstreamAdapters,
+		store:            store,
+		inflight:         &InflightRegistry{},
 	}
 }
 
@@ -485,18 +489,23 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			}
 		}
 		imageBytes = b
-	case "custom":
-		b, execErr := s.generateCustomImage(genCtx, eventID, modelItem, in, aspectRatio, resolution)
+	case "upstream":
+		// Unified dispatch for all user-configured upstream adapters (OpenAI, YCY, etc)
+		b, execErr := s.dispatchUpstreamImage(genCtx, eventID, modelItem, in, aspectRatio, resolution)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
 			switch {
-			case errors.Is(execErr, custom.ErrAuth):
+			case errors.Is(execErr, ErrAdapterAuth):
 				return nil, ErrProviderAuth
-			case errors.Is(execErr, custom.ErrQuotaExhausted):
+			case errors.Is(execErr, ErrAdapterQuotaExhausted):
 				return nil, ErrProviderQuota
-			case errors.Is(execErr, custom.ErrTemporaryUpstream):
+			case errors.Is(execErr, ErrAdapterTemporaryUpstream):
 				return nil, ErrProviderTemporary
+			case errors.Is(execErr, ErrNoProviderAccount):
+				return nil, ErrNoProviderAccount
+			case errors.Is(execErr, ErrConcurrencyFull):
+				return nil, ErrConcurrencyFull
 			default:
 				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
 			}
@@ -624,8 +633,8 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 		videoBytes, _, execErr = s.generateRunwayVideo(genCtx, eventID, modelItem, in, aspectRatio, parseDurationSeconds(duration), true)
 	case "grok":
 		videoBytes, _, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), true)
-	case "custom":
-		videoBytes, _, execErr = s.generateCustomVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), true)
+	case "upstream":
+		videoBytes, _, execErr = s.dispatchUpstreamVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), true)
 	default:
 		_ = s.refundIfNeeded(ctx, principal, eventID, price)
 		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider not implemented", 0)
@@ -637,12 +646,14 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 		switch {
 		case errors.Is(execErr, ErrNoProviderAccount):
 			return nil, ErrNoProviderAccount
-		case errors.Is(execErr, adobe.ErrAuth), errors.Is(execErr, runway.ErrAuth), errors.Is(execErr, grok.ErrAuth), errors.Is(execErr, custom.ErrAuth):
+		case errors.Is(execErr, adobe.ErrAuth), errors.Is(execErr, runway.ErrAuth), errors.Is(execErr, grok.ErrAuth), errors.Is(execErr, ErrAdapterAuth):
 			return nil, ErrProviderAuth
-		case errors.Is(execErr, adobe.ErrQuotaExhausted), errors.Is(execErr, runway.ErrQuotaExhausted), errors.Is(execErr, grok.ErrQuotaExhausted), errors.Is(execErr, custom.ErrQuotaExhausted):
+		case errors.Is(execErr, adobe.ErrQuotaExhausted), errors.Is(execErr, runway.ErrQuotaExhausted), errors.Is(execErr, grok.ErrQuotaExhausted), errors.Is(execErr, ErrAdapterQuotaExhausted):
 			return nil, ErrProviderQuota
-		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, custom.ErrTemporaryUpstream):
+		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, ErrAdapterTemporaryUpstream):
 			return nil, ErrProviderTemporary
+		case errors.Is(execErr, ErrConcurrencyFull):
+			return nil, ErrConcurrencyFull
 		default:
 			return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
 		}
@@ -749,8 +760,8 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		_, videoURL, execErr = s.generateRunwayVideo(genCtx, eventID, modelItem, in, aspectRatio, parseDurationSeconds(duration), false)
 	case "grok":
 		_, videoURL, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
-	case "custom":
-		_, videoURL, execErr = s.generateCustomVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
+	case "upstream":
+		_, videoURL, execErr = s.dispatchUpstreamVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
 	default:
 		_ = s.refundIfNeeded(ctx, principal, eventID, price)
 		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider not implemented", 0)
@@ -1036,12 +1047,21 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 		return nil, "", "", "", 0, ErrUnknownModel
 	}
 	// Fail fast before charging — effective provider (custom upstream by id, else native).
-	if eff := s.effectiveProvider(ctx, modelItem); eff == "custom" {
+	if eff := s.effectiveProvider(ctx, modelItem); eff == "custom" || eff == "ycy" {
 		// custom serves this id (effectiveProvider guaranteed it) — precheck ok
 	} else if ok, err := s.hasActiveProviderToken(ctx, eff, "video"); err != nil {
 		return nil, "", "", "", 0, err
 	} else if !ok {
 		return nil, "", "", "", 0, ErrNoProviderAccount
+	}
+	if s.effectiveProvider(ctx, modelItem) == "ycy" {
+		active, err := s.ycyActive(ctx, modelItem.ID)
+		if err != nil {
+			return nil, "", "", "", 0, err
+		}
+		if len(active) == 0 {
+			return nil, "", "", "", 0, ErrNoProviderAccount
+		}
 	}
 	refLimit := modelItem.MaxReferenceImages
 	if refLimit <= 0 {
@@ -1210,6 +1230,19 @@ func imageExtFromBytes(b []byte) string {
 	}
 }
 
+func ycyReferenceImages(inputs []string, limit int) ([]string, error) {
+	refs, err := decodeReferenceImages(inputs, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		mime := contentTypeForExt(imageExtFromBytes(ref))
+		out = append(out, "data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(ref))
+	}
+	return out, nil
+}
+
 // allocateOutput builds the object key (= relative path, user-scoped) and the
 // directly-downloadable URL pointing at this site's /images proxy. Nothing is
 // written here — the bytes are uploaded to RustFS by the caller.
@@ -1285,14 +1318,13 @@ const maxTempDeadAccounts = 3
 //   - 认证失效 auth → refresh the token from its cookie and retry ONCE with the
 //     fresh token; if it still auth-fails (or there's nothing to refresh, e.g.
 //     chatgpt's JWT IS the credential), mark the account and fail over.
-//   - 上游临时 temporary → behavior depends on tempFailover:
-//   - tempFailover=false (default): retry the SAME account up to
+//   - 上游临时 temporary → behavior depends on tempAsDead:
+//   - tempAsDead=false (default): retry the SAME account up to
 //     maxSameAccountAttempts times (not counted); if still failing, STOP
 //     (no fan-out — an upstream-wide blip fails identically everywhere).
-//   - tempFailover=true (adobe): fail over to the next account WITHOUT
-//     penalizing this one (rate-limit/overload isn't the account's fault),
-//     capped at maxTempDeadAccounts accounts so a pool-wide blip can't fan
-//     a single request out across everything.
+//   - tempAsDead=true (adobe): BAN the account (mark dead/disabled) and fail
+//     over to the next account, capped at maxTempDeadAccounts accounts so a
+//     pool-wide blip can't kill everything. Dead accounts don't auto-recover.
 //   - 参数错 / request-level (anything else) → return immediately, no retry, no
 //     account penalty (the account isn't at fault).
 //
@@ -1682,6 +1714,25 @@ func customAccountServes(item model.TokenAccount, modelID string) bool {
 	return false
 }
 
+func ycyAccountServes(item model.TokenAccount, modelID string) bool {
+	if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
+		return false
+	}
+	if item.Meta == nil || strings.TrimSpace(stringValue(item.Meta["base_url"])) == "" {
+		return false
+	}
+	list := strings.TrimSpace(stringValue(item.Meta["models"]))
+	if list == "" {
+		return true
+	}
+	for _, m := range strings.Split(list, ",") {
+		if strings.EqualFold(strings.TrimSpace(m), modelID) {
+			return true
+		}
+	}
+	return false
+}
+
 // customActive returns the custom accounts that serve modelID, ordered by weight
 // (higher first; ties by id) so heavier upstreams are preferred.
 func (s *V1Service) customActive(ctx context.Context, modelID string) ([]model.TokenAccount, error) {
@@ -1699,6 +1750,21 @@ func (s *V1Service) customActive(ctx context.Context, modelID string) ([]model.T
 	return active, nil
 }
 
+func (s *V1Service) ycyActive(ctx context.Context, modelID string) ([]model.TokenAccount, error) {
+	items, err := s.tokens.ListByPool(ctx, "ycy")
+	if err != nil {
+		return nil, err
+	}
+	var active []model.TokenAccount
+	for _, item := range items {
+		if ycyAccountServes(item, modelID) {
+			active = append(active, item)
+		}
+	}
+	s.rotateRoundRobin("ycy", active)
+	return active, nil
+}
+
 // accountConcurrency is the per-account simultaneous-job cap. Custom accounts use
 // their configured Concurrency (default 1); built-in pools use the system value.
 func accountConcurrency(item model.TokenAccount) int {
@@ -1708,14 +1774,285 @@ func accountConcurrency(item model.TokenAccount) int {
 	return 1
 }
 
+// upstreamAdapterType extracts the adapter type from a TokenAccount's metadata.
+// Falls back to inferring from the pool name for legacy accounts without metadata.
+func upstreamAdapterType(acct *model.TokenAccount) string {
+	if acct == nil {
+		return "openai" // default
+	}
+	// Try to read adapter_type from metadata
+	if acct.Meta != nil {
+		if adapterType, ok := acct.Meta["adapter_type"].(string); ok && adapterType != "" {
+			return adapterType
+		}
+	}
+	// Fallback: infer from pool for legacy accounts
+	switch acct.Pool {
+	case "ycy":
+		return "ycy"
+	case "custom":
+		return "openai"
+	default:
+		return "openai" // default to OpenAI-compatible
+	}
+}
+
+// upstreamActive returns active upstream accounts that serve the given model,
+// regardless of adapter type. Combines the old customActive and ycyActive logic.
+func (s *V1Service) upstreamActive(ctx context.Context, modelID string) ([]model.TokenAccount, error) {
+	// Get all custom and ycy accounts
+	var accounts []model.TokenAccount
+	customAccts, err := s.tokens.List(ctx, "custom")
+	if err == nil {
+		accounts = append(accounts, customAccts...)
+	}
+	ycyAccts, err := s.tokens.List(ctx, "ycy")
+	if err == nil {
+		accounts = append(accounts, ycyAccts...)
+	}
+
+	var active []model.TokenAccount
+	for _, acct := range accounts {
+		if acct.Status != "active" {
+			continue
+		}
+		// Check if this account serves the model
+		served := stringSliceValue(acct.Meta["served_models"])
+		if contains(served, modelID) {
+			active = append(active, acct)
+		}
+	}
+
+	// Sort by weight (higher first), then by ID for stable ordering
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].Weight != active[j].Weight {
+			return active[i].Weight > active[j].Weight
+		}
+		return active[i].ID < active[j].ID
+	})
+
+	return active, nil
+}
+
+// dispatchUpstreamImage dispatches an image generation to a user-configured
+// upstream adapter (OpenAI, YCY, etc). Handles account selection, failover,
+// and error mapping.
+func (s *V1Service) dispatchUpstreamImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string) ([]byte, error) {
+	refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
+	if err != nil {
+		return nil, err
+	}
+
+	active, err := s.upstreamActive(ctx, modelItem.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(active) == 0 {
+		return nil, ErrNoProviderAccount
+	}
+
+	size := upstreamSize(aspectRatio, resolution)
+	quality := upstreamQuality(resolution)
+	upstreamModel := modelItem.UpstreamModel
+	if upstreamModel == "" {
+		upstreamModel = modelItem.ID
+	}
+
+	var lastErr error
+	busy := 0
+	for _, acct := range active {
+		if !s.acctAcquire(ctx, acct.ID, eventID, accountConcurrency(acct)) {
+			busy++
+			continue
+		}
+
+		var data []byte
+		done, failover := func() (bool, bool) {
+			defer s.acctRelease(ctx, acct.ID, eventID)
+			_ = s.events.SetAccount(ctx, eventID, acct.ID)
+			_ = s.tokens.TouchLastUsed(ctx, acct.ID)
+
+			// Get the adapter for this account
+			adapterType := upstreamAdapterType(&acct)
+			adapter, ok := s.upstreamAdapters[adapterType]
+			if !ok {
+				lastErr = fmt.Errorf("unknown adapter type: %s", adapterType)
+				return false, true // fail over to next account
+			}
+
+			baseURL := stringValue(acct.Meta["base_url"])
+			d, genErr := adapter.GenerateImage(ctx, baseURL, acct.Value, upstreamModel, in.Prompt, size, quality, refs)
+			if genErr == nil {
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{
+					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
+				})
+				data = d
+				return true, false
+			}
+
+			lastErr = genErr
+			// Map adapter errors to failover decisions
+			switch {
+			case errors.Is(genErr, ErrAdapterAuth):
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{"status": "disabled", "fails": gorm.Expr("fails + 1")})
+				return false, true // fail over
+			case errors.Is(genErr, ErrAdapterQuotaExhausted):
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{"status": "quota", "fails": gorm.Expr("fails + 1")})
+				return false, true // fail over
+			case errors.Is(genErr, ErrAdapterTemporaryUpstream):
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{"fails": gorm.Expr("fails + 1")})
+				return false, true // fail over on temporary errors
+			default:
+				return false, false // permanent error, don't fail over
+			}
+		}()
+
+		if done {
+			return data, nil
+		}
+		if !failover {
+			return nil, lastErr
+		}
+	}
+
+	if busy == len(active) {
+		return nil, ErrConcurrencyFull
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, ErrNoProviderAccount
+}
+
+// dispatchUpstreamVideo dispatches a video generation to a user-configured
+// upstream adapter. Similar to dispatchUpstreamImage but for video.
+func (s *V1Service) dispatchUpstreamVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, duration int, downloadResult bool) ([]byte, string, error) {
+	refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
+	if err != nil {
+		return nil, "", err
+	}
+
+	active, err := s.upstreamActive(ctx, modelItem.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(active) == 0 {
+		return nil, "", ErrNoProviderAccount
+	}
+
+	size := upstreamSize(aspectRatio, resolution)
+	upstreamModel := modelItem.UpstreamModel
+	if upstreamModel == "" {
+		upstreamModel = modelItem.ID
+	}
+
+	var lastErr error
+	busy := 0
+	for _, acct := range active {
+		if !s.acctAcquire(ctx, acct.ID, eventID, accountConcurrency(acct)) {
+			busy++
+			continue
+		}
+
+		var videoBytes []byte
+		var contentURL string
+		done, failover := func() (bool, bool) {
+			defer s.acctRelease(ctx, acct.ID, eventID)
+			_ = s.events.SetAccount(ctx, eventID, acct.ID)
+			_ = s.tokens.TouchLastUsed(ctx, acct.ID)
+
+			// Get the adapter for this account
+			adapterType := upstreamAdapterType(&acct)
+			adapter, ok := s.upstreamAdapters[adapterType]
+			if !ok {
+				lastErr = fmt.Errorf("unknown adapter type: %s", adapterType)
+				return false, true
+			}
+
+			baseURL := stringValue(acct.Meta["base_url"])
+			vb, url, genErr := adapter.GenerateVideo(ctx, baseURL, acct.Value, upstreamModel, in.Prompt, size, duration, refs, downloadResult)
+			if genErr == nil {
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{
+					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
+				})
+				videoBytes = vb
+				contentURL = url
+				return true, false
+			}
+
+			lastErr = genErr
+			switch {
+			case errors.Is(genErr, ErrAdapterAuth):
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{"status": "disabled", "fails": gorm.Expr("fails + 1")})
+				return false, true
+			case errors.Is(genErr, ErrAdapterQuotaExhausted):
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{"status": "quota", "fails": gorm.Expr("fails + 1")})
+				return false, true
+			case errors.Is(genErr, ErrAdapterTemporaryUpstream):
+				_, _ = s.tokens.Update(ctx, acct.Pool, acct.ID, map[string]any{"fails": gorm.Expr("fails + 1")})
+				return false, true
+			default:
+				return false, false
+			}
+		}()
+
+		if done {
+			return videoBytes, contentURL, nil
+		}
+		if !failover {
+			return nil, "", lastErr
+		}
+	}
+
+	if busy == len(active) {
+		return nil, "", ErrConcurrencyFull
+	}
+	if lastErr != nil {
+		return nil, "", lastErr
+	}
+	return nil, "", ErrNoProviderAccount
+}
+
+// Helper: check if a string slice contains a value
+func contains(slice []string, val string) bool {
+	for _, item := range slice {
+		if item == val {
+			return true
+		}
+	}
+	return false
+}
+
+// Helper: extract string slice from metadata value
+func stringSliceValue(v interface{}) []string {
+	if v == nil {
+		return nil
+	}
+	switch x := v.(type) {
+	case []string:
+		return x
+	case []interface{}:
+		var result []string
+		for _, item := range x {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
 // effectiveProvider routes a model to the "custom" upstream whenever a custom
 // account declares it serves that model id (id-based override of the model's
 // native provider) — so an upstream can take over any model by matching its id.
 // Otherwise the model's own provider is used.
 func (s *V1Service) effectiveProvider(ctx context.Context, modelItem *model.ModelConfig) string {
-	if s.custom != nil {
-		if active, err := s.customActive(ctx, modelItem.ID); err == nil && len(active) > 0 {
-			return "custom"
+	// Check if any upstream adapter (custom/ycy/etc) serves this model
+	if active, err := s.upstreamActive(ctx, modelItem.ID); err == nil && len(active) > 0 {
+		return "upstream" // unified upstream dispatch
+	}
 		}
 	}
 	return modelItem.Provider
@@ -1839,6 +2176,85 @@ func (s *V1Service) generateCustomVideo(ctx context.Context, eventID string, mod
 				s.markTokenFailure(ctx, "custom", token, "video", false, true)
 				return false, true
 			case errors.Is(genErr, custom.ErrTemporaryUpstream):
+				return false, true
+			default:
+				return false, false
+			}
+		}()
+		if done {
+			return data, videoURL, nil
+		}
+		if failover {
+			continue
+		}
+		return nil, "", lastErr
+	}
+	if lastErr == nil {
+		if busy > 0 {
+			return nil, "", ErrConcurrencyFull
+		}
+		lastErr = ErrProviderExecution
+	}
+	return nil, "", lastErr
+}
+
+// generateYCYVideo forwards a video generation to the YCY upstream. YCY reuses
+// the existing token-management flow: pool="ycy" stores the API key, while the
+// base URL comes from config (with an optional per-token override in meta).
+func (s *V1Service) generateYCYVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
+	if s.ycy == nil {
+		return nil, "", errors.New("ycy client not configured")
+	}
+	refs, err := ycyReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
+	if err != nil {
+		return nil, "", err
+	}
+	active, err := s.ycyActive(ctx, modelItem.ID)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(active) == 0 {
+		return nil, "", ErrNoProviderAccount
+	}
+	var lastErr error
+	var videoURL string
+	busy := 0
+	for _, token := range active {
+		if !s.acctAcquire(ctx, token.ID, eventID, accountConcurrency(token)) {
+			busy++
+			continue
+		}
+		var data []byte
+		done, failover := func() (bool, bool) {
+			defer s.acctRelease(ctx, token.ID, eventID)
+			_ = s.events.SetAccount(ctx, eventID, token.ID)
+			_ = s.tokens.TouchLastUsed(ctx, token.ID)
+			baseURL := strings.TrimSpace(stringValue(token.Meta["base_url"]))
+			if baseURL == "" {
+				baseURL = strings.TrimSpace(s.cfg.YCYBaseURL)
+			}
+			if baseURL == "" {
+				lastErr = errors.New("ycy base_url not configured")
+				return false, false
+			}
+			d, url, genErr := s.ycy.GenerateVideo(ctx, baseURL, token.Value, modelItem.ID, in.Prompt, aspectRatio, refs, downloadResult)
+			if genErr == nil {
+				_, _ = s.tokens.Update(ctx, "ycy", token.ID, map[string]any{
+					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
+				})
+				data = d
+				videoURL = url
+				return true, false
+			}
+			lastErr = genErr
+			switch {
+			case errors.Is(genErr, ycy.ErrAuth):
+				s.markTokenFailure(ctx, "ycy", token, "video", true, false)
+				return false, true
+			case errors.Is(genErr, ycy.ErrQuotaExhausted):
+				s.markTokenFailure(ctx, "ycy", token, "video", false, true)
+				return false, true
+			case errors.Is(genErr, ycy.ErrTemporaryUpstream):
 				return false, true
 			default:
 				return false, false
