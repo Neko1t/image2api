@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 
-	"backend/internal/service"
+	"backend/internal/adapter"
 )
 
-// Adapter wraps the existing custom.Client to implement service.UpstreamAdapter.
+// Adapter wraps the existing custom.Client to implement adapter.UpstreamAdapter.
 // It adapts OpenAI-compatible upstream APIs (image and video generation) to the
 // unified adapter interface.
 type Adapter struct {
@@ -20,7 +20,7 @@ func NewAdapter() *Adapter {
 	return &Adapter{Client: NewClient()}
 }
 
-// GenerateImage implements service.ImageAdapter by calling the OpenAI-compatible
+// GenerateImage implements adapter.ImageAdapter by calling the OpenAI-compatible
 // /v1/images/generations or /v1/images/edits endpoint.
 func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte) ([]byte, error) {
 	imageBytes, err := a.Client.GenerateImage(ctx, baseURL, apiKey, upstreamModel, prompt, size, quality, refs)
@@ -30,7 +30,7 @@ func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamMo
 	return imageBytes, nil
 }
 
-// GenerateVideo implements service.VideoAdapter by calling the OpenAI Sora-style
+// GenerateVideo implements adapter.VideoAdapter by calling the OpenAI Sora-style
 // async video API: POST /v1/videos → poll /v1/videos/{id} → GET /v1/videos/{id}/content.
 func (a *Adapter) GenerateVideo(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size string, duration int, refs [][]byte, downloadResult bool) ([]byte, string, error) {
 	// Note: custom.Client.GenerateVideo expects duration in seconds as an int,
@@ -43,7 +43,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, baseURL, apiKey, upstreamMo
 	return videoBytes, contentURL, nil
 }
 
-// mapAdapterError converts custom package errors to service.ErrAdapter* sentinels
+// mapAdapterError converts custom package errors to adapter.ErrAdapter* sentinels
 // for uniform error handling in the service layer.
 func mapAdapterError(err error) error {
 	if err == nil {
@@ -51,13 +51,13 @@ func mapAdapterError(err error) error {
 	}
 	switch {
 	case errors.Is(err, ErrAuth):
-		return fmt.Errorf("%w: %v", service.ErrAdapterAuth, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterAuth, err)
 	case errors.Is(err, ErrQuotaExhausted):
-		return fmt.Errorf("%w: %v", service.ErrAdapterQuotaExhausted, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterQuotaExhausted, err)
 	case errors.Is(err, ErrTemporaryUpstream):
-		return fmt.Errorf("%w: %v", service.ErrAdapterTemporaryUpstream, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterTemporaryUpstream, err)
 	default:
 		// Unknown errors are treated as temporary by default (safer for failover)
-		return fmt.Errorf("%w: %v", service.ErrAdapterTemporaryUpstream, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterTemporaryUpstream, err)
 	}
 }

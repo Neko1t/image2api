@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# # syntax=docker/dockerfile:1
 
 # --- Stage 1: build the Go binary from source ---
 FROM golang:1.26-alpine AS build

@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"backend/internal/adapter"
 	"backend/internal/config"
 	"backend/internal/http/handler"
 	"backend/internal/http/router"
@@ -125,7 +126,7 @@ func NewApp(ctx context.Context) (*App, error) {
 	grokClient := grok.NewClient("")
 
 	// Build upstream adapter registry for user-configured formats
-	upstreamAdapters := map[string]service.UpstreamAdapter{
+	upstreamAdapters := map[string]adapter.UpstreamAdapter{
 		"openai": custom.NewAdapter(),
 		"ycy":    ycy.NewAdapter(),
 		// Future formats registered here with one line each

@@ -8,10 +8,10 @@ import (
 
 	nanoid "github.com/matoous/go-nanoid/v2"
 
-	"backend/internal/service"
+	"backend/internal/adapter"
 )
 
-// Adapter wraps the existing ycy.Client to implement service.UpstreamAdapter.
+// Adapter wraps the existing ycy.Client to implement adapter.UpstreamAdapter.
 // YCY currently only supports video generation and expects reference images as
 // base64 data-URIs rather than URLs.
 type Adapter struct {
@@ -25,13 +25,13 @@ func NewAdapter() *Adapter {
 	}
 }
 
-// GenerateImage implements service.ImageAdapter but YCY does not support image
+// GenerateImage implements adapter.ImageAdapter but YCY does not support image
 // generation, so this always returns ErrAdapterUnsupported.
 func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte) ([]byte, error) {
-	return nil, service.ErrAdapterUnsupported
+	return nil, adapter.ErrAdapterUnsupported
 }
 
-// GenerateVideo implements service.VideoAdapter by calling the YCY video API.
+// GenerateVideo implements adapter.VideoAdapter by calling the YCY video API.
 // YCY expects reference images as base64 data-URIs (not URLs), so this adapter
 // converts the byte arrays to data-URI format.
 func (a *Adapter) GenerateVideo(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size string, duration int, refs [][]byte, downloadResult bool) ([]byte, string, error) {
@@ -121,19 +121,19 @@ func randomID(n int) string {
 	return id
 }
 
-// mapAdapterError converts ycy package errors to service.ErrAdapter* sentinels.
+// mapAdapterError converts ycy package errors to adapter.ErrAdapter* sentinels.
 func mapAdapterError(err error) error {
 	if err == nil {
 		return nil
 	}
 	switch {
 	case errors.Is(err, ErrAuth):
-		return fmt.Errorf("%w: %v", service.ErrAdapterAuth, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterAuth, err)
 	case errors.Is(err, ErrQuotaExhausted):
-		return fmt.Errorf("%w: %v", service.ErrAdapterQuotaExhausted, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterQuotaExhausted, err)
 	case errors.Is(err, ErrTemporaryUpstream):
-		return fmt.Errorf("%w: %v", service.ErrAdapterTemporaryUpstream, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterTemporaryUpstream, err)
 	default:
-		return fmt.Errorf("%w: %v", service.ErrAdapterTemporaryUpstream, err)
+		return fmt.Errorf("%w: %v", adapter.ErrAdapterTemporaryUpstream, err)
 	}
 }

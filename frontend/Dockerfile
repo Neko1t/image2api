@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# # syntax=docker/dockerfile:1
 # Frontend is open-source: built from source inside the image, then served by
 # nginx (HTTP only on :2000) which also reverse-proxies the API. TLS + domain are
 # handled by the user's own reverse proxy in front of this container.
