@@ -38,6 +38,22 @@ func (h *UserGenerationHandler) MyImages(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": items})
 }
 
+// DeleteMyFile removes ONE of the caller's own generated files (plus its
+// thumbnail) and blanks the log rows referencing it, so the 画图台 grid and
+// 创作记录 gallery stop showing it. ?file= is the storage key (owner/name).
+func (h *UserGenerationHandler) DeleteMyFile(c *gin.Context) {
+	user := currentUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
+		return
+	}
+	if err := h.admin.DeleteOwnedFile(c.Request.Context(), service.OwnerDir(user), c.Query("file")); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 func (h *UserGenerationHandler) Generate(c *gin.Context) {
 	user := currentUser(c)
 	if user == nil {
@@ -52,6 +68,7 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 		Resolution      string   `json:"resolution"`
 		Duration        string   `json:"duration"`
 		ReferenceImages []string `json:"reference_images"`
+		DeAI            bool     `json:"deai"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
@@ -65,12 +82,13 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 		Resolution:      body.Resolution,
 		Duration:        body.Duration,
 		ReferenceImages: body.ReferenceImages,
+		DeAI:            body.DeAI,
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrUnknownModel):
 			c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
-		case errors.Is(err, service.ErrUnsupportedParams):
+		case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
 			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		case errors.Is(err, service.ErrInsufficientFunds):
 			c.JSON(http.StatusPaymentRequired, gin.H{"detail": "积分不足"})
@@ -114,6 +132,7 @@ func (h *UserGenerationHandler) Test(c *gin.Context) {
 		Resolution      string   `json:"resolution"`
 		Duration        string   `json:"duration"`
 		ReferenceImages []string `json:"reference_images"`
+		AccountID       string   `json:"account_id"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
@@ -127,12 +146,13 @@ func (h *UserGenerationHandler) Test(c *gin.Context) {
 		Resolution:      body.Resolution,
 		Duration:        body.Duration,
 		ReferenceImages: body.ReferenceImages,
+		AccountID:       body.AccountID,
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrUnknownModel):
 			c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
-		case errors.Is(err, service.ErrUnsupportedParams):
+		case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
 			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		case errors.Is(err, service.ErrProviderQuota):
 			c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
@@ -206,7 +226,28 @@ func (h *UserGenerationHandler) Logs(c *gin.Context) {
 	// rows with real media (success + stored file), not failed/pending events.
 	hasFile := c.Query("has_file") == "1" || c.Query("has_file") == "true"
 
-	items, total, stats, err := h.admin.Logs(c.Request.Context(), limit, offset, kind, status, statuses, nil, userID, excludeSource, source, hasFile)
+	// Media views hide homepage showcase files — those belong to the public
+	// landing page, not to the caller's personal works. Galleries imply it via
+	// has_file; the 画图台 grid opts in with exclude_showcase=1.
+	excludeShowcase := hasFile || c.Query("exclude_showcase") == "1"
+	// media=1 (画图台 grid): only pending rows or rows with a stored file, so a
+	// deleted work's blanked row doesn't consume one of the grid's slots.
+	mediaOnly := c.Query("media") == "1"
+	// ?user= — admin-only 用户搜索 (the 日志管理 page with scope=all). Ignored for
+	// normal users, whose rows are already pinned to their own userID.
+	var userIDs []string
+	if term := strings.TrimSpace(c.Query("user")); term != "" && userID == "" {
+		ids, uerr := h.admin.MatchUserIDs(c.Request.Context(), term)
+		if uerr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
+			return
+		}
+		if len(ids) == 0 {
+			ids = []string{"__no_match__"}
+		}
+		userIDs = ids
+	}
+	items, total, stats, err := h.admin.Logs(c.Request.Context(), limit, offset, kind, status, statuses, nil, userID, userIDs, strings.TrimSpace(c.Query("q")), excludeSource, source, hasFile, excludeShowcase, mediaOnly)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
 		return
@@ -225,6 +266,11 @@ func (h *UserGenerationHandler) Logs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
 		return
 	}
+	modelByID, err := h.admin.ModelNameMap(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
+		return
+	}
 
 	out := make([]gin.H, 0, len(items))
 	for _, item := range items {
@@ -236,30 +282,39 @@ func (h *UserGenerationHandler) Logs(c *gin.Context) {
 		} else {
 			userName = item.UserID
 		}
-		var accountName any
-		if item.AccountID != "" {
-			if label, ok := accountByID[item.AccountID]; ok {
-				accountName = label
-			} else {
-				accountName = item.AccountID
+		// Provider account identity is admin-only: normal users must not see
+		// which upstream account (email) fulfilled their generation.
+		var accountName, accountID any
+		if userID == "" {
+			if item.AccountEmail != "" {
+				// Email stamped on the row itself survives account deletion/re-import.
+				accountName = item.AccountEmail
+			} else if item.AccountID != "" {
+				if label, ok := accountByID[item.AccountID]; ok {
+					accountName = label
+				} else {
+					accountName = item.AccountID
+				}
 			}
+			accountID = emptyStringNil(item.AccountID)
 		}
 		out = append(out, gin.H{
 			"id":         item.ID,
 			"ts":         item.TS.Unix(),
 			"kind":       item.Kind,
 			"status":     item.Status,
-			"model":      item.Model,
+			"model":      displayModelName(modelByID, item.Model),
 			"provider":   item.Provider,
 			"prompt":     item.Prompt,
 			"ratio":      item.Ratio,
 			"resolution": item.Resolution,
 			"duration":   item.Duration,
 			"refs":       item.Refs,
+			"deai":       item.DeAI,
 			"source":     emptyStringNil(item.Source),
 			"user_id":    emptyStringNil(item.UserID),
 			"user_name":  userName,
-			"account_id": emptyStringNil(item.AccountID),
+			"account_id": accountID,
 			"account":    accountName,
 			"cost":       item.Cost,
 			"elapsed_ms": item.ElapsedMS,
@@ -409,6 +464,17 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"description":          "Runway Nano Banana 2 (图/参考图)",
 		},
 		{
+			"id":                   "nano-banana-pro",
+			"provider":             "runway",
+			"type":                 "image",
+			"ratios":               []string{"1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"},
+			"resolutions":          []string{"1K", "2K", "4K"},
+			"image_to_image":       true,
+			"max_reference_images": 6,
+			"reference_mode":       "asset",
+			"description":          "Runway Nano Banana Pro (图/参考图)",
+		},
+		{
 			"id":                   "gemini-veo31",
 			"provider":             "adobe",
 			"type":                 "video",
@@ -446,7 +512,7 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"provider":             "runway",
 			"type":                 "video",
 			"ratios":               []string{"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"},
-			"resolutions":          []string{"2K"},
+			"resolutions":          []string{"720p"},
 			"durations":            []string{"5s", "10s"},
 			"max_reference_images": 1,
 			"reference_mode":       "frame",
@@ -458,7 +524,7 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"type":                 "video",
 			"ratios":               []string{"2:3", "3:2", "1:1", "9:16", "16:9"},
 			"resolutions":          []string{"720p"},
-			"durations":            []string{"6s", "10s", "15s"},
+			"durations":            []string{"6s", "10s"},
 			"max_reference_images": 6,
 			"reference_mode":       "asset",
 			"description":          "Grok Imagine video (文/图生视频)",
@@ -568,6 +634,15 @@ func (h *UserGenerationHandler) publicModels() ([]gin.H, error) {
 			"stub":        false,
 		},
 		{
+			"id":          "nano-banana-pro",
+			"provider":    "runway",
+			"kind":        "image",
+			"ratios":      []string{"1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"},
+			"resolutions": []string{"1K", "2K", "4K"},
+			"description": "Runway Nano Banana Pro",
+			"stub":        false,
+		},
+		{
 			"id":          "gemini-veo31",
 			"provider":    "adobe",
 			"kind":        "video",
@@ -599,7 +674,7 @@ func (h *UserGenerationHandler) publicModels() ([]gin.H, error) {
 			"provider":    "runway",
 			"kind":        "video",
 			"ratios":      []string{"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"},
-			"resolutions": []string{"2K"},
+			"resolutions": []string{"720p"},
 			"description": "Runway Gen-4 Turbo video",
 			"stub":        false,
 		},

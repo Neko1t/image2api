@@ -190,6 +190,10 @@ func (h *AdminWriteHandler) CreateModel(c *gin.Context) {
 	}
 	item, err := h.admin.CreateModel(c.Request.Context(), body)
 	if err != nil {
+		if errors.Is(err, service.ErrModelAliasCollision) {
+			c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
@@ -204,6 +208,10 @@ func (h *AdminWriteHandler) UpdateModel(c *gin.Context) {
 	}
 	item, err := h.admin.UpdateModel(c.Request.Context(), c.Param("model_id"), body)
 	if err != nil {
+		if errors.Is(err, service.ErrModelAliasCollision) {
+			c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}

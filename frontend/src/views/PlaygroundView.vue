@@ -9,6 +9,7 @@ import SelectMenu from '../components/SelectMenu.vue'
 import MediaLightbox from '../components/MediaLightbox.vue'
 import { pointsLabel } from '../credits'
 import { sortResolutions } from '../utils/format'
+import { copyText } from '../utils/clipboard'
 
 const route = useRoute()
 
@@ -27,6 +28,7 @@ const prompt = ref(draft.prompt || '')
 const ratio = ref(draft.ratio || '')
 const resolution = ref(draft.resolution || '')
 const duration = ref(draft.duration || '')
+const deai = ref(draft.deai || false)
 
 watch(mode,       (v) => { draft.mode = v })
 watch(modelId,    (v) => { draft.modelId = v })
@@ -34,6 +36,7 @@ watch(prompt,     (v) => { draft.prompt = v })
 watch(ratio,      (v) => { draft.ratio = v })
 watch(resolution, (v) => { draft.resolution = v })
 watch(duration,   (v) => { draft.duration = v })
+watch(deai,       (v) => { draft.deai = v })
 
 const refImages = ref([])      // [{ name, dataUrl }]
 const fileInput = ref(null)
@@ -68,7 +71,7 @@ const models = computed(() =>
   allModels.value.filter((m) => m.enabled !== false && m.type === mode.value),
 )
 const modelOptions = computed(() =>
-  models.value.map((m) => ({ value: m.id, label: m.name || m.id })),
+  models.value.map((m) => ({ value: m.id, label: m.alias || m.name || m.id })),
 )
 const model = computed(() => allModels.value.find((m) => m.id === modelId.value) || null)
 const familyPreset = computed(() => {
@@ -135,6 +138,13 @@ function tierPrice(normalMap, agentMap, key) {
   }
   return Number(n)
 }
+// 去AI特征 per-tier surcharge (loaded from /deai-pricing; defaults 1/2/3 分).
+const deaiPricing = ref({ enabled: false, price_1k: 1, price_2k: 2, price_4k: 3 })
+const deaiEnabled = computed(() => !!deaiPricing.value.enabled)
+const deaiSurcharge = computed(() => {
+  const key = { '1K': 'price_1k', '2K': 'price_2k', '4K': 'price_4k' }[resolution.value] || 'price_1k'
+  return Number(deaiPricing.value[key] ?? 0)
+})
 const price = computed(() => {
   if (!model.value) return null
   const m = model.value
@@ -144,7 +154,9 @@ const price = computed(() => {
     if (rp == null || dp == null) return null
     return rp + dp
   }
-  return tierPrice(m.prices, m.prices_agent, resolution.value)
+  const base = tierPrice(m.prices, m.prices_agent, resolution.value)
+  if (base == null) return null
+  return base + (deaiEnabled.value && deai.value ? deaiSurcharge.value : 0)
 })
 const priceLabel = computed(() => price.value == null ? '—' : pointsLabel(price.value))
 const canAfford = computed(() => price.value == null || credits.value >= price.value)
@@ -180,16 +192,17 @@ function setMode(m) {
 }
 
 function openPicker() { fileInput.value && fileInput.value.click() }
-// Backend rejects reference images over 8MB (maxReferenceImageBytes). Enforce it
+// Backend rejects reference images over 20MB (maxReferenceImageBytes). Enforce it
 // here at pick time so an oversized image fails fast with a clear message instead
 // of charging + failing upstream after the upload.
-const MAX_REF_BYTES = 8 * 1024 * 1024
+const MAX_REF_BYTES = 20 * 1024 * 1024
 function onFiles(ev) {
   addFiles(Array.from(ev.target.files || []))
   if (ev.target) ev.target.value = ''
 }
 // Shared by the file picker AND drag-and-drop. Filters to images, honors the
-// per-model max + 8MB cap, reads each to a data URL.
+// per-model max + 20MB cap. The preview shows a small downscaled thumbnail;
+// the ORIGINAL file is kept untouched and is what gets uploaded at submit time.
 function addFiles(files) {
   files = files.filter((f) => f && f.type && f.type.startsWith('image/'))
   const room = Math.max(0, maxRefs.value - refImages.value.length)
@@ -198,15 +211,53 @@ function addFiles(files) {
   for (const f of files) {
     if (added >= room) break
     if (f.size > MAX_REF_BYTES) { tooBig.push(f.name); continue }
-    const reader = new FileReader()
-    reader.onload = () => refImages.value.push({ name: f.name, dataUrl: reader.result })
-    reader.readAsDataURL(f)
+    makeThumb(f).then((thumb) => {
+      if (thumb) { refImages.value.push({ name: f.name, file: f, thumb }); return }
+      // thumbnail failed (odd format) — fall back to the full data URL preview
+      const reader = new FileReader()
+      reader.onload = () => refImages.value.push({ name: f.name, file: f, dataUrl: reader.result })
+      reader.readAsDataURL(f)
+    })
     added++
   }
   error.value = tooBig.length
-    ? `图片超过 8MB 已跳过：${tooBig.join('、')}（请压缩后再传）`
+    ? `图片超过 20MB 已跳过：${tooBig.join('、')}（请压缩后再传）`
     : ''
 }
+// Downscale an image blob/file to a small display-only thumbnail so the DOM
+// never holds a multi-MB original just to render an 80px preview. The original
+// bytes are untouched — uploads always use the source file/URL.
+function makeThumb(blob, maxSide = 320) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob)
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height))
+        const w = Math.max(1, Math.round(img.width * scale))
+        const h = Math.max(1, Math.round(img.height * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h)
+        resolve(canvas.toDataURL('image/jpeg', 0.8))
+      } catch {
+        resolve('')
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+    }
+    img.onerror = () => { URL.revokeObjectURL(url); resolve('') }
+    img.src = url
+  })
+}
+
+// URL-backed refs (restored / 加入参考图) preview via the server-generated
+// thumbnail object (url + '.thumb.jpg', ≤512px). The serving route falls back
+// to the original when the thumb is missing, so this is always safe. The plain
+// url remains what gets re-submitted.
+function serverThumb(u) { return u + '.thumb.jpg' }
+
 // Drag-and-drop onto the reference area.
 const dragOver = ref(false)
 function onDrop(ev) {
@@ -236,13 +287,23 @@ function removeRef(i) { refImages.value.splice(i, 1) }
 function restoreRefs(urls) {
   if (!Array.isArray(urls) || !urls.length) return
   if (refImages.value.length) return   // don't clobber refs the user already added
-  refImages.value = urls.map((u) => ({ name: 'ref', url: u }))
+  refImages.value = urls.map((u) => ({ name: 'ref', url: u, thumb: serverThumb(u) }))
 }
 
-// refToBase64 yields the raw base64 the backend expects, from either a freshly
-// uploaded ref (dataUrl) or a restored one (url → fetch). Returns '' on failure.
+// refToBase64 yields the raw base64 the backend expects, from a freshly picked
+// ref (file — the untouched original), a data-URL ref (pasted/frame captures)
+// or a restored one (url → fetch). Returns '' on failure.
 async function refToBase64(r) {
   try {
+    if (r.file) {
+      const dataUrl = await new Promise((res, rej) => {
+        const fr = new FileReader()
+        fr.onload = () => res(fr.result)
+        fr.onerror = rej
+        fr.readAsDataURL(r.file)
+      })
+      return dataUrl.replace(/^data:[^,]*,/, '')
+    }
     if (r.dataUrl) return r.dataUrl.replace(/^data:[^,]*,/, '')
     if (r.url) {
       const blob = await (await fetch(r.url)).blob()
@@ -265,12 +326,50 @@ function flash(msg) {
   toastTimer = setTimeout(() => (toast.value = ''), 1800)
 }
 
+async function copyPrompt(item) {
+  const text = (item && item.prompt) || ''
+  if (!text.trim()) return
+  flash(await copyText(text) ? '指令已复制' : '复制失败')
+}
+
+async function copyImage(url) {
+  try {
+    const blob = await (await fetch(url)).blob()
+    const pngBlob = blob.type === 'image/png'
+      ? blob
+      : await new Promise((resolve, reject) => {
+          createImageBitmap(blob).then((bitmap) => {
+            const canvas = document.createElement('canvas')
+            canvas.width = bitmap.width
+            canvas.height = bitmap.height
+            const ctx = canvas.getContext('2d')
+            if (!ctx) { reject(new Error('no canvas ctx')); return }
+            ctx.drawImage(bitmap, 0, 0)
+            canvas.toBlob((out) => {
+              if (out) resolve(out)
+              else reject(new Error('png convert failed'))
+            }, 'image/png')
+          }).catch(reject)
+        })
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })])
+    flash('图片已复制')
+  } catch {
+    flash('复制失败')
+  }
+}
+
 // ---- generate (concurrent — no lock) ----
 // 生图 can request 1–4 images at once: each is an independent task/charge.
 const count = ref(1)
 const batchCount = computed(() => (mode.value === 'image' ? Math.max(1, Math.min(4, count.value)) : 1))
 
+// Guard against accidental double-clicks: a second run() within 600ms is
+// ignored (each click otherwise fires an independent, charged generation).
+let lastRunAt = 0
 async function run() {
+  const now = Date.now()
+  if (now - lastRunAt < 600) return
+  lastRunAt = now
   if (!modelId.value) { error.value = '请选择模型'; return }
   if (!prompt.value.trim()) { error.value = '请输入提示词'; return }
   if (refsRequired.value && refImages.value.length < 1) {
@@ -298,12 +397,13 @@ async function fireOne() {
   // user edits the form (or fires another batch) while this one runs.
   const task = {
     id: Math.random().toString(36).slice(2, 10),
-    model: modelId.value,
+    model: model.value?.alias || modelId.value,
     kind: mode.value,
     prompt: prompt.value,
     ratio: ratio.value,
     resolution: resolution.value,
     duration: mode.value === 'video' ? duration.value : '',
+    deai: mode.value === 'image' && deaiEnabled.value ? deai.value : false,
     status: 'pending',
     url: '',
     error: '',
@@ -326,6 +426,7 @@ async function fireOne() {
     model: task.model, prompt: task.prompt, ratio: task.ratio, resolution: task.resolution,
   }
   if (task.kind === 'video') payload.duration = task.duration
+  if (task.kind === 'image' && task.deai) payload.deai = true
   if (refsSnapshot.length) {
     const refs = await Promise.all(refsSnapshot.map(refToBase64))
     payload.reference_images = refs.filter(Boolean)
@@ -363,14 +464,14 @@ let prevPending = 0
 async function loadHistory() {
   // Server-side filter: status IN (pending, success), newest 12 — exactly the
   // rows the grid shows, in one query (no client over-fetch).
-  const r = await api('/logs?limit=10&statuses=pending,success&source=user')
+  const r = await api('/logs?limit=10&statuses=pending,success&source=user&exclude_showcase=1&media=1')
   if (!r.ok) return
   history.value = (r.data?.data || [])
     .filter((e) => e.status === 'pending' || e.file)
     .map((e) => ({
       id: 'srv-' + e.id,
       prompt: e.prompt, model: e.model, kind: e.kind,
-      ratio: e.ratio, resolution: e.resolution, duration: e.duration,
+      ratio: e.ratio, resolution: e.resolution, duration: e.duration, deai: !!e.deai,
       status: e.status === 'success' ? 'done' : 'running',
       url: e.file ? generatedUrl(e.file) : '',
       error: '',
@@ -390,6 +491,22 @@ async function loadHistory() {
   prevPending = serverPending.size
 }
 
+// Delete one of my works: remove the stored file (+thumb) server-side, then
+// drop the card locally so it disappears before the next history poll.
+async function deleteItem(item) {
+  if (!item || !item.url) return
+  if (!confirm('确定删除这个作品？删除后不可恢复')) return
+  const rel = (item.url || '').split('?')[0].split('/images/').pop()
+  const r = await api('/my-files?file=' + encodeURIComponent(rel), { method: 'DELETE' })
+  if (r.ok) {
+    tasks.value = tasks.value.filter((t) => t.id !== item.id)
+    history.value = history.value.filter((h) => h.id !== item.id)
+    flash('已删除')
+  } else {
+    flash(r.data?.detail || '删除失败')
+  }
+}
+
 // Click a generated IMAGE → use it as a reference. Single-ref model: replace the
 // existing ref. Multi-ref: append if there's room, else replace the last one.
 function useAsRef(item) {
@@ -397,7 +514,7 @@ function useAsRef(item) {
   if (item.kind === 'video') return
   const cap = maxRefs.value
   if (cap <= 0) { flash('当前模型不支持参考图'); return }
-  const ref = { name: 'ref', url: item.url }
+  const ref = { name: 'ref', url: item.url, thumb: serverThumb(item.url) }
   if (cap === 1) {
     refImages.value = [ref]
   } else if (refImages.value.length >= cap) {
@@ -470,9 +587,10 @@ function onKey(e) { if (e.key === 'Escape') lightbox.value = null }
 
 onMounted(async () => {
   refreshMe()   // pull the latest real balance
-  const [mm, pp] = await Promise.all([api('/managed-models'), api('/video-presets')])
+  const [mm, pp, dp] = await Promise.all([api('/managed-models'), api('/video-presets'), api('/deai-pricing')])
   allModels.value = mm.data?.data || []
   presets.value = pp.data?.data || []
+  if (dp.ok && dp.data) deaiPricing.value = dp.data
   // Pre-fill from query string (?prompt=...&model=...) — used by the home
   // page's example cards to seed the form in one click.
   const qPrompt = String(route.query.prompt || '')
@@ -579,6 +697,20 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 去AI特征 (image only): opt-in post-processing with a per-tier surcharge -->
+      <div v-if="mode === 'image' && deaiEnabled" class="flex items-center justify-between">
+        <label class="text-xs font-medium text-slate-500">
+          去AI特征
+          <span class="text-slate-400 font-normal">(+{{ deaiSurcharge }} 积分)</span>
+        </label>
+        <button type="button" role="switch" :aria-checked="deai" @click="deai = !deai"
+                class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+                :class="deai ? 'bg-slate-900' : 'bg-slate-200'">
+          <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform"
+                :class="deai ? 'translate-x-[18px]' : 'translate-x-0.5'"></span>
+        </button>
+      </div>
+
       <div v-if="mode === 'video' && durations.length > 0">
         <label class="block text-xs font-medium text-slate-500 mb-1.5">时长</label>
         <div class="flex flex-wrap gap-1.5">
@@ -595,7 +727,7 @@ onUnmounted(() => {
         <label class="block text-xs font-medium text-slate-500 mb-1.5">
           参考图
           <span class="text-slate-400 font-normal">
-            (最多 {{ maxRefs }} 张{{ refMode === 'frame' && mode === 'video' ? (maxRefs >= 2 ? ' · 首帧/末帧' : ' · 首帧') : '' }} · 单张 ≤8MB)
+            (最多 {{ maxRefs }} 张{{ refMode === 'frame' && mode === 'video' ? (maxRefs >= 2 ? ' · 首帧/末帧' : ' · 首帧') : '' }} · 单张 ≤20MB)
           </span>
           <span v-if="refsRequired" class="text-rose-500">*</span>
         </label>
@@ -604,7 +736,7 @@ onUnmounted(() => {
              @drop="onDrop" @dragover="onDragOver" @dragleave="onDragLeave">
           <div v-for="(img, i) in refImages" :key="i"
                class="relative w-20 h-20 rounded-lg overflow-hidden border border-slate-200 bg-slate-50 transition-all">
-            <img :src="img.dataUrl || img.url" class="w-full h-full object-cover" />
+            <img :src="img.thumb || img.dataUrl || img.url" class="w-full h-full object-cover" />
             <button type="button" @click="removeRef(i)"
                     class="absolute top-1 right-1 w-5 h-5 rounded-full bg-slate-900/70 text-white hover:bg-rose-500 grid place-items-center disabled:opacity-40 disabled:cursor-not-allowed">
               <Icon name="close" class="w-3 h-3" />
@@ -679,6 +811,10 @@ onUnmounted(() => {
             <!-- hover action: 上参考图. Image → use as reference; video → 末帧设为首帧
                  (only shown when the model supports 首尾帧). Clicking the media zooms. -->
             <div class="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+              <button v-if="item.kind !== 'video'" @click.stop.prevent="copyImage(item.url)" title="复制图片"
+                      class="w-7 h-7 rounded-lg bg-black/50 ring-1 ring-white/10 hover:bg-black/70 text-white grid place-items-center">
+                <Icon name="copy" class="w-3.5 h-3.5" />
+              </button>
               <a :href="item.url" :download="(item.url || '').split('/').pop()" @click.stop title="下载"
                  class="w-7 h-7 rounded-lg bg-black/50 ring-1 ring-white/10 hover:bg-black/70 text-white grid place-items-center">
                 <Icon name="download" class="w-3.5 h-3.5" />
@@ -689,10 +825,16 @@ onUnmounted(() => {
                       class="w-7 h-7 rounded-lg bg-black/50 ring-1 ring-white/10 hover:bg-black/70 text-white grid place-items-center">
                 <Icon name="plus" class="w-3.5 h-3.5" />
               </button>
+              <button @click.stop.prevent="deleteItem(item)" title="删除"
+                      class="w-7 h-7 rounded-lg bg-black/50 ring-1 ring-white/10 hover:bg-rose-600/80 text-white grid place-items-center">
+                <Icon name="trash" class="w-3.5 h-3.5" />
+              </button>
             </div>
             <div class="absolute inset-x-0 bottom-0 p-2.5 pointer-events-none">
-              <div class="pg-cap text-[11px] leading-tight font-medium line-clamp-2" :title="item.prompt">{{ item.prompt }}</div>
-              <div class="pg-cap-sub text-[9px] mt-0.5 font-mono truncate">{{ item.model }}<span v-if="item.elapsed_ms"> · {{ (item.elapsed_ms / 1000).toFixed(1) }}s</span></div>
+              <div class="pg-cap text-[11px] leading-tight font-medium line-clamp-2 transition-colors"
+                   :class="item.prompt ? 'pointer-events-auto cursor-pointer' : ''"
+                   :title="item.prompt ? '点击复制提示词' : ''" @click.stop="copyPrompt(item)">{{ item.prompt }}</div>
+              <div class="pg-cap-sub text-[9px] mt-0.5 font-mono truncate">{{ item.model }}<span v-if="item.deai"> · <span class="text-[#7c3aed]">去AI</span></span><span v-if="item.elapsed_ms"> · {{ (item.elapsed_ms / 1000).toFixed(1) }}s</span></div>
             </div>
           </template>
           <!-- pending / running -->
@@ -744,5 +886,6 @@ onUnmounted(() => {
    The global `.theme-text` remap would otherwise darken them (it turns
    over-image whites dark for the marketing pages), making them unreadable here. */
 .pg-cap { color: #fff !important; }
+.pg-cap.cursor-pointer:hover { color: rgb(255 255 255 / 0.75) !important; }
 .pg-cap-sub { color: rgb(255 255 255 / 0.62) !important; }
 </style>

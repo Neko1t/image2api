@@ -249,12 +249,26 @@ func (s *PaymentService) GetForUser(ctx context.Context, userID, orderID string)
 	return o, nil
 }
 
-func (s *PaymentService) ListByUser(ctx context.Context, userID, status string, limit, offset int) ([]model.Order, int64, error) {
-	return s.orders.ListByUser(ctx, userID, status, limit, offset)
+func (s *PaymentService) ListByUser(ctx context.Context, userID, status, query string, limit, offset int) ([]model.Order, int64, error) {
+	return s.orders.ListByUser(ctx, userID, status, query, limit, offset)
 }
 
-func (s *PaymentService) ListAll(ctx context.Context, status string, limit, offset int) ([]model.Order, int64, error) {
-	return s.orders.List(ctx, status, limit, offset)
+// ListAll — admin order list. A search query also matches 用户名/邮箱: resolve
+// the term to user ids first so "张三" finds that user's orders.
+func (s *PaymentService) ListAll(ctx context.Context, status, query string, limit, offset int) ([]model.Order, int64, error) {
+	var userIDs []string
+	if term := strings.ToLower(strings.TrimSpace(query)); term != "" {
+		if users, err := s.users.List(ctx); err == nil {
+			for _, u := range users {
+				if strings.Contains(strings.ToLower(u.Name), term) ||
+					strings.Contains(strings.ToLower(u.Email), term) ||
+					strings.Contains(strings.ToLower(u.ID), term) {
+					userIDs = append(userIDs, u.ID)
+				}
+			}
+		}
+	}
+	return s.orders.List(ctx, status, query, userIDs, limit, offset)
 }
 
 // UserNames maps user id → display name (name, else email, else id) so the admin

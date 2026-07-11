@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"backend/internal/model"
@@ -29,12 +30,17 @@ func (r *OrderRepository) Update(ctx context.Context, id string, patch map[strin
 }
 
 // ListByUser returns a user's own orders, newest first, with pagination + total.
-func (r *OrderRepository) ListByUser(ctx context.Context, userID, status string, limit, offset int) ([]model.Order, int64, error) {
+// query — server-side search over 订单号 / 支付方式 / 金额 (跨页).
+func (r *OrderRepository) ListByUser(ctx context.Context, userID, status, query string, limit, offset int) ([]model.Order, int64, error) {
 	var out []model.Order
 	var total int64
 	q := r.db.WithContext(ctx).Model(&model.Order{}).Where("user_id = ?", userID)
 	if status != "" {
 		q = q.Where("status = ?", status)
+	}
+	if term := strings.TrimSpace(query); term != "" {
+		like := "%" + term + "%"
+		q = q.Where("(id ILIKE ? OR method ILIKE ? OR CAST(amount AS TEXT) LIKE ?)", like, like, like)
 	}
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -47,12 +53,22 @@ func (r *OrderRepository) ListByUser(ctx context.Context, userID, status string,
 }
 
 // List returns all orders (admin) with optional status filter + pagination.
-func (r *OrderRepository) List(ctx context.Context, status string, limit, offset int) ([]model.Order, int64, error) {
+// query — server-side search over 订单号 / 支付方式 / 金额; userIDs — additionally
+// match orders belonging to these users (resolved from a 用户名 search upstream).
+func (r *OrderRepository) List(ctx context.Context, status, query string, userIDs []string, limit, offset int) ([]model.Order, int64, error) {
 	var out []model.Order
 	var total int64
 	q := r.db.WithContext(ctx).Model(&model.Order{})
 	if status != "" {
 		q = q.Where("status = ?", status)
+	}
+	if term := strings.TrimSpace(query); term != "" {
+		like := "%" + term + "%"
+		if len(userIDs) > 0 {
+			q = q.Where("(id ILIKE ? OR method ILIKE ? OR CAST(amount AS TEXT) LIKE ? OR user_id IN ?)", like, like, like, userIDs)
+		} else {
+			q = q.Where("(id ILIKE ? OR method ILIKE ? OR CAST(amount AS TEXT) LIKE ?)", like, like, like)
+		}
 	}
 	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err

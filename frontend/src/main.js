@@ -23,6 +23,8 @@ import ModelsView from './views/ModelsView.vue'
 import AccountsView from './views/AccountsView.vue'
 import UsersView from './views/UsersView.vue'
 import ConcurrencyView from './views/ConcurrencyView.vue'
+import BannedWordsView from './views/BannedWordsView.vue'
+import BannedWordHitsView from './views/BannedWordHitsView.vue'
 import CdksView from './views/CdksView.vue'
 import InvitesAdminView from './views/InvitesAdminView.vue'
 import ImagesView from './views/ImagesView.vue'
@@ -56,10 +58,12 @@ const routes = [
       { path: 'accounts', component: AccountsView, meta: { label: '账号管理' } },
       { path: 'users',    component: UsersView,    meta: { label: '用户管理' } },
       { path: 'concurrency', component: ConcurrencyView, meta: { label: '并发分组' } },
+      { path: 'banned-words', component: BannedWordsView, meta: { label: '违禁词列表' } },
+      { path: 'banned-word-hits', component: BannedWordHitsView, meta: { label: '违禁词触发列表' } },
       { path: 'orders', component: AdminOrdersView, meta: { label: '订单管理' } },
       { path: 'cdks',     component: CdksView,     meta: { label: '兑换码管理' } },
       { path: 'invites',  component: InvitesAdminView, meta: { label: '邀请日志' } },
-      { path: 'images',   component: ImagesView,   meta: { label: '图片管理' } },
+      { path: 'images',   component: ImagesView,   meta: { label: '作品管理' } },
       { path: 'showcase', component: ShowcaseView, meta: { label: '首页内容' } },
       { path: 'logs',     component: LogsView,     meta: { label: '日志管理' } },
       { path: 'config',   component: ConfigView,   meta: { label: '系统配置' } },

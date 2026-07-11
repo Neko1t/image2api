@@ -22,8 +22,10 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -107,10 +109,11 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 	if token == "" {
 		return unknownBalance("empty token"), nil
 	}
-	client, err := c.newTLSClient()
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err
 	}
+	c.ensureChallenge(ctx, client, token)
 	// gRPC-web empty message frame: 1-byte flag + 4-byte length (both zero).
 	body := []byte{0, 0, 0, 0, 0}
 	req, err := http.NewRequest(http.MethodPost, apiBase+"/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig", strings.NewReader(string(body)))
@@ -189,10 +192,11 @@ func (c *Client) FetchSubscription(ctx context.Context, token string) (*Subscrip
 	if token == "" {
 		return nil, ErrAuth
 	}
-	client, err := c.newTLSClient()
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err
 	}
+	c.ensureChallenge(ctx, client, token)
 	req, err := http.NewRequest(http.MethodGet, apiBase+"/rest/subscriptions", nil)
 	if err != nil {
 		return nil, err
@@ -252,10 +256,11 @@ func (c *Client) FetchSession(ctx context.Context, token string) (email, userID 
 	if token == "" {
 		return "", "", ErrAuth
 	}
-	client, err := c.newTLSClient()
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return "", "", err
 	}
+	c.ensureChallenge(ctx, client, token)
 	req, err := http.NewRequest(http.MethodGet, apiBase+"/api/auth/session", nil)
 	if err != nil {
 		return "", "", err
@@ -291,22 +296,51 @@ func (c *Client) FetchSession(ctx context.Context, token string) (email, userID 
 	return strings.TrimSpace(body.Session.Email), strings.TrimSpace(body.Session.UserID), nil
 }
 
-// statsig challenge constants for the current grok.com web build. They rotate
-// when grok ships a new build; override at runtime via env vars
-// (GROK_STATSIG_HEADER_HEX / GROK_STATSIG_SUFFIX / GROK_STATSIG_TRAILER).
+// grok's x-statsig-id is validated per-session: the 49-byte header is 0x00 plus
+// a 48-byte "seed" published in the homepage <meta name="grok-site-verification">,
+// and the salt embeds a 3-byte "F" the server recomputes from that seed and the
+// page's curve set. Both rotate whenever grok ships a new web build, so hardcoded
+// constants go stale (403 anti-bot). We self-heal: fetch the homepage per session
+// (browser-free, tls-client), derive seed + F, and cache. The static defaults
+// below (env-overridable) are a last-resort fallback if the fetch fails.
 // statsigEpoch is the challenge epoch (2023-05-01 00:00 UTC).
 const (
 	statsigEpoch          = 1682924400
-	defaultStatsigHeader  = "00e1ebcb2cac08f42039de1eb4d8534da581482fd09ccc95e06e3f03a3e9ddde02eb50b70c2efeaec6401f5d9b5ed329d4"
-	defaultStatsigSuffix  = "obfiowerehiring4fa399100100"
+	defaultStatsigHeader  = "00a1adb5012bd32f844f4426c62680d91c6129361eb9459a759710e179a888a99b21678e1f0b1e8952de6a6b3ca019f74b"
+	defaultStatsigSuffix  = "obfiowerehiringd244100f5c28f5c28f5c047ae147ae147b047ae147ae147b0f5c28f5c28f5c00"
 	defaultStatsigTrailer = 3
+	statsigSaltPrefix     = "obfiowerehiring"
+	statsigAnimDuration   = 4096
+	statsigTTL            = 5 * time.Minute
 )
 
 var (
 	statsigHeader  = resolveStatsigHeader()
 	statsigSuffix  = envOr("GROK_STATSIG_SUFFIX", defaultStatsigSuffix)
 	statsigTrailer = resolveStatsigTrailer()
+
+	statsigMetaRe = regexp.MustCompile(`name="grok[^"]*verification"[^>]*content="([^"]+)"`)
+
+	statsigMu    sync.Mutex
+	statsigCache = map[string]statsigChallenge{} // keyed by sso token
 )
+
+// statsigChallenge is a resolved, self-consistent (header, salt) pair for one
+// grok session, derived from the homepage seed + curves.
+type statsigChallenge struct {
+	header    []byte
+	suffix    string
+	trailer   byte
+	fetchedAt time.Time
+}
+
+// statsigCurve is one entry of the per-load curve set injected via the Next.js
+// RSC stream; the server uses it (with the seed) to recompute F.
+type statsigCurve struct {
+	Color  []int `json:"color"`
+	Deg    int   `json:"deg"`
+	Bezier []int `json:"bezier"`
+}
 
 func resolveStatsigHeader() []byte {
 	h := envOr("GROK_STATSIG_HEADER_HEX", defaultStatsigHeader)
@@ -333,19 +367,288 @@ func envOr(key, def string) string {
 	return def
 }
 
+// ensureChallenge refreshes the cached (header, salt) for the session if missing
+// or stale. Any failure is non-fatal: statsigID then falls back to the static
+// defaults. An explicit env override disables dynamic fetching entirely.
+func (c *Client) ensureChallenge(ctx context.Context, client tlsclient.HttpClient, token string) {
+	if token == "" || client == nil {
+		return
+	}
+	if os.Getenv("GROK_STATSIG_HEADER_HEX") != "" || os.Getenv("GROK_STATSIG_SUFFIX") != "" {
+		return
+	}
+	statsigMu.Lock()
+	cur, ok := statsigCache[token]
+	fresh := ok && time.Since(cur.fetchedAt) < statsigTTL
+	statsigMu.Unlock()
+	if fresh {
+		return
+	}
+	ch, err := fetchStatsigChallenge(ctx, client, token)
+	if err != nil {
+		return
+	}
+	statsigMu.Lock()
+	statsigCache[token] = ch
+	statsigMu.Unlock()
+}
+
+// fetchStatsigChallenge does a browser-free homepage GET and derives a
+// self-consistent (header, salt) pair: header = 0x00 + seed, salt = prefix + F.
+func fetchStatsigChallenge(ctx context.Context, client tlsclient.HttpClient, token string) (statsigChallenge, error) {
+	req, err := http.NewRequest(http.MethodGet, apiBase+"/", nil)
+	if err != nil {
+		return statsigChallenge{}, err
+	}
+	req = req.WithContext(ctx)
+	req.Header = http.Header{
+		"accept":            {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+		"accept-language":   {"en-US,en;q=0.9"},
+		"user-agent":        {userAgent},
+		"cookie":            {"sso=" + token + "; sso-rw=" + token},
+		http.HeaderOrderKey: {"accept", "accept-language", "user-agent", "cookie"},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return statsigChallenge{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return statsigChallenge{}, err
+	}
+	html := string(raw)
+
+	mm := statsigMetaRe.FindStringSubmatch(html)
+	if mm == nil {
+		return statsigChallenge{}, errors.New("statsig: seed meta not found")
+	}
+	seed, err := decodeStatsigSeed(mm[1])
+	if err != nil {
+		return statsigChallenge{}, err
+	}
+	curves, err := parseStatsigCurves(html)
+	if err != nil {
+		return statsigChallenge{}, err
+	}
+	tail, err := computeStatsigTail(seed, curves)
+	if err != nil {
+		return statsigChallenge{}, err
+	}
+	header := make([]byte, 0, 49)
+	header = append(header, 0x00)
+	header = append(header, seed...)
+	return statsigChallenge{
+		header:    header,
+		suffix:    statsigSaltPrefix + tail,
+		trailer:   defaultStatsigTrailer,
+		fetchedAt: time.Now(),
+	}, nil
+}
+
+func decodeStatsigSeed(s string) ([]byte, error) {
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil && len(b) == 48 {
+		return b, nil
+	}
+	b, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(s, "="))
+	if err != nil {
+		return nil, fmt.Errorf("statsig: seed decode: %w", err)
+	}
+	if len(b) != 48 {
+		return nil, fmt.Errorf("statsig: seed len %d", len(b))
+	}
+	return b, nil
+}
+
+// parseStatsigCurves extracts the [[{color,deg,bezier}...]...] array from the
+// RSC-escaped homepage HTML (the one immediately followed by color/bezier keys).
+func parseStatsigCurves(html string) ([][]statsigCurve, error) {
+	marker := -1
+	for from := 0; ; {
+		i := strings.Index(html[from:], "curves")
+		if i < 0 {
+			break
+		}
+		i += from
+		end := i + 160
+		if end > len(html) {
+			end = len(html)
+		}
+		w := html[i:end]
+		if strings.Contains(w, "color") && strings.Contains(w, "bezier") {
+			marker = i
+			break
+		}
+		from = i + 6
+	}
+	if marker < 0 {
+		return nil, errors.New("statsig: curves not found")
+	}
+	rel := strings.IndexByte(html[marker:], '[')
+	if rel < 0 {
+		return nil, errors.New("statsig: curves array start not found")
+	}
+	start := marker + rel
+	depth, stop := 0, -1
+	for k := start; k < len(html); k++ {
+		switch html[k] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				stop = k + 1
+			}
+		}
+		if stop > 0 {
+			break
+		}
+	}
+	if stop < 0 {
+		return nil, errors.New("statsig: curves array end not found")
+	}
+	sub := strings.ReplaceAll(html[start:stop], `\`, "")
+	var out [][]statsigCurve
+	if err := json.Unmarshal([]byte(sub), &out); err != nil {
+		return nil, fmt.Errorf("statsig: curves json: %w", err)
+	}
+	return out, nil
+}
+
+// computeStatsigTail reproduces the browser's 3-byte color + 6-number transform
+// matrix "F" tail: it selects a curve by the seed, samples the curve's keyframe
+// animation (color lerp + rotate) at a seed-derived paused currentTime, and
+// serializes getComputedStyle(color)+getComputedStyle(transform) exactly as the
+// signer does (each number -> Number(v.toFixed(2)).toString(16), '.'/'-' stripped).
+func computeStatsigTail(seed []byte, curves [][]statsigCurve) (string, error) {
+	if len(seed) < 46 {
+		return "", errors.New("statsig: short seed")
+	}
+	if len(curves) == 0 {
+		return "", errors.New("statsig: no curves")
+	}
+	group := int(seed[5]) % len(curves)
+	if len(curves[group]) == 0 {
+		return "", errors.New("statsig: empty curve group")
+	}
+	idx := int(seed[17]) % len(curves[group])
+	cv := curves[group][idx]
+	if len(cv.Color) < 6 || len(cv.Bezier) < 4 {
+		return "", errors.New("statsig: malformed curve")
+	}
+
+	n := (int(seed[19]) % 16) * (int(seed[15]) % 16) * (int(seed[39]) % 16)
+	currentTime := jsRound(float64(n)/10) * 10
+	progress := float64(currentTime) / statsigAnimDuration
+
+	x1 := toFixed2(float64(cv.Bezier[0]) / 255)
+	y1 := toFixed2(float64(cv.Bezier[1])*2/255 - 1)
+	x2 := toFixed2(float64(cv.Bezier[2]) / 255)
+	y2 := toFixed2(float64(cv.Bezier[3])*2/255 - 1)
+	eased := cubicBezierEase(x1, y1, x2, y2, progress)
+
+	nums := make([]float64, 0, 9)
+	for k := 0; k < 3; k++ {
+		v := jsRound(float64(cv.Color[k]) + (float64(cv.Color[k+3])-float64(cv.Color[k]))*eased)
+		if v < 0 {
+			v = 0
+		}
+		if v > 255 {
+			v = 255
+		}
+		nums = append(nums, float64(v))
+	}
+	theta := jsRound(float64(cv.Deg)*300/255 + 60)
+	rad := float64(theta) * eased * math.Pi / 180
+	cos, sin := math.Cos(rad), math.Sin(rad)
+	nums = append(nums, cos, sin, -sin, cos, 0, 0)
+
+	var b strings.Builder
+	for _, v := range nums {
+		b.WriteString(jsHex(v))
+	}
+	out := strings.NewReplacer(".", "", "-", "").Replace(b.String())
+	return out, nil
+}
+
+// jsRound matches JavaScript Math.round (round half up toward +Inf).
+func jsRound(x float64) int {
+	return int(math.Floor(x + 0.5))
+}
+
+// toFixed2 matches JavaScript Number(v.toFixed(2)).
+func toFixed2(v float64) float64 {
+	f, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'f', 2, 64), 64)
+	return f
+}
+
+// jsHex matches JavaScript Number(v.toFixed(2)).toString(16).
+func jsHex(v float64) string {
+	v = toFixed2(v)
+	neg := ""
+	if v < 0 {
+		neg = "-"
+		v = -v
+	}
+	ip := int64(math.Floor(v))
+	frac := v - float64(ip)
+	s := neg + strconv.FormatInt(ip, 16)
+	if frac == 0 {
+		return s
+	}
+	const digits = "0123456789abcdef"
+	var b strings.Builder
+	b.WriteString(s)
+	b.WriteByte('.')
+	for i := 0; i < 20 && frac != 0; i++ {
+		frac *= 16
+		d := int(frac)
+		b.WriteByte(digits[d])
+		frac -= float64(d)
+	}
+	return b.String()
+}
+
+// cubicBezierEase evaluates a CSS cubic-bezier(x1,y1,x2,y2) easing at input
+// fraction p: solve X(t)=p for t (bisection), then return Y(t).
+func cubicBezierEase(x1, y1, x2, y2, p float64) float64 {
+	bez := func(t, a, b float64) float64 {
+		mt := 1 - t
+		return 3*a*mt*mt*t + 3*b*mt*t*t + t*t*t
+	}
+	lo, hi := 0.0, 1.0
+	for i := 0; i < 100; i++ {
+		mid := (lo + hi) / 2
+		if bez(mid, x1, x2) < p {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return bez((lo+hi)/2, y1, y2)
+}
+
 // statsigID reproduces grok.com's x-statsig-id anti-bot token for a request. The
 // token binds to the request METHOD and URL path and to a coarse timestamp, so
-// it must be regenerated per request. See the package doc for the layout.
-func statsigID(path, method string) string {
+// it must be regenerated per request. See the package doc for the layout. It uses
+// the session's self-healed (header, salt) when available, else static defaults.
+func statsigID(path, method, token string) string {
+	header, suffix, trailer := statsigHeader, statsigSuffix, statsigTrailer
+	statsigMu.Lock()
+	if ch, ok := statsigCache[token]; ok {
+		header, suffix, trailer = ch.header, ch.suffix, ch.trailer
+	}
+	statsigMu.Unlock()
+
 	counter := uint32(time.Now().Unix() - statsigEpoch)
-	sig := fmt.Sprintf("%s!%s!%d%s", method, path, counter, statsigSuffix)
+	sig := fmt.Sprintf("%s!%s!%d%s", method, path, counter, suffix)
 	hash := sha256.Sum256([]byte(sig))
 
 	raw := make([]byte, 0, 70)
-	raw = append(raw, statsigHeader...)
+	raw = append(raw, header...)
 	raw = binary.LittleEndian.AppendUint32(raw, counter)
 	raw = append(raw, hash[:16]...)
-	raw = append(raw, statsigTrailer)
+	raw = append(raw, trailer)
 
 	key := byte(rand.IntN(256))
 	for i := range raw {
@@ -364,7 +667,7 @@ func (c *Client) applyHeaders(req *http.Request, token string, extra map[string]
 		"origin":             {origin},
 		"referer":            {origin + "/"},
 		"user-agent":         {userAgent},
-		"x-statsig-id":       {statsigID(req.URL.Path, req.Method)},
+		"x-statsig-id":       {statsigID(req.URL.Path, req.Method, token)},
 		"x-xai-request-id":   {uuid.NewString()},
 		"sec-ch-ua":          {`"Chromium";v="133", "Not(A:Brand";v="99"`},
 		"sec-ch-ua-mobile":   {"?0"},
@@ -386,7 +689,14 @@ func (c *Client) applyHeaders(req *http.Request, token string, extra map[string]
 	req.Header = h
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) {
+func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+
+// newDirectTLSClient egresses on the local IP (never the proxy). Used for
+// reference-frame upload and result (video) download; only the generate submit
+// (/rest/app-chat/conversations/new) uses the proxy.
+func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
+
+func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 	options := []tlsclient.HttpClientOption{
 		// Video generation streams inline until progress=100; a 15s clip can take
 		// several minutes, so allow up to 10m (caller's genCtx caps at 12m).
@@ -394,7 +704,7 @@ func (c *Client) newTLSClient() (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(profiles.Chrome_133),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if c.proxy != "" {
+	if useProxy && c.proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(c.proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)

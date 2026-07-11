@@ -18,6 +18,7 @@ const REF_MODE_LABEL = { none: '无', frame: '首帧/首尾帧', asset: '参考�
 const catalog = ref([])
 const loading = ref(true)
 const selectedId = ref(props.model?.id || '')
+const alias = ref(props.model?.alias || '')
 const imagePrices = ref({})        // 普通价 { '1K': '', '2K': '', ... } keyed by resolutions
 const videoPrices = ref({})        // 普通价 { '5s': '', '10s': '', ... } keyed by durations
 const imagePricesAgent = ref({})   // 代理价(留空 = 跟随普通价)
@@ -138,6 +139,7 @@ async function save() {
       duration_prices,
       prices_agent,
       duration_prices_agent,
+      alias: alias.value.trim(),
       max_reference_images: e.max_reference_images || 0,
       reference_mode: e.reference_mode || 'none',
       weight: Number(weight.value) || 0,
@@ -153,6 +155,7 @@ async function save() {
       prices,
       prices_agent,
       image_to_image: !!e.image_to_image,
+      alias: alias.value.trim(),
       // 多参考图:把目录定义的张数(gpt=3/seedream=6/flux=4 …)写进模型,
       // 否则后端仍按旧值(默认 1)限制。
       max_reference_images: e.max_reference_images || 0,
@@ -195,6 +198,12 @@ async function save() {
             <p v-if="!isEdit && !addOptions.length" class="text-[11px] text-amber-300/80 mt-1.5">
               所有支持的模型都已添加。
             </p>
+          </div>
+
+          <div>
+            <label class="lbl">别名</label>
+            <input v-model="alias" class="field font-mono" placeholder="可选，对外名" />
+            <p class="text-[11px] text-white/40 mt-1.5">设置后原模型名将不可调用,画图台 / API / 文档都改用别名</p>
           </div>
 
           <!-- read-only param summary, straight from the loaded catalog -->

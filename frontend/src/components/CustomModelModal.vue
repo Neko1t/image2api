@@ -15,6 +15,7 @@ const ALL_RES = ['1K', '2K', '4K', '720p', '1080p']
 const DUR_OPTS = ['5s', '6s', '8s', '10s', '15s']
 
 const id = ref('')
+const alias = ref('')
 const type = ref('image')
 const ratios = ref(['1:1', '16:9', '9:16'])
 const maxRefs = ref(0)
@@ -89,6 +90,7 @@ async function save() {
   const body = {
     id: mid,
     name: mid,
+    alias: alias.value.trim(),
     type: type.value,
     provider: 'custom',
     prices: r.prices,
@@ -127,13 +129,17 @@ async function save() {
       </div>
       <div class="p-5 space-y-4">
         <p class="text-xs text-slate-500 leading-relaxed">
-          id 要与上游模型名<strong class="text-slate-700">一致</strong> —— 生成时按 id 自动路由到「支持该 id 的上游账号」。价格按本地价计费。
+          id 要与上游模型名<strong class="text-slate-700">一致</strong> —— 生成时按 id 自动路由到「支持该 id 的上游账号」。价格按本地价计费。设了别名后,对外只用别名调用(原 id 调不到),但内部仍按 id 路由到上游,不影响。
         </p>
 
         <div class="flex gap-3">
           <div class="flex-1">
             <label class="text-xs text-slate-500 block mb-1">模型 id <span class="text-rose-500">*</span></label>
             <input v-model="id" class="field font-mono text-xs h-10" placeholder="gpt-image-2" />
+          </div>
+          <div class="w-40">
+            <label class="text-xs text-slate-500 block mb-1">别名(选填)</label>
+            <input v-model="alias" class="field font-mono text-xs h-10" placeholder="对外调用名" />
           </div>
           <div class="w-28">
             <label class="text-xs text-slate-500 block mb-1">类型</label>

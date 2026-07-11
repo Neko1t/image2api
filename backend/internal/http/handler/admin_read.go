@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"backend/internal/model"
@@ -29,6 +30,7 @@ func (h *AdminReadHandler) Users(c *gin.Context) {
 	for _, user := range users {
 		row := userPublic(user)
 		row["generation_count"] = user.GenerationCount
+		row["banned_word_hits"] = user.BannedWordHits
 		out = append(out, row)
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out, "stats": stats})
@@ -56,7 +58,23 @@ func (h *AdminReadHandler) Logs(c *gin.Context) {
 		}
 	}
 
-	items, total, stats, err := h.admin.Logs(c.Request.Context(), limit, offset, kind, status, nil, since, "", "", c.Query("source"), false)
+	// ?user= — server-side 用户搜索: resolve the term to matching user ids
+	// (name/email/id contains, case-insensitive) and filter rows to those users.
+	// A term that matches nobody must return zero rows, not the unfiltered list.
+	var userIDs []string
+	if term := strings.TrimSpace(c.Query("user")); term != "" {
+		ids, uerr := h.admin.MatchUserIDs(c.Request.Context(), term)
+		if uerr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
+			return
+		}
+		if len(ids) == 0 {
+			ids = []string{"__no_match__"}
+		}
+		userIDs = ids
+	}
+
+	items, total, stats, err := h.admin.Logs(c.Request.Context(), limit, offset, kind, status, nil, since, "", userIDs, strings.TrimSpace(c.Query("q")), "", c.Query("source"), false, false, false)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
 		return
@@ -74,6 +92,11 @@ func (h *AdminReadHandler) Logs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
 		return
 	}
+	modelByID, err := h.admin.ModelNameMap(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load logs"})
+		return
+	}
 	out := make([]gin.H, 0, len(items))
 	for _, item := range items {
 		var userName any
@@ -85,7 +108,10 @@ func (h *AdminReadHandler) Logs(c *gin.Context) {
 			userName = item.UserID
 		}
 		var accountName any
-		if item.AccountID != "" {
+		if item.AccountEmail != "" {
+			// Email stamped on the row itself survives account deletion/re-import.
+			accountName = item.AccountEmail
+		} else if item.AccountID != "" {
 			if label, ok := accountByID[item.AccountID]; ok {
 				accountName = label
 			} else {
@@ -97,13 +123,14 @@ func (h *AdminReadHandler) Logs(c *gin.Context) {
 			"ts":         item.TS.Unix(),
 			"kind":       item.Kind,
 			"status":     item.Status,
-			"model":      item.Model,
+			"model":      displayModelName(modelByID, item.Model),
 			"provider":   item.Provider,
 			"prompt":     item.Prompt,
 			"ratio":      item.Ratio,
 			"resolution": item.Resolution,
 			"duration":   item.Duration,
 			"refs":       item.Refs,
+			"deai":       item.DeAI,
 			"source":     item.Source,
 			"user_id":    emptyStringNil(item.UserID),
 			"user_name":  userName,
@@ -153,6 +180,16 @@ func (h *AdminReadHandler) Invites(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": items, "stats": stats})
 }
 
+// DeleteImage removes one generated file (plus derived stills) and blanks the
+// log rows referencing it. Admin 图片管理 delete; ?name= is the storage key.
+func (h *AdminReadHandler) DeleteImage(c *gin.Context) {
+	if err := h.admin.DeleteFile(c.Request.Context(), c.Query("name")); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 func (h *AdminReadHandler) Providers(c *gin.Context) {
 	items, err := h.admin.Providers(c.Request.Context())
 	if err != nil {
@@ -192,24 +229,24 @@ func userPublic(user model.User) gin.H {
 		})
 	}
 	return gin.H{
-		"id":             user.ID,
-		"email":          user.Email,
-		"name":           user.Name,
-		"role":           user.Role,
-		"status":         user.Status,
-		"credits":        user.Credits,
-		"notes":          user.Notes,
-		"recharge_total": user.RechargeTotal,
+		"id":                   user.ID,
+		"email":                user.Email,
+		"name":                 user.Name,
+		"role":                 user.Role,
+		"status":               user.Status,
+		"credits":              user.Credits,
+		"notes":                user.Notes,
+		"recharge_total":       user.RechargeTotal,
 		"concurrency_group_id": user.ConcurrencyGroupID,
-		"created_at":     unixSec(user.CreatedAt),
-		"last_login_at":  unixSecPtr(user.LastLoginAt),
-		"last_login_ip":  user.LastLoginIP,
-		"invite_code":    user.InviteCode,
-		"invited_by":     user.InvitedBy,
-		"checkin_last":   user.CheckinLast,
-		"checkin_streak": user.CheckinStreak,
-		"api_keys":       keys,
-		"has_password":   user.PasswordHash != "",
+		"created_at":           unixSec(user.CreatedAt),
+		"last_login_at":        unixSecPtr(user.LastLoginAt),
+		"last_login_ip":        user.LastLoginIP,
+		"invite_code":          user.InviteCode,
+		"invited_by":           user.InvitedBy,
+		"checkin_last":         user.CheckinLast,
+		"checkin_streak":       user.CheckinStreak,
+		"api_keys":             keys,
+		"has_password":         user.PasswordHash != "",
 	}
 }
 

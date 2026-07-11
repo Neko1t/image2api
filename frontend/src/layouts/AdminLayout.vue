@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import Icon from '../components/Icon.vue'
 import Logo from '../components/Logo.vue'
@@ -14,16 +14,36 @@ const tabs = [
   { label: '账号管理', to: '/admin/accounts', icon: 'plug' },
   { label: '用户管理', to: '/admin/users',    icon: 'accounts' },
   { label: '并发分组', to: '/admin/concurrency', icon: 'shield' },
+  { label: '违禁词管理', icon: 'ban', children: [
+    { label: '违禁词列表', to: '/admin/banned-words' },
+    { label: '违禁词触发列表', to: '/admin/banned-word-hits' },
+  ] },
   { label: '订单管理', to: '/admin/orders',   icon: 'receipt' },
   { label: '兑换码管理', to: '/admin/cdks',   icon: 'spark' },
   { label: '邀请日志', to: '/admin/invites',  icon: 'accounts' },
-  { label: '图片管理', to: '/admin/images',   icon: 'files' },
+  { label: '作品管理', to: '/admin/images',   icon: 'files' },
   { label: '首页内容', to: '/admin/showcase', icon: 'spark' },
   { label: '日志管理', to: '/admin/logs',     icon: 'log' },
   { label: '系统配置', to: '/admin/config',   icon: 'config' },
 ]
 
 const currentLabel = computed(() => route.meta?.label || '')
+
+// 二级菜单展开状态：当前路由命中子项时默认展开，也可手动切换。
+const openGroups = ref(new Set())
+function groupActive(t) { return (t.children || []).some((c) => route.path.startsWith(c.to)) }
+function toggleGroup(label) {
+  const s = new Set(openGroups.value)
+  s.has(label) ? s.delete(label) : s.add(label)
+  openGroups.value = s
+}
+watch(() => route.path, () => {
+  for (const t of tabs) {
+    if (t.children && groupActive(t) && !openGroups.value.has(t.label)) {
+      const s = new Set(openGroups.value); s.add(t.label); openGroups.value = s
+    }
+  }
+}, { immediate: true })
 </script>
 
 <template>
@@ -39,16 +59,34 @@ const currentLabel = computed(() => route.meta?.label || '')
         </div>
       </router-link>
 
-      <nav class="flex-1 px-3 py-4 space-y-1">
-        <router-link
-          v-for="t in tabs" :key="t.to" :to="t.to"
-          class="admin-link group"
-          active-class="active">
-          <span class="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full opacity-0 transition-opacity"
-                style="background: linear-gradient(180deg, #f0abfc, #a78bfa)"></span>
-          <Icon :name="t.icon" class="w-4 h-4 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity" />
-          <span class="text-sm">{{ t.label }}</span>
-        </router-link>
+      <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+        <template v-for="t in tabs" :key="t.label">
+          <router-link v-if="!t.children" :to="t.to"
+            class="admin-link group"
+            active-class="active">
+            <span class="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full opacity-0 transition-opacity"
+                  style="background: linear-gradient(180deg, #f0abfc, #a78bfa)"></span>
+            <Icon :name="t.icon" class="w-4 h-4 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity" />
+            <span class="text-sm">{{ t.label }}</span>
+          </router-link>
+          <div v-else>
+            <button type="button" @click="toggleGroup(t.label)"
+                    class="admin-link group w-full text-left" :class="groupActive(t) && 'active'">
+              <span class="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full opacity-0 transition-opacity"
+                    style="background: linear-gradient(180deg, #f0abfc, #a78bfa)"></span>
+              <Icon :name="t.icon" class="w-4 h-4 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity" />
+              <span class="text-sm">{{ t.label }}</span>
+              <svg class="w-3 h-3 ml-auto transition-transform" :class="openGroups.has(t.label) && 'rotate-90'"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+            </button>
+            <div v-if="openGroups.has(t.label)" class="mt-1 space-y-0.5">
+              <router-link v-for="c in t.children" :key="c.to" :to="c.to"
+                class="admin-sublink" active-class="active">
+                <span class="text-sm">{{ c.label }}</span>
+              </router-link>
+            </div>
+          </div>
+        </template>
       </nav>
 
       <div class="p-3 border-t border-[color:var(--hairline)] space-y-1">
@@ -112,6 +150,18 @@ const currentLabel = computed(() => route.meta?.label || '')
 .admin-link:hover { background: var(--hover); color: var(--fg); }
 .admin-link.active { color: var(--fg); background: var(--hover); }
 .admin-link.active > span:first-child { opacity: 1; }
+
+.admin-sublink {
+  display: flex;
+  align-items: center;
+  padding: 0.45rem 0.875rem 0.45rem 2.6rem;
+  border-radius: 0.625rem;
+  color: var(--fg-2);
+  font-weight: 500;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.admin-sublink:hover { background: var(--hover); color: var(--fg); }
+.admin-sublink.active { color: var(--fg); background: var(--hover); }
 
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s ease, transform 0.15s ease; }
 .fade-enter-from { opacity: 0; transform: translateY(4px); }

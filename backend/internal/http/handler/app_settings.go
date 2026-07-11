@@ -223,6 +223,31 @@ func (h *AppSettingsHandler) CreditsPut(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "data": data})
 }
 
+// DeAIGet returns the 去AI特征 per-tier surcharge. Also mounted publicly (the
+// 画图台 needs it to show the price next to the toggle) — prices aren't secret.
+func (h *AppSettingsHandler) DeAIGet(c *gin.Context) {
+	data, err := h.settings.DeAI(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load deai settings"})
+		return
+	}
+	c.JSON(http.StatusOK, data)
+}
+
+func (h *AppSettingsHandler) DeAIPut(c *gin.Context) {
+	var body service.DeAISettings
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+		return
+	}
+	data, err := h.settings.SaveDeAI(c.Request.Context(), body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "data": data})
+}
+
 func (h *AppSettingsHandler) LogsGet(c *gin.Context) {
 	data, err := h.settings.Logs(c.Request.Context())
 	if err != nil {

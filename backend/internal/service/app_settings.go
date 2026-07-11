@@ -48,6 +48,15 @@ type CreditSettings struct {
 	CDKRedeemEnabled bool `json:"cdk_redeem_enabled"`
 }
 
+// DeAISettings is the per-tier surcharge (积分) for the 去AI特征 option on the
+// 画图台 — charged on top of the model's image price when the toggle is on.
+type DeAISettings struct {
+	Enabled bool `json:"enabled"`
+	Price1K int `json:"price_1k"`
+	Price2K int `json:"price_2k"`
+	Price4K int `json:"price_4k"`
+}
+
 type ProxySettings struct {
 	Proxy string `json:"proxy"`
 }
@@ -332,6 +341,50 @@ func (s *AppSettingsService) TestProxy(ctx context.Context, proxy string) (map[s
 		"exit_ip":    echo.IP,
 		"elapsed_ms": elapsed,
 	}, nil
+}
+
+func (s *AppSettingsService) DeAI(ctx context.Context) (*DeAISettings, error) {
+	enabledRaw, err := s.settings.GetValue(ctx, "deai.enabled")
+	if err != nil {
+		return nil, err
+	}
+	p1Raw, err := s.settings.GetValue(ctx, "deai.price_1k")
+	if err != nil {
+		return nil, err
+	}
+	p2Raw, err := s.settings.GetValue(ctx, "deai.price_2k")
+	if err != nil {
+		return nil, err
+	}
+	p4Raw, err := s.settings.GetValue(ctx, "deai.price_4k")
+	if err != nil {
+		return nil, err
+	}
+	return &DeAISettings{
+		Enabled: parseBoolSetting(enabledRaw, false),
+		Price1K: clampNonNegative(parseIntSetting(p1Raw, 1)),
+		Price2K: clampNonNegative(parseIntSetting(p2Raw, 2)),
+		Price4K: clampNonNegative(parseIntSetting(p4Raw, 3)),
+	}, nil
+}
+
+func (s *AppSettingsService) SaveDeAI(ctx context.Context, in DeAISettings) (*DeAISettings, error) {
+	if err := s.settings.UpsertValues(ctx, map[string]string{
+		"deai.enabled":  strconv.FormatBool(in.Enabled),
+		"deai.price_1k": strconv.Itoa(clampNonNegative(in.Price1K)),
+		"deai.price_2k": strconv.Itoa(clampNonNegative(in.Price2K)),
+		"deai.price_4k": strconv.Itoa(clampNonNegative(in.Price4K)),
+	}); err != nil {
+		return nil, err
+	}
+	return s.DeAI(ctx)
+}
+
+func clampNonNegative(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *AppSettingsService) Credits(ctx context.Context) (*CreditSettings, error) {

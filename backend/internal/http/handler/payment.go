@@ -59,7 +59,11 @@ func (h *PaymentHandler) Recharge(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
 		return
 	}
-	order, err := h.pay.CreateOrder(c.Request.Context(), user, body.Amount, body.Method, requestBaseURL(c), clientIP(c))
+	base := requestBaseURL(c)
+	if strings.HasPrefix(base, "http://") {
+		base = "https://" + strings.TrimPrefix(base, "http://")
+	}
+	order, err := h.pay.CreateOrder(c.Request.Context(), user, body.Amount, body.Method, base, clientIP(c))
 	if err != nil {
 		h.writeErr(c, err)
 		return
@@ -75,7 +79,7 @@ func (h *PaymentHandler) MyOrders(c *gin.Context) {
 	}
 	limit := parseInt(c.Query("limit"), 20)
 	offset := parseInt(c.Query("offset"), 0)
-	orders, total, err := h.pay.ListByUser(c.Request.Context(), user.ID, c.Query("status"), limit, offset)
+	orders, total, err := h.pay.ListByUser(c.Request.Context(), user.ID, c.Query("status"), strings.TrimSpace(c.Query("q")), limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load orders"})
 		return
@@ -107,7 +111,11 @@ func (h *PaymentHandler) ContinueOrder(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
 		return
 	}
-	order, err := h.pay.Continue(c.Request.Context(), user, c.Param("id"), requestBaseURL(c), clientIP(c))
+	base := requestBaseURL(c)
+	if strings.HasPrefix(base, "http://") {
+		base = "https://" + strings.TrimPrefix(base, "http://")
+	}
+	order, err := h.pay.Continue(c.Request.Context(), user, c.Param("id"), base, clientIP(c))
 	if err != nil {
 		h.writeErr(c, err)
 		return
@@ -121,7 +129,7 @@ func (h *PaymentHandler) AdminOrders(c *gin.Context) {
 	status := c.Query("status")
 	limit := parseInt(c.Query("limit"), 100)
 	offset := parseInt(c.Query("offset"), 0)
-	orders, total, err := h.pay.ListAll(c.Request.Context(), status, limit, offset)
+	orders, total, err := h.pay.ListAll(c.Request.Context(), status, strings.TrimSpace(c.Query("q")), limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load orders"})
 		return

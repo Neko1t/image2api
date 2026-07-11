@@ -1,12 +1,14 @@
 package grok
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
+	"net/textproto"
 	"os"
 	"regexp"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
+	"github.com/google/uuid"
 )
 
 // assetBase is where generated media artifacts live (the stream returns a
@@ -51,10 +54,23 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		seconds = 10
 	}
 
-	client, err := c.newTLSClient()
+	// Only the conversations/new submit egresses via the proxy; reference-frame
+	// upload and the mp4 download run on the local IP.
+	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
+	directClient, err := c.newDirectTLSClient()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Self-heal the x-statsig-id anti-bot challenge for THIS session before the
+	// gated submit. Without it the header falls back to the static defaults,
+	// which go stale on a new grok web build and make conversations/new answer
+	// 403 (anti-bot). Fetch via the proxy client so the derived seed matches the
+	// submit's egress IP. Failure is non-fatal (statsigID then uses defaults).
+	c.ensureChallenge(ctx, submitClient, token)
 
 	// Image-to-video: upload each reference frame and collect its asset URL.
 	var imageRefs []string
@@ -62,7 +78,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		if len(f) == 0 {
 			continue
 		}
-		url, upErr := c.uploadImage(ctx, client, token, f)
+		url, upErr := c.uploadImage(ctx, directClient, token, f)
 		if upErr != nil {
 			return nil, nil, upErr
 		}
@@ -71,9 +87,9 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 
 	// grok occasionally accepts the conversation (HTTP 200) but closes the stream
 	// after only the conversation object — no progress events, no videoUrl. This
-	// is transient, so retry the whole create-post + stream a few times before
-	// giving up. Real out-of-credits / auth errors are returned immediately.
-	const maxAttempts = 5
+	// is transient and surfaces as ErrTemporaryUpstream so the caller fails over
+	// to the NEXT account (换号重试) instead of retrying this one.
+	const maxAttempts = 1
 	var (
 		postID   string
 		artifact string
@@ -84,7 +100,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		pid, cpErr := c.createPost(ctx, client, token, prompt)
+		pid, cpErr := c.createPost(ctx, submitClient, token, prompt)
 		if cpErr != nil {
 			lastErr = cpErr
 			continue
@@ -113,7 +129,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 			},
 		}
 
-		body, psErr := c.postStream(ctx, client, token, "/rest/app-chat/conversations/new", payload)
+		body, psErr := c.postStream(ctx, submitClient, token, "/rest/app-chat/conversations/new", payload)
 		if psErr != nil {
 			// Transient HTTP/2 stream resets etc. — retry.
 			lastErr = psErr
@@ -137,7 +153,14 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		if artifact != "" {
 			break
 		}
-		// No artifact: grok closed the stream early. Retry.
+		// A fatal stream error means grok definitively rejected this generation
+		// (content moderation, an unsupported parameter, etc.). Retrying — on this
+		// or any other account — fails identically and only burns the pool, so fail
+		// fast with a non-temporary error the pool won't fail over on.
+		if strings.Contains(body, "STREAM_ERROR_SEVERITY_FATAL") {
+			return nil, nil, fmt.Errorf("grok: video generation rejected by upstream (fatal stream error): %s", clip([]byte(body), 200))
+		}
+		// No artifact and no fatal error: grok closed the stream early. Retry.
 		lastErr = nil
 	}
 	if artifact == "" {
@@ -159,24 +182,18 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	if !downloadResult {
 		return nil, meta, nil
 	}
-	data, err := c.download(ctx, client, token, fullURL)
+	data, err := c.download(ctx, directClient, token, fullURL)
 	if err != nil {
 		return nil, nil, err
 	}
 	return data, meta, nil
 }
 
-// uploadImage uploads one reference frame via /rest/app-chat/upload-file (JSON
-// with base64 content) and returns its asset content URL for imageReferences.
-// Cloudflare's bot score is per-request, so a big base64 upload can hit a
-// "Just a moment…" 403 intermittently while identical requests pass — retry
-// transient failures with backoff instead of failing the whole task.
+// uploadImage uploads one reference frame via /http/upload-file-v2/direct and
+// returns its asset content URL for imageReferences. Cloudflare's bot score is
+// per-request, so retry transient failures with backoff instead of failing the
+// whole task.
 func (c *Client) uploadImage(ctx context.Context, client tlsclient.HttpClient, token string, img []byte) (string, error) {
-	body := map[string]any{
-		"fileName":     "ref.png",
-		"fileMimeType": "image/png",
-		"content":      base64.StdEncoding.EncodeToString(img),
-	}
 	var res map[string]any
 	var err error
 	backoffs := []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * time.Second}
@@ -188,7 +205,7 @@ func (c *Client) uploadImage(ctx context.Context, client tlsclient.HttpClient, t
 			case <-time.After(wait):
 			}
 		}
-		res, err = c.postJSON(ctx, client, token, "/rest/app-chat/upload-file", body)
+		res, err = c.uploadFileV2(ctx, client, token, img)
 		if err == nil || !errors.Is(err, ErrTemporaryUpstream) {
 			break
 		}
@@ -196,7 +213,11 @@ func (c *Client) uploadImage(ctx context.Context, client tlsclient.HttpClient, t
 	if err != nil {
 		return "", err
 	}
-	fileURI := strings.TrimSpace(stringValue(res["fileUri"]))
+	meta, _ := res["fileMetadata"].(map[string]any)
+	fileURI := ""
+	if meta != nil {
+		fileURI = strings.TrimSpace(stringValue(meta["fileUri"]))
+	}
 	if fileURI == "" {
 		return "", fmt.Errorf("%w: upload missing fileUri", ErrTemporaryUpstream)
 	}
@@ -204,6 +225,52 @@ func (c *Client) uploadImage(ctx context.Context, client tlsclient.HttpClient, t
 		return fileURI, nil
 	}
 	return assetBase + strings.TrimPrefix(fileURI, "/"), nil
+}
+
+func (c *Client) uploadFileV2(ctx context.Context, client tlsclient.HttpClient, token string, img []byte) (map[string]any, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	partHeader := textproto.MIMEHeader{}
+	partHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, uuid.NewString()+".png"))
+	partHeader.Set("Content-Type", "image/png")
+	part, err := mw.CreatePart(partHeader)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := part.Write(img); err != nil {
+		return nil, err
+	}
+	if err := mw.WriteField("file_source", "IMAGINE_SELF_UPLOAD_FILE_SOURCE"); err != nil {
+		return nil, err
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, apiBase+"/http/upload-file-v2/direct", bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	c.applyHeaders(req, token, map[string]string{"content-type": mw.FormDataContentType()})
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+	}
+	if e := mapStatus("/http/upload-file-v2/direct", resp.StatusCode, raw); e != nil {
+		return nil, e
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("%w: upload non-json: %s", ErrTemporaryUpstream, clip(raw, 120))
+	}
+	return out, nil
 }
 
 // createPost registers a video media post and returns its id (parentPostId).
@@ -288,7 +355,8 @@ func (c *Client) OpenAsset(ctx context.Context, token, url string) (io.ReadClose
 	if token == "" {
 		return nil, "", ErrAuth
 	}
-	client, err := c.newTLSClient()
+	// Asset streaming is pure bandwidth (no anti-bot) — egress on the local IP.
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, "", err
 	}

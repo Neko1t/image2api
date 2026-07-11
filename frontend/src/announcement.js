@@ -19,6 +19,19 @@ export async function loadAnnouncement() {
   } catch { /* offline — skip */ }
 }
 
+// Manual open (公告 button in the left rail): re-fetch so the text is fresh
+// even if nothing was loaded yet, then show regardless of seen-state.
+export async function openAnnouncement() {
+  try {
+    const r = await api('/announcement')
+    if (r.ok && r.data) {
+      announcement.content = r.data.content || ''
+      announcement.version = r.data.version || ''
+    }
+  } catch { /* offline — show whatever we have */ }
+  announcement.show = true
+}
+
 // Dismiss: hide + remember this version server-side so it won't re-pop.
 export async function dismissAnnouncement() {
   announcement.show = false

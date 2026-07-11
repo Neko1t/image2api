@@ -66,7 +66,7 @@ const filtered = computed(() => {
     if (kindFilter.value && m.type !== kindFilter.value) return false
     if (statusFilter.value === 'enabled' && m.enabled === false) return false
     if (statusFilter.value === 'disabled' && m.enabled !== false) return false
-    if (q && !(m.id.toLowerCase().includes(q) || (m.provider || '').toLowerCase().includes(q))) return false
+    if (q && !(m.id.toLowerCase().includes(q) || (m.alias || '').toLowerCase().includes(q) || (m.provider || '').toLowerCase().includes(q))) return false
     return true
   })
 })
@@ -114,7 +114,7 @@ onMounted(loadModels)
         </button>
       </div>
       <div class="flex-1 min-w-[200px]">
-        <input v-model="search" class="field !py-1.5 text-xs" placeholder="搜索 模型 ID / Provider…" />
+        <input v-model="search" class="field !py-1.5 text-xs" placeholder="搜索 模型 ID / 别名 / Provider…" />
       </div>
       <button @click="loadModels" class="btn-soft">
         <Icon name="refresh" class="w-3.5 h-3.5" /> 刷新
@@ -163,7 +163,10 @@ onMounted(loadModels)
               class="border-b border-white/[0.04] hover:bg-white/[0.03] transition-colors">
             <!-- Model id + provider underneath -->
             <td class="px-5 py-3.5 align-middle min-w-0">
-              <div class="font-mono text-xs text-white/90 truncate" :title="m.id">{{ m.id }}</div>
+              <div class="flex items-start gap-2 min-w-0">
+                <div class="font-mono text-xs text-white/90 truncate" :title="m.id">{{ m.id }}</div>
+                <span v-if="m.alias" class="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] bg-sky-500/10 text-sky-300 ring-1 ring-sky-400/20 shrink-0">{{ m.alias }}</span>
+              </div>
               <div class="mt-1 text-[10px] text-white/45 capitalize truncate">{{ m.provider || '—' }}</div>
             </td>
 

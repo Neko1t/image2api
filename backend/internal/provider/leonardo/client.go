@@ -91,7 +91,7 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 	}
 	c.mu.Unlock()
 
-	client, err := c.newTLSClient()
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 		"variables":     map[string]any{"sub": sess.CognitoSub},
 		"query":         qGetTokens,
 	})
-	body, status, err := c.graphql(ctx, sess.AccessToken, payload)
+	body, status, err := c.graphqlP(ctx, sess.AccessToken, payload, false)
 	if err != nil {
 		return unknownBalance("network: " + err.Error()), nil
 	}
@@ -248,10 +248,15 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 	}, nil
 }
 
-// graphql POSTs a GraphQL body to the Leonardo API with the bearer + schema header,
-// returning the raw response body and status.
+// graphql runs a GraphQL call through the proxy. graphqlP lets callers pick the
+// egress: only the generate submit uses the proxy; reference-image upload and
+// polling run direct (local IP).
 func (c *Client) graphql(ctx context.Context, accessToken string, payload []byte) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+	return c.graphqlP(ctx, accessToken, payload, true)
+}
+
+func (c *Client) graphqlP(ctx context.Context, accessToken string, payload []byte, useProxy bool) ([]byte, int, error) {
+	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -300,7 +305,13 @@ func unknownBalance(reason string) map[string]any {
 	}
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) {
+func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+
+// newDirectTLSClient egresses on the local IP (never the proxy). Used for
+// reference-image upload, polling and result download.
+func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
+
+func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 	// Match the fingerprint proven to work against Leonardo's Cloudflare edge:
 	// Chrome_120, fixed extension order. A randomized JA3 (Chrome_133 +
 	// WithRandomTLSExtensionOrder) gets flagged and 429'd at get-session.
@@ -308,7 +319,7 @@ func (c *Client) newTLSClient() (tlsclient.HttpClient, error) {
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if c.proxy != "" {
+	if useProxy && c.proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(c.proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
@@ -319,7 +330,7 @@ func (c *Client) downloadImage(ctx context.Context, imageURL string) ([]byte, er
 	if _, err := url.Parse(imageURL); err != nil {
 		return nil, err
 	}
-	client, err := c.newTLSClient()
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err
 	}

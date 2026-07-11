@@ -20,6 +20,7 @@ import (
 // row does not exist, so handlers can translate it into a 404 (GORM's Delete
 // does not error on a zero-row delete).
 var ErrNotFound = errors.New("not found")
+var ErrModelAliasCollision = errors.New("model alias collision")
 
 type AdminWriteService struct {
 	users    *repo.UserRepository
@@ -94,18 +95,18 @@ func (s *AdminWriteService) CreateUser(ctx context.Context, body map[string]any)
 	}
 
 	user := &model.User{
-		ID:           "u-" + uuid.NewString()[:10],
-		Email:        email,
-		Name:         name,
-		PasswordHash: passwordHash,
-		Role:         role,
-		Status:       status,
-		Credits:      credits,
-		Notes:        notes,
+		ID:                 "u-" + uuid.NewString()[:10],
+		Email:              email,
+		Name:               name,
+		PasswordHash:       passwordHash,
+		Role:               role,
+		Status:             status,
+		Credits:            credits,
+		Notes:              notes,
 		ConcurrencyGroupID: cgroupID,
-		InviteCode:   randomInviteCode(),
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
+		InviteCode:         randomInviteCode(),
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
 	}
 	if err := s.users.Create(ctx, user); err != nil {
 		return nil, err
@@ -347,6 +348,7 @@ func (s *AdminWriteService) CreateModel(ctx context.Context, body map[string]any
 	modelID := strings.TrimSpace(stringValue(body["id"]))
 	modelType := normalizedModelType(stringValue(body["type"]))
 	provider := strings.TrimSpace(stringValue(body["provider"]))
+	alias := strings.TrimSpace(stringValue(body["alias"]))
 	if modelID == "" {
 		return nil, errors.New("id required")
 	}
@@ -355,6 +357,9 @@ func (s *AdminWriteService) CreateModel(ctx context.Context, body map[string]any
 	}
 	if provider == "" {
 		return nil, errors.New("provider required")
+	}
+	if err := s.validateModelNameSpace(ctx, "", modelID, alias); err != nil {
+		return nil, err
 	}
 
 	prices := jsonMap(body["prices"])
@@ -366,24 +371,25 @@ func (s *AdminWriteService) CreateModel(ctx context.Context, body map[string]any
 	}
 
 	item := &model.ModelConfig{
-		ID:                 modelID,
-		Type:               modelType,
-		Name:               defaultString(strings.TrimSpace(stringValue(body["name"])), modelID),
-		Provider:           provider,
-		Enabled:            boolValueWithDefault(body["enabled"], true),
-		Ratios:             jsonArray(body["ratios"]),
-		Prices:             prices,
-		Resolutions:        resolutions,
-		ImageToImage:       boolValueWithDefault(body["image_to_image"], false),
-		DurationPrices:     jsonMap(body["duration_prices"]),
+		ID:                  modelID,
+		Type:                modelType,
+		Name:                defaultString(strings.TrimSpace(stringValue(body["name"])), modelID),
+		Alias:               alias,
+		Provider:            provider,
+		Enabled:             boolValueWithDefault(body["enabled"], true),
+		Ratios:              jsonArray(body["ratios"]),
+		Prices:              prices,
+		Resolutions:         resolutions,
+		ImageToImage:        boolValueWithDefault(body["image_to_image"], false),
+		DurationPrices:      jsonMap(body["duration_prices"]),
 		PricesAgent:         jsonMap(body["prices_agent"]),
 		DurationPricesAgent: jsonMap(body["duration_prices_agent"]),
-		Durations:          jsonArray(body["durations"]),
-		MaxReferenceImages: intValue(body["max_reference_images"]),
-		ReferenceMode:      defaultString(strings.TrimSpace(stringValue(body["reference_mode"])), "none"),
-		Weight:             intValue(body["weight"]),
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		Durations:           jsonArray(body["durations"]),
+		MaxReferenceImages:  intValue(body["max_reference_images"]),
+		ReferenceMode:       defaultString(strings.TrimSpace(stringValue(body["reference_mode"])), "none"),
+		Weight:              intValue(body["weight"]),
+		CreatedAt:           time.Now(),
+		UpdatedAt:           time.Now(),
 	}
 	if err := s.models.Create(ctx, item); err != nil {
 		return nil, err
@@ -393,6 +399,7 @@ func (s *AdminWriteService) CreateModel(ctx context.Context, body map[string]any
 
 func (s *AdminWriteService) UpdateModel(ctx context.Context, modelID string, body map[string]any) (*model.ModelConfig, error) {
 	patch := map[string]any{}
+	alias := ""
 	if _, ok := body["type"]; ok {
 		modelType := normalizedModelType(stringValue(body["type"]))
 		if modelType == "" {
@@ -402,6 +409,13 @@ func (s *AdminWriteService) UpdateModel(ctx context.Context, modelID string, bod
 	}
 	if _, ok := body["name"]; ok {
 		patch["name"] = strings.TrimSpace(stringValue(body["name"]))
+	}
+	if _, ok := body["alias"]; ok {
+		alias = strings.TrimSpace(stringValue(body["alias"]))
+		if err := s.validateModelNameSpace(ctx, modelID, modelID, alias); err != nil {
+			return nil, err
+		}
+		patch["alias"] = alias
 	}
 	if _, ok := body["provider"]; ok {
 		provider := strings.TrimSpace(stringValue(body["provider"]))
@@ -455,6 +469,36 @@ func (s *AdminWriteService) UpdateModel(ctx context.Context, modelID string, bod
 		patch["weight"] = intValue(body["weight"])
 	}
 	return s.models.Update(ctx, modelID, patch)
+}
+
+func (s *AdminWriteService) validateModelNameSpace(ctx context.Context, selfID, candidateID, candidateAlias string) error {
+	candidateID = strings.TrimSpace(candidateID)
+	candidateAlias = strings.TrimSpace(candidateAlias)
+	if candidateID == "" && candidateAlias == "" {
+		return nil
+	}
+	items, err := s.models.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.ID == selfID {
+			continue
+		}
+		existingAlias := strings.TrimSpace(item.Alias)
+		if candidateID != "" && existingAlias == candidateID {
+			return fmt.Errorf("%w: model id %q collides with existing alias %q", ErrModelAliasCollision, candidateID, existingAlias)
+		}
+		if candidateAlias != "" {
+			if item.ID == candidateAlias {
+				return fmt.Errorf("%w: alias %q collides with existing model id %q", ErrModelAliasCollision, candidateAlias, item.ID)
+			}
+			if existingAlias != "" && existingAlias == candidateAlias {
+				return fmt.Errorf("%w: alias %q collides with existing alias %q", ErrModelAliasCollision, candidateAlias, existingAlias)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *AdminWriteService) DeleteModel(ctx context.Context, modelID string) error {

@@ -38,10 +38,22 @@ func (r *ModelRepository) List(ctx context.Context) ([]model.ModelConfig, error)
 
 func (r *ModelRepository) Get(ctx context.Context, modelID string) (*model.ModelConfig, error) {
 	var item model.ModelConfig
-	if err := r.db.WithContext(ctx).First(&item, "id = ?", modelID).Error; err != nil {
+	if err := r.db.WithContext(ctx).First(&item, "(alias <> '' AND alias = ?) OR (alias = '' AND id = ?)", modelID, modelID).Error; err != nil {
 		return nil, err
 	}
 	return &item, nil
+}
+
+func (r *ModelRepository) NameMap(ctx context.Context) (map[string]string, error) {
+	items, err := r.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(items))
+	for _, item := range items {
+		out[item.ID] = item.EffectiveName()
+	}
+	return out, nil
 }
 
 func JSONStrings(v datatypes.JSON) []string {

@@ -18,6 +18,12 @@ const (
 	defaultClientVersion     = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
 	defaultClientBuildNumber = "7904904"
 	defaultPOWScript         = "https://chatgpt.com/backend-api/sentinel/sdk.js"
+	// sseAsyncGrace bounds how long startImageGeneration keeps reading the SSE
+	// waiting for the image_gen_async marker after the conversation id is known.
+	// The marker normally arrives within ~1s; when it never streams (intermittent
+	// on gpt-5-5-thinking) we must not hold the stream open for the whole ctx
+	// budget, so we break after this grace and fall through to polling.
+	sseAsyncGrace = 10 * time.Second
 )
 
 var (
@@ -43,6 +49,22 @@ var (
 		"this request may violate our content polic",
 		"this prompt may violate our content polic",
 		"may violate our content policies",
+		"i can't help with",
+		"i can\u2019t help with",
+		"i cannot help with",
+		"i can't assist with",
+		"i can\u2019t assist with",
+		"i cannot assist with",
+		"i'm unable to help with",
+		"i\u2019m unable to help with",
+		"can't create images",
+		"can\u2019t create images",
+		"cannot create images",
+		"can't generate images",
+		"can\u2019t generate images",
+		"cannot generate images",
+		"unable to create images",
+		"unable to generate images",
 	}
 )
 
@@ -107,6 +129,66 @@ func conversationRejected(conversation map[string]any) bool {
 		var sb strings.Builder
 		collectText(message["content"], &sb)
 		if detectContentPolicyRejection(sb.String()) {
+			return true
+		}
+	}
+	return false
+}
+
+// conversationEndedWithoutImage reports whether the model finished its turn
+// with a plain-text answer and never engaged the async image pipeline (no tool
+// turn, no image_gen task). ChatGPT localizes audit refusals, so this catches
+// rejections in ANY language structurally: a closed text-only turn can never
+// produce an image, and polling further only burns the budget.
+func conversationEndedWithoutImage(conversation map[string]any) bool {
+	mapping, _ := conversation["mapping"].(map[string]any)
+	if len(mapping) == 0 {
+		return false
+	}
+	for _, rawNode := range mapping {
+		node, _ := rawNode.(map[string]any)
+		message, _ := node["message"].(map[string]any)
+		if message == nil {
+			continue
+		}
+		if metadata, _ := message["metadata"].(map[string]any); metadata != nil {
+			if stringValue(metadata["image_gen_task_id"]) != "" || metadata["image_gen_async"] == true {
+				return false
+			}
+		}
+		author, _ := message["author"].(map[string]any)
+		role := strings.ToLower(strings.TrimSpace(stringValue(author["role"])))
+		if role == "tool" {
+			return false
+		}
+		if role == "assistant" {
+			if content, _ := message["content"].(map[string]any); content != nil {
+				// Only tool-invoking content types mean generation is underway.
+				// Context nodes (model_editable_context, thoughts, …) also appear
+				// on refused turns and must NOT suppress the detection.
+				switch stringValue(content["content_type"]) {
+				case "code", "multimodal_text":
+					return false
+				}
+			}
+		}
+	}
+	for _, rawNode := range mapping {
+		node, _ := rawNode.(map[string]any)
+		message, _ := node["message"].(map[string]any)
+		if message == nil {
+			continue
+		}
+		author, _ := message["author"].(map[string]any)
+		if strings.ToLower(strings.TrimSpace(stringValue(author["role"]))) != "assistant" {
+			continue
+		}
+		if message["end_turn"] != true || stringValue(message["status"]) != "finished_successfully" {
+			continue
+		}
+		var sb strings.Builder
+		collectText(message["content"], &sb)
+		if strings.TrimSpace(sb.String()) != "" {
 			return true
 		}
 	}

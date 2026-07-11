@@ -14,6 +14,7 @@ import (
 	"io"
 	stdhttp "net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -73,6 +74,15 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 		return nil, nil, err
 	}
 
+	// Fail over immediately when the account's image_gen allowance is spent:
+	// submitting anyway just burns the whole poll budget and surfaces as
+	// "image poll timeout". Unknown quota (init failed) proceeds as before.
+	if quota, qErr := c.fetchImageQuota(ctx, session, accessToken); qErr == nil && quota["unknown"] == false {
+		if remaining, ok := quota["remaining"].(int); ok && remaining <= 0 {
+			return nil, nil, fmt.Errorf("%w: image_gen remaining 0 (resets %s)", ErrQuotaExhausted, stringValue(quota["reset_after"]))
+		}
+	}
+
 	scriptSources, dataBuild, err := c.bootstrap(ctx, session)
 	if err != nil {
 		return nil, nil, err
@@ -94,11 +104,19 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if err != nil {
 		return nil, nil, err
 	}
-	session, err = c.newSession(accessToken)
+	// The SSE stream and conversation JSON echo the user's uploaded reference
+	// assets; treating those ids as "the generated image" would return the
+	// reference itself. Drop them from every id set we collect.
+	refIDs := uploadedRefIDSet(uploadedRefs)
+	fileIDs = dropIDs(fileIDs, refIDs)
+	sedimentIDs = dropIDs(sedimentIDs, refIDs)
+	// Poll / resolve / download run on the local IP (fresh direct session);
+	// only the submit phase above egressed via the proxy.
+	session, err = c.newDirectSession(accessToken)
 	if err != nil {
 		return nil, nil, err
 	}
-	fileIDs, sedimentIDs, err = c.pollForImage(ctx, session, accessToken, conversationID, fileIDs, sedimentIDs, pollBudget(ctx))
+	fileIDs, sedimentIDs, err = c.pollForImage(ctx, session, accessToken, conversationID, fileIDs, sedimentIDs, refIDs, pollBudget(ctx))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -138,10 +156,14 @@ func ExtractAccountInfo(token string) map[string]any {
 }
 
 func (c *Client) FetchImageQuota(ctx context.Context, accessToken string) (map[string]any, error) {
-	session, err := c.newSession(accessToken)
+	session, err := c.newDirectSession(accessToken)
 	if err != nil {
 		return nil, err
 	}
+	return c.fetchImageQuota(ctx, session, accessToken)
+}
+
+func (c *Client) fetchImageQuota(ctx context.Context, session tlsclient.HttpClient, accessToken string) (map[string]any, error) {
 	path := "/backend-api/conversation/init"
 	body, _ := json.Marshal(map[string]any{
 		"gizmo_id":                nil,
@@ -199,6 +221,17 @@ type chatRequirements struct {
 }
 
 func (c *Client) newSession(accessToken string) (tlsclient.HttpClient, error) {
+	return c.newSessionP(accessToken, true)
+}
+
+// newDirectSession egresses on the local IP (never the proxy). Used for the
+// poll / resolve / download phase; only the anti-bot-guarded submit phase
+// (bootstrap, chat-requirements, upload, conversation create) uses the proxy.
+func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, error) {
+	return c.newSessionP(accessToken, false)
+}
+
+func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpClient, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(600),
 		// Match the Python reference (curl_cffi impersonate="chrome110"): the
@@ -206,7 +239,7 @@ func (c *Client) newSession(accessToken string) (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(profiles.Chrome_110),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if c.proxy != "" {
+	if useProxy && c.proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(c.proxy))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
@@ -429,7 +462,7 @@ func (c *Client) uploadReferenceImages(ctx context.Context, session tlsclient.Ht
 
 func imageModelSlug(model string) string {
 	if strings.EqualFold(strings.TrimSpace(model), "gpt-image-2") {
-		return "gpt-5-3"
+		return "gpt-5-5-thinking"
 	}
 	return "auto"
 }
@@ -800,6 +833,28 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
 	var chunks []string
+	sseStart := time.Now()
+	// Watchdog: once the conversation id is known, the stream may go silent
+	// without ever emitting the async marker, leaving scanner.Scan() blocked on
+	// a read for the whole ctx budget. Closing the body unblocks the read so the
+	// loop exits and we fall through to polling.
+	convFound := make(chan struct{})
+	watchdogDone := make(chan struct{})
+	defer close(watchdogDone)
+	go func() {
+		select {
+		case <-convFound:
+		case <-watchdogDone:
+			return
+		}
+		timer := time.NewTimer(sseAsyncGrace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			resp.Body.Close()
+		case <-watchdogDone:
+		}
+	}()
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -816,6 +871,7 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 		if conversationID == "" {
 			if match := conversationIDRE.FindStringSubmatch(payload); len(match) >= 2 {
 				conversationID = match[1]
+				close(convFound)
 			}
 		}
 		newFiles, newSeds := scanForIDs(payload)
@@ -830,7 +886,12 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 		// conversation id there is nothing more to read here, so stop instead of
 		// holding the SSE open until [DONE] (a stalled stream would otherwise burn
 		// the whole generation budget and surface as "context deadline exceeded").
-		if asyncStarted && conversationID != "" {
+		//
+		// The async marker normally arrives within ~1s of the conversation id. We
+		// still only wait a short grace for it (the watchdog above unblocks a
+		// silent stream) so a request that never engages the async pipeline is
+		// detected quickly instead of burning the whole budget.
+		if conversationID != "" && (asyncStarted || time.Since(sseStart) >= sseAsyncGrace) {
 			break
 		}
 	}
@@ -842,6 +903,18 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	}
 	if conversationID == "" {
 		return "", nil, nil, errors.New("chatgpt SSE closed without conversation_id")
+	}
+	// Intermittently (~10% on gpt-5-5-thinking) the stream returns a conversation
+	// id but never emits the async pipeline marker and no image is ever produced —
+	// polling such a conversation only burns the whole budget and surfaces as the
+	// non-retryable "image poll timeout". The async marker is the reliable "the
+	// image generation task actually started" signal, so when it is absent (and
+	// nothing was streamed inline) treat the attempt as a transient upstream
+	// failure. That is retryable: a fresh submission reliably engages the pipeline,
+	// so the pool retries the same account a few times and then fails over to
+	// another account (换号重试) instead of failing the request.
+	if !asyncStarted && len(fileIDs) == 0 && len(sedimentIDs) == 0 {
+		return "", nil, nil, fmt.Errorf("%w: image generation did not start (no async marker)", ErrTemporaryUpstream)
 	}
 	return conversationID, fileIDs, sedimentIDs, nil
 }
@@ -865,6 +938,9 @@ func (c *Client) getConversation(ctx context.Context, session tlsclient.HttpClie
 	}
 	if err := ensureOK(resp.StatusCode, body, "conversation_get"); err != nil {
 		return nil, err
+	}
+	if dir := os.Getenv("CHATGPT_DEBUG_DUMP"); dir != "" {
+		_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("conv-%s-%d.json", conversationID, time.Now().UnixMilli())), body, 0o644)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -898,10 +974,10 @@ func pollBudget(ctx context.Context) time.Duration {
 	return budget
 }
 
-func (c *Client) pollForImage(ctx context.Context, session tlsclient.HttpClient, accessToken, conversationID string, initialFileIDs, initialSedimentIDs []string, timeout time.Duration) ([]string, []string, error) {
+func (c *Client) pollForImage(ctx context.Context, session tlsclient.HttpClient, accessToken, conversationID string, initialFileIDs, initialSedimentIDs []string, refIDs map[string]bool, timeout time.Duration) ([]string, []string, error) {
 	start := time.Now()
-	fileIDs := append([]string{}, initialFileIDs...)
-	sedimentIDs := append([]string{}, initialSedimentIDs...)
+	fileIDs := dropIDs(append([]string{}, initialFileIDs...), refIDs)
+	sedimentIDs := dropIDs(append([]string{}, initialSedimentIDs...), refIDs)
 	if len(fileIDs) == 0 {
 		time.Sleep(8 * time.Second)
 	} else {
@@ -925,12 +1001,12 @@ func (c *Client) pollForImage(ctx context.Context, session tlsclient.HttpClient,
 			return nil, nil, err
 		}
 		newFiles, newSeds := extractImageIDs(conv)
-		fileIDs = mergeStrings(fileIDs, newFiles)
-		sedimentIDs = mergeStrings(sedimentIDs, newSeds)
+		fileIDs = mergeStrings(fileIDs, dropIDs(newFiles, refIDs))
+		sedimentIDs = mergeStrings(sedimentIDs, dropIDs(newSeds, refIDs))
 		// Fail fast on a content-audit refusal: the assistant turn carries the
 		// rejection text and no image will ever land, so polling to timeout only
 		// wastes the whole budget. Only bail while we have no asset yet.
-		if len(fileIDs) == 0 && len(sedimentIDs) == 0 && conversationRejected(conv) {
+		if len(fileIDs) == 0 && len(sedimentIDs) == 0 && (conversationRejected(conv) || conversationEndedWithoutImage(conv)) {
 			return nil, nil, ErrContentPolicy
 		}
 		if len(fileIDs) > 0 || len(sedimentIDs) > 0 {
@@ -938,8 +1014,8 @@ func (c *Client) pollForImage(ctx context.Context, session tlsclient.HttpClient,
 			conv, err = c.getConversation(ctx, session, accessToken, conversationID)
 			if err == nil {
 				finalFiles, finalSeds := extractImageIDs(conv)
-				fileIDs = mergeStrings(fileIDs, finalFiles)
-				sedimentIDs = mergeStrings(sedimentIDs, finalSeds)
+				fileIDs = mergeStrings(fileIDs, dropIDs(finalFiles, refIDs))
+				sedimentIDs = mergeStrings(sedimentIDs, dropIDs(finalSeds, refIDs))
 			}
 			return fileIDs, sedimentIDs, nil
 		}
@@ -948,13 +1024,56 @@ func (c *Client) pollForImage(ctx context.Context, session tlsclient.HttpClient,
 	return nil, nil, errors.New("image poll timeout")
 }
 
+// uploadedRefIDSet collects every id belonging to the user's uploaded
+// reference images so they can be excluded from generated-asset extraction.
+func uploadedRefIDSet(refs []uploadedReference) map[string]bool {
+	ids := make(map[string]bool, len(refs)*2)
+	for _, ref := range refs {
+		if ref.FileID != "" {
+			ids[ref.FileID] = true
+		}
+		if ref.LibraryFileID != "" {
+			ids[ref.LibraryFileID] = true
+		}
+	}
+	return ids
+}
+
+func dropIDs(ids []string, exclude map[string]bool) []string {
+	if len(exclude) == 0 || len(ids) == 0 {
+		return ids
+	}
+	out := ids[:0]
+	for _, id := range ids {
+		if !exclude[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func (c *Client) getFileDownloadURL(ctx context.Context, session tlsclient.HttpClient, accessToken, conversationID, fileID string, inline bool) (string, error) {
-	// Python parity (_get_file_download_url): GET /backend-api/files/{id}/download
-	// with NO query params. The old /files/download/{id}?conversation_id&inline
-	// form returned an inline stream URL that 403s with "File stream access denied".
-	_ = conversationID
-	_ = inline
-	path := "/backend-api/files/" + fileID + "/download"
+	// Current web client form: GET /backend-api/files/download/{id}
+	// ?conversation_id=...&inline=false → {"status":"success","download_url":...}.
+	// Falls back to the legacy /files/{id}/download form if the new one fails.
+	paths := []string{
+		"/backend-api/files/download/" + fileID + "?conversation_id=" + conversationID + "&inline=" + strconv.FormatBool(inline),
+		"/backend-api/files/" + fileID + "/download",
+	}
+	var lastErr error
+	for _, path := range paths {
+		rawURL, err := c.fetchDownloadURL(ctx, session, accessToken, path)
+		if err == nil && rawURL != "" {
+			return rawURL, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	return "", lastErr
+}
+
+func (c *Client) fetchDownloadURL(ctx context.Context, session tlsclient.HttpClient, accessToken, path string) (string, error) {
 	req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		return "", err

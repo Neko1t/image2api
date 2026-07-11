@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -21,9 +22,10 @@ type AdminReadService struct {
 	tokens   *repo.TokenRepository
 	cdks     *repo.CDKRepository
 	store    *storage.Client
+	showcase *repo.ShowcaseRepository
 }
 
-func NewAdminReadService(cfg *config.Config, users *repo.UserRepository, models *repo.ModelRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, tokens *repo.TokenRepository, cdks *repo.CDKRepository, store *storage.Client) *AdminReadService {
+func NewAdminReadService(cfg *config.Config, users *repo.UserRepository, models *repo.ModelRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, tokens *repo.TokenRepository, cdks *repo.CDKRepository, store *storage.Client, showcase *repo.ShowcaseRepository) *AdminReadService {
 	return &AdminReadService{
 		cfg:      cfg,
 		users:    users,
@@ -33,7 +35,26 @@ func NewAdminReadService(cfg *config.Config, users *repo.UserRepository, models 
 		tokens:   tokens,
 		cdks:     cdks,
 		store:    store,
+		showcase: showcase,
 	}
+}
+
+// showcaseFileList returns the homepage showcase image keys (no leading slash).
+// User-facing galleries and the admin image manager hide these files — they
+// belong to the public landing page, not to anyone's personal works.
+func (s *AdminReadService) showcaseFileList(ctx context.Context) []string {
+	if s.showcase == nil {
+		return nil
+	}
+	set, err := s.showcase.PublicFileSet(ctx)
+	if err != nil || len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	return out
 }
 
 func (s *AdminReadService) Users(ctx context.Context) ([]model.User, map[string]any, error) {
@@ -54,6 +75,10 @@ func (s *AdminReadService) Models(ctx context.Context) ([]model.ModelConfig, err
 	return s.models.List(ctx)
 }
 
+func (s *AdminReadService) ModelNameMap(ctx context.Context) (map[string]string, error) {
+	return s.models.NameMap(ctx)
+}
+
 func (s *AdminReadService) ModelsView(ctx context.Context) ([]map[string]any, error) {
 	items, err := s.models.List(ctx)
 	if err != nil {
@@ -63,6 +88,7 @@ func (s *AdminReadService) ModelsView(ctx context.Context) ([]map[string]any, er
 	for _, item := range items {
 		out = append(out, map[string]any{
 			"id":                    item.ID,
+			"alias":                 item.Alias,
 			"type":                  item.Type,
 			"name":                  item.Name,
 			"provider":              item.Provider,
@@ -86,7 +112,11 @@ func (s *AdminReadService) ModelsView(ctx context.Context) ([]map[string]any, er
 	return out, nil
 }
 
-func (s *AdminReadService) Logs(ctx context.Context, limit, offset int, kind, status string, statuses []string, since *time.Time, userID, excludeSource, source string, hasFile bool) ([]model.EventLog, int64, *repo.EventStats, error) {
+func (s *AdminReadService) Logs(ctx context.Context, limit, offset int, kind, status string, statuses []string, since *time.Time, userID string, userIDs []string, query, excludeSource, source string, hasFile, excludeShowcase, mediaOnly bool) ([]model.EventLog, int64, *repo.EventStats, error) {
+	var excludeFiles []string
+	if excludeShowcase {
+		excludeFiles = s.showcaseFileList(ctx)
+	}
 	items, total, err := s.events.List(ctx, repo.EventListFilter{
 		Limit:         limit,
 		Offset:        offset,
@@ -95,9 +125,13 @@ func (s *AdminReadService) Logs(ctx context.Context, limit, offset int, kind, st
 		Statuses:      statuses,
 		Since:         since,
 		UserID:        userID,
+		UserIDs:       userIDs,
+		Query:         query,
 		ExcludeSource: excludeSource,
 		Source:        source,
 		HasFile:       hasFile,
+		ExcludeFiles:  excludeFiles,
+		MediaOnly:     mediaOnly,
 	})
 	if err != nil {
 		return nil, 0, nil, err
@@ -113,6 +147,30 @@ func (s *AdminReadService) Logs(ctx context.Context, limit, offset int, kind, st
 		return nil, 0, nil, err
 	}
 	return items, total, stats, nil
+}
+
+// MatchUserIDs resolves an admin 用户搜索 term to the set of user ids whose
+// name, email or id contains the term (case-insensitive). Returns a non-nil,
+// possibly empty slice — an empty slice means "no user matched" and the caller
+// should return zero rows rather than dropping the filter.
+func (s *AdminReadService) MatchUserIDs(ctx context.Context, term string) ([]string, error) {
+	term = strings.ToLower(strings.TrimSpace(term))
+	if term == "" {
+		return nil, nil
+	}
+	users, err := s.users.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, u := range users {
+		if strings.Contains(strings.ToLower(u.Name), term) ||
+			strings.Contains(strings.ToLower(u.Email), term) ||
+			strings.Contains(strings.ToLower(u.ID), term) {
+			out = append(out, u.ID)
+		}
+	}
+	return out, nil
 }
 
 // UserNameMap builds an id -> display name lookup (name, else email, else id)
@@ -164,13 +222,25 @@ func (s *AdminReadService) Stats(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	recentFiles, _ := s.RecentImages(ctx, 24)
-	files, fileStats, _ := s.scanGeneratedFiles(ctx)
+	files, _, _ := s.scanGeneratedFiles(ctx)
+	// Exclude homepage showcase media so 已生成作品 matches the 作品管理 total.
+	pinned := map[string]struct{}{}
+	if s.showcase != nil {
+		if set, perr := s.showcase.PublicFileSet(ctx); perr == nil {
+			pinned = set
+		}
+	}
+	var count int
 	var size int64
-	if v, ok := fileStats["size_bytes"].(int64); ok {
-		size = v
+	for _, f := range files {
+		if _, ok := pinned[strings.TrimLeft(f.Name, "/")]; ok {
+			continue
+		}
+		count++
+		size += f.Size
 	}
 	return map[string]any{
-		"generated_count":      len(files),
+		"generated_count":      count,
 		"generated_size_bytes": size,
 		"recent":               recentFiles,
 		"avg_elapsed_ms":       stats.AvgElapsedMS,
@@ -186,7 +256,23 @@ func (s *AdminReadService) Dashboard(ctx context.Context) (map[string]any, error
 	now := time.Now()
 	dayCut := now.Add(-24 * time.Hour)
 	weekCut := now.Add(-3 * 24 * time.Hour) // "week" key = last 3 days (per admin request)
+	// "today" = since local midnight (Asia/Shanghai, the app's business tz), not a
+	// rolling 24h — so 今日消耗/生成 resets at 00:00 the way the admin expects.
+	loc, lerr := time.LoadLocation("Asia/Shanghai")
+	if lerr != nil {
+		loc = time.Local
+	}
+	nowLocal := now.In(loc)
+	todayCut := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), 0, 0, 0, 0, loc)
 
+	today, err := s.events.WindowStats(ctx, todayCut)
+	if err != nil {
+		return nil, err
+	}
+	todayDau, err := s.events.DistinctUsersSince(ctx, todayCut)
+	if err != nil {
+		return nil, err
+	}
 	day, err := s.events.WindowStats(ctx, dayCut)
 	if err != nil {
 		return nil, err
@@ -275,6 +361,8 @@ func (s *AdminReadService) Dashboard(ctx context.Context) (map[string]any, error
 	}
 
 	return map[string]any{
+		"today":          today,
+		"today_dau":      todayDau,
 		"day":            day,
 		"week":           week,
 		"prev_day_total": prevDay,
@@ -397,12 +485,31 @@ func (s *AdminReadService) Images(ctx context.Context, limit, offset int, kind s
 	if offset < 0 {
 		offset = 0
 	}
-	allFiles, stats, err := s.scanGeneratedFiles(ctx)
+	allFiles, _, err := s.scanGeneratedFiles(ctx)
 	if err != nil {
 		return nil, 0, nil, err
 	}
+	// Homepage showcase media never shows in the image manager — it's public
+	// landing-page content, managed on the 首页内容 page instead.
+	pinned := map[string]struct{}{}
+	if s.showcase != nil {
+		if set, perr := s.showcase.PublicFileSet(ctx); perr == nil {
+			pinned = set
+		}
+	}
+	// KPI stats must reflect what the manager actually shows, so recompute them
+	// after dropping showcase files (independent of the kind tab filter).
+	stats := map[string]any{"total": 0, "image": 0, "video": 0, "size_bytes": int64(0)}
 	filtered := make([]generatedFile, 0, len(allFiles))
 	for _, item := range allFiles {
+		if _, ok := pinned[strings.TrimLeft(item.Name, "/")]; ok {
+			continue
+		}
+		if _, ok := stats[item.Kind]; ok {
+			stats[item.Kind] = stats[item.Kind].(int) + 1
+		}
+		stats["total"] = stats["total"].(int) + 1
+		stats["size_bytes"] = stats["size_bytes"].(int64) + item.Size
 		if kind == "" || item.Kind == kind {
 			filtered = append(filtered, item)
 		}
@@ -423,6 +530,10 @@ func (s *AdminReadService) Images(ctx context.Context, limit, offset int, kind s
 	if err != nil {
 		return nil, 0, nil, err
 	}
+	nameMap, err := s.models.NameMap(ctx)
+	if err != nil {
+		return nil, 0, nil, err
+	}
 	out := make([]map[string]any, 0, len(page))
 	for _, item := range page {
 		row := map[string]any{
@@ -435,13 +546,19 @@ func (s *AdminReadService) Images(ctx context.Context, limit, offset int, kind s
 			"resolution": "",
 			"ratio":      "",
 			"duration":   "",
+			"deai":       false,
 		}
 		if event, ok := index[item.Name]; ok {
 			row["prompt"] = event.Prompt
-			row["model"] = event.Model
+			if eff, ok := nameMap[event.Model]; ok && eff != "" {
+				row["model"] = eff
+			} else {
+				row["model"] = event.Model
+			}
 			row["resolution"] = event.Resolution
 			row["ratio"] = event.Ratio
 			row["duration"] = event.Duration
+			row["deai"] = event.DeAI
 		}
 		out = append(out, row)
 	}
@@ -508,6 +625,44 @@ func (s *AdminReadService) RecentImagesOwned(ctx context.Context, owner string, 
 		out = append(out, map[string]any{"name": f.Name, "size": f.Size, "mtime": f.MTime, "kind": f.Kind})
 	}
 	return out, nil
+}
+
+// DeleteOwnedFile removes a generated media object (and its thumbnail) that
+// lives under the given owner directory, then blanks the file reference on the
+// matching log rows so galleries and the 画图台 grid stop showing it. The owner
+// prefix check keeps a user from deleting anyone else's files.
+func (s *AdminReadService) DeleteOwnedFile(ctx context.Context, owner, rel string) error {
+	owner = strings.TrimSpace(owner)
+	rel = strings.TrimLeft(strings.TrimSpace(rel), "/")
+	if owner == "" {
+		return errors.New("invalid file")
+	}
+	if !strings.HasPrefix(rel, owner+"/") {
+		return errors.New("file not owned by caller")
+	}
+	return s.DeleteFile(ctx, rel)
+}
+
+// DeleteFile removes any generated media object (and its derived stills) and
+// blanks the log rows referencing it. Admin 图片管理 delete — no owner check.
+func (s *AdminReadService) DeleteFile(ctx context.Context, rel string) error {
+	rel = strings.TrimLeft(strings.TrimSpace(rel), "/")
+	if rel == "" || strings.Contains(rel, "..") {
+		return errors.New("invalid file")
+	}
+	if s.store == nil || !s.store.Configured() {
+		return errors.New("storage not configured")
+	}
+	if err := s.store.Delete(ctx, rel); err != nil {
+		return err
+	}
+	// Best-effort derived stills; old files may not have them.
+	_ = s.store.Delete(ctx, ThumbKey(rel))
+	_ = s.store.Delete(ctx, LastFrameKey(rel))
+	if _, err := s.events.ClearFiles(ctx, []string{rel}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *AdminReadService) eventIndexByFile(ctx context.Context) (map[string]model.EventLog, error) {

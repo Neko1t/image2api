@@ -30,6 +30,7 @@ async function load() {
   loading.value = true
   const qs = new URLSearchParams({ limit: String(pageSize), offset: String((page.value - 1) * pageSize) })
   if (status.value) qs.set('status', status.value)
+  if (search.value.trim()) qs.set('q', search.value.trim())
   const r = await api('/pay/admin/orders?' + qs.toString())
   loading.value = false
   if (r.ok) {
@@ -39,14 +40,9 @@ async function load() {
 }
 onMounted(load)
 
-const displayed = computed(() => {
-  const q = search.value.trim().toLowerCase()
-  if (!q) return items.value
-  return items.value.filter((o) =>
-    (o.id || '').toLowerCase().includes(q) ||
-    (o.user_name || '').toLowerCase().includes(q) ||
-    String(o.amount).includes(q))
-})
+// 搜索走服务端(跨页)，直接展示服务端返回的当页结果。
+const displayed = computed(() => items.value)
+function doSearch() { page.value = 1; load() }
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 const pageStart = computed(() => total.value === 0 ? 0 : (page.value - 1) * pageSize + 1)
 const pageEnd = computed(() => Math.min(total.value, page.value * pageSize))
@@ -84,7 +80,8 @@ function goPage(n) {
           <button v-for="s in [['','全部'],['pending','待支付'],['paid','已支付'],['cancelled','已取消']]" :key="s[0]"
                   @click="setStatus(s[0])" class="fp" :class="status === s[0] && 'fp-on'">{{ s[1] }}</button>
         </div>
-        <input v-model="search" class="field !py-1.5 text-xs !w-52" placeholder="搜索 订单号 / 用户名 / 金额…" />
+        <input v-model="search" @keyup.enter="doSearch" @change="doSearch"
+               class="field !py-1.5 text-xs !w-52" placeholder="搜索 订单号 / 用户名 / 金额…" />
         <button @click="load" class="btn-soft"><Icon name="refresh" class="w-3.5 h-3.5" /> 刷新</button>
       </div>
     </div>

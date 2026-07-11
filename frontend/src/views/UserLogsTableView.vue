@@ -54,6 +54,7 @@ async function load() {
   })
   if (statusFilter.value) qs.set('status', statusFilter.value)
   if (SOURCE_PARAM[sourceFilter.value]) qs.set('source', SOURCE_PARAM[sourceFilter.value])
+  if (search.value.trim()) qs.set('q', search.value.trim())
   const r = await api('/logs?' + qs.toString())
   loading.value = false
   if (r.ok) {
@@ -72,15 +73,9 @@ const sourcePill = (e) => (isApi(e)
   ? 'bg-violet-50 text-violet-700 ring-violet-200'
   : 'bg-sky-50 text-sky-700 ring-sky-200')
 
-// 搜索只在当前页内过滤(状态/来源已由服务端筛选并分页)。
-const displayed = computed(() => {
-  const q = search.value.trim().toLowerCase()
-  if (!q) return items.value
-  return items.value.filter((e) =>
-    (e.model || '').toLowerCase().includes(q) ||
-    (e.prompt || '').toLowerCase().includes(q) ||
-    (e.error || '').toLowerCase().includes(q))
-})
+// 搜索走服务端(跨页)，直接展示服务端返回的当页结果。
+const displayed = computed(() => items.value)
+function doSearch() { page.value = 1; load() }
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 const pageStart = computed(() => total.value === 0 ? 0 : (page.value - 1) * pageSize + 1)
 const pageEnd = computed(() => Math.min(total.value, page.value * pageSize))
@@ -178,7 +173,8 @@ const params = (e) => {
                 :class="sourceFilter === s[0] ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'">{{ s[1] }}</button>
       </div>
       <div class="flex-1 min-w-[180px]">
-        <input v-model="search" class="field !py-1.5 text-xs" placeholder="搜索 提示词 / 模型 / 错误…" />
+        <input v-model="search" @keyup.enter="doSearch" @change="doSearch"
+               class="field !py-1.5 text-xs" placeholder="搜索 提示词 / 模型 / 错误…" />
       </div>
       <button @click="load" class="btn-soft"><Icon name="refresh" class="w-3.5 h-3.5" /> 刷新</button>
     </div>
@@ -197,8 +193,7 @@ const params = (e) => {
           <col class="w-16" />     <!-- preview -->
           <col class="w-28" />     <!-- time -->
           <col class="w-24" />     <!-- status -->
-          <col class="w-28" />     <!-- user/account -->
-          <col class="w-36" />     <!-- model -->
+          <col class="w-56" />     <!-- model -->
           <col />                  <!-- prompt/error -->
           <col class="w-40" />     <!-- params -->
           <col class="w-14" />     <!-- cost -->
@@ -209,7 +204,6 @@ const params = (e) => {
             <th class="text-center px-3 py-3 font-medium">预览</th>
             <th class="text-left px-3 py-3 font-medium">时间</th>
             <th class="text-left px-3 py-3 font-medium">状态</th>
-            <th class="text-left px-3 py-3 font-medium">用户 / 账号</th>
             <th class="text-left px-3 py-3 font-medium">模型</th>
             <th class="text-left px-3 py-3 font-medium">提示词 / 错误</th>
             <th class="text-left px-3 py-3 font-medium">参数</th>
@@ -243,11 +237,7 @@ const params = (e) => {
               </span>
             </td>
             <td class="px-3 py-3 align-middle min-w-0">
-              <div class="text-xs text-slate-700 truncate" :title="e.user_name || '匿名'">{{ e.user_name || '匿名' }}</div>
-              <div v-if="e.account" class="mt-0.5 text-[11px] text-slate-400 truncate" :title="e.account">{{ e.account }}</div>
-            </td>
-            <td class="px-3 py-3 align-middle min-w-0">
-              <div class="font-mono text-xs text-slate-800 truncate" :title="e.model">{{ e.model }}</div>
+              <div class="font-mono text-xs text-slate-800 break-all" :title="e.model">{{ e.model }}</div>
               <div class="mt-0.5 flex items-center gap-1.5">
                 <span class="text-[10px] uppercase tracking-wider font-medium"
                       :class="e.kind === 'video' ? 'text-fuchsia-600' : 'text-indigo-600'">
@@ -266,7 +256,7 @@ const params = (e) => {
                    :title="e.error + ' — 点击复制'"
                    @click.stop="copyError(e)">⚠ {{ e.error }}</div>
             </td>
-            <td class="px-3 py-3 align-middle text-xs text-slate-500 tabular-nums">{{ params(e) || '—' }}</td>
+            <td class="px-3 py-3 align-middle text-xs text-slate-500 tabular-nums">{{ params(e) || '—' }}<span v-if="e.deai"> · <span class="text-[#7c3aed]">去AI特征</span></span></td>
             <td class="px-3 py-3 align-middle text-right text-xs text-slate-700 tabular-nums">{{ e.cost ? points(e.cost) : '—' }}</td>
             <td class="px-3 py-3 align-middle text-right text-xs text-slate-500 tabular-nums">{{ e.elapsed_ms ? (e.elapsed_ms / 1000).toFixed(1) + 's' : '—' }}</td>
           </tr>

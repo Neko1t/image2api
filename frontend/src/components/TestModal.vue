@@ -8,6 +8,7 @@ const props = defineProps({
   model: { type: Object, required: true },
 })
 const emit = defineEmits(['close'])
+const publishName = computed(() => props.model.alias || props.model.id)
 
 const isVideo = props.model.type === 'video'
 
@@ -124,7 +125,7 @@ async function run() {
   resultUrl.value = ''
   resultKind.value = ''
   const payload = {
-    model: props.model.id,
+    model: publishName.value,
     prompt: prompt.value,
     ratio: ratio.value,
     resolution: resolution.value,
@@ -198,7 +199,7 @@ async function recover() {
       <div class="px-5 py-4 border-b border-white/[0.06] flex items-center justify-between">
         <div class="min-w-0">
           <h2 class="text-sm font-semibold">测试模型</h2>
-          <div class="text-xs text-white/45 font-mono truncate">{{ model.id }}</div>
+          <div class="text-xs text-white/45 font-mono truncate">{{ publishName }}</div>
         </div>
         <button @click="emit('close')" class="text-white/40 hover:text-white transition-colors">
           <Icon name="close" class="w-5 h-5" />

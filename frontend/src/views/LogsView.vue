@@ -14,6 +14,7 @@ const kindFilter = ref('')     // '' | 'image' | 'video'
 const statusFilter = ref('')   // '' | 'success' | 'failed' | 'pending'
 const sourceFilter = ref('')   // '' | 'v1' | 'user' | 'admin'
 const search = ref('')
+const userSearch = ref('')   // 服务端用户搜索：名称 / 邮箱 / ID，跨页生效
 const page = ref(1)
 const pageSize = ref(15)
 const total = ref(0)
@@ -42,6 +43,8 @@ async function load() {
   if (kindFilter.value) qs.set('kind', kindFilter.value)
   if (statusFilter.value) qs.set('status', statusFilter.value)
   if (sourceFilter.value) qs.set('source', sourceFilter.value)
+  if (userSearch.value.trim()) qs.set('user', userSearch.value.trim())
+  if (search.value.trim()) qs.set('q', search.value.trim())
   const r = await api('/logs?' + qs.toString())
   items.value = r.data?.data || []
   total.value = Number(r.data?.total ?? items.value.length)
@@ -83,16 +86,10 @@ function goPage(n) {
 function setKind(v) { kindFilter.value = v; page.value = 1; load() }
 function setStatus(v) { statusFilter.value = v; page.value = 1; load() }
 function setSource(v) { sourceFilter.value = v; page.value = 1; load() }
+function doUserSearch() { page.value = 1; load() }
 
-const filtered = computed(() => {
-  const q = search.value.trim().toLowerCase()
-  if (!q) return items.value
-  return items.value.filter((e) =>
-    (e.model || '').toLowerCase().includes(q) ||
-    (e.prompt || '').toLowerCase().includes(q) ||
-    (e.error || '').toLowerCase().includes(q),
-  )
-})
+// 搜索全部走服务端(跨页)，页面直接展示服务端返回的当页结果。
+const filtered = computed(() => items.value)
 
 function fmtMs(ms) {
   if (!ms) return '—'
@@ -203,8 +200,13 @@ const sourcePill = (s) => ({
         <button @click="setSource('v1')" class="fp" :class="sourceFilter === 'v1' && 'fp-on'">API</button>
         <button @click="setSource('admin')" class="fp" :class="sourceFilter === 'admin' && 'fp-on'">测试</button>
       </div>
+      <div class="w-44">
+        <input v-model="userSearch" @keyup.enter="doUserSearch" @change="doUserSearch"
+               class="field !py-1.5 text-xs" placeholder="搜索用户 名称/邮箱/ID…" />
+      </div>
       <div class="flex-1 min-w-[200px]">
-        <input v-model="search" class="field !py-1.5 text-xs" placeholder="搜索 模型 / 提示词 / 错误…" />
+        <input v-model="search" @keyup.enter="doUserSearch" @change="doUserSearch"
+               class="field !py-1.5 text-xs" placeholder="搜索 模型 / 提示词 / 错误…" />
       </div>
       <button @click="load" class="btn-soft">
         <Icon name="refresh" class="w-3.5 h-3.5" /> 刷新
@@ -216,9 +218,7 @@ const sourcePill = (s) => ({
       <div v-if="loading && !items.length" class="text-center text-sm text-white/40 py-20">加载中…</div>
       <div v-else-if="!filtered.length" class="flex flex-col items-center gap-3 text-white/40 py-20">
         <span class="w-14 h-14 rounded-2xl bg-white/[0.04] grid place-items-center"><Icon name="files" class="w-6 h-6" /></span>
-        <!-- Search is client-side over the CURRENT page only, so "no match" here
-             doesn't mean the term is absent globally — say so to avoid confusion. -->
-        <span class="text-sm">{{ search.trim() ? '当前页没有匹配的记录(搜索仅作用于本页)' : '还没有日志' }}</span>
+        <span class="text-sm">{{ (search.trim() || userSearch.trim()) ? '没有匹配的记录' : '还没有日志' }}</span>
       </div>
 
       <!-- Each row is a thumbnail + a stack of model/prompt + a meta line.
@@ -230,7 +230,7 @@ const sourcePill = (s) => ({
           <col class="w-32" />        <!-- time -->
           <col class="w-24" />        <!-- status -->
           <col class="w-28" />        <!-- user -->
-          <col class="w-40" />        <!-- model -->
+          <col class="w-56" />        <!-- model -->
           <col />                     <!-- prompt + error -->
           <col class="w-48" />        <!-- params -->
           <col class="w-16" />        <!-- credits -->
@@ -288,7 +288,7 @@ const sourcePill = (s) => ({
               <div v-if="e.account" class="mt-0.5 text-[11px] text-white/45 truncate" :title="e.account">{{ e.account }}</div>
             </td>
             <td class="px-3 py-3.5 align-middle min-w-0">
-              <div class="font-mono text-xs text-white/90 truncate" :title="e.model">{{ e.model }}</div>
+              <div class="font-mono text-xs text-white/90 break-all" :title="e.model">{{ e.model }}</div>
               <div class="mt-1 flex items-center gap-1.5 min-w-0">
                 <span class="text-[10px] uppercase tracking-wider font-medium truncate min-w-0"
                       :class="e.kind === 'video' ? 'text-fuchsia-300/80' : 'text-indigo-300/80'">
@@ -324,6 +324,10 @@ const sourcePill = (s) => ({
               <template v-if="e.refs > 0">
                 <span class="text-white/25 mx-1.5">·</span>
                 <span class="text-white/40">参考 {{ e.refs }}</span>
+              </template>
+              <template v-if="e.deai">
+                <span class="text-white/25 mx-1.5">·</span>
+                <span class="text-[#7c3aed]">去AI特征</span>
               </template>
             </td>
             <td class="px-3 py-3.5 text-right text-xs tabular-nums align-middle whitespace-nowrap">

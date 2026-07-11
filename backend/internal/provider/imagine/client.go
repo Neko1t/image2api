@@ -264,7 +264,7 @@ func (c *Client) RefreshIfNeeded(ctx context.Context, cred string) (string, bool
 }
 
 func (c *Client) refreshPost(ctx context.Context, refreshToken string) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -305,7 +305,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cred string) (map[stri
 		return unknownBalance("bad credential"), nil
 	}
 	userID := userIDFromToken(cr.Token)
-	body, status, err := c.apiGet(ctx, cr.Token, apiBase+"/v1/credit?org_id="+userID)
+	body, status, err := c.apiGetP(ctx, cr.Token, apiBase+"/v1/credit?org_id="+userID, false)
 	if err != nil {
 		return unknownBalance("network: " + err.Error()), nil
 	}
@@ -337,7 +337,12 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cred string) (map[stri
 // ---------------------------------------------------------------------------
 
 func (c *Client) apiGet(ctx context.Context, token, url string) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+	return c.apiGetP(ctx, token, url, true)
+}
+
+// apiGetP picks the egress: polling runs direct (local IP).
+func (c *Client) apiGetP(ctx context.Context, token, url string, useProxy bool) ([]byte, int, error) {
+	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -365,12 +370,18 @@ func (c *Client) apiGet(ctx context.Context, token, url string) ([]byte, int, er
 	return b, resp.StatusCode, err
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) {
+func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+
+// newDirectTLSClient egresses on the local IP (never the proxy). Used for
+// polling and result download.
+func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
+
+func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if c.proxy != "" {
+	if useProxy && c.proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(c.proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)

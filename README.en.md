@@ -86,6 +86,8 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 - Images + videos in one place, with **image-to-image / reference frames** (first frame, last frame, style reference)
 - Multiple resolutions (images 1K / 2K / 4K · videos 720p / 1080p), aspect ratios and video durations — configured and priced per model
 - 7 providers, 10+ models, **enable / disable / re-price from the admin console**, no code changes
+- **Model aliases**: one model can expose multiple public ids — API calls with any alias resolve to it
+- **De-AI fingerprint** (optional): one-click toggle on the playground — generated images get anti-AI-detection post-processing (subtle detail jitter + metadata stripping), charged as a per-tier surcharge (defaults 1K+1 / 2K+2 / 4K+3 credits, admin-configurable, can be disabled globally); processed works carry a "de-AI" badge across the playground, gallery, logs and admin image manager
 
 #### 🔌 OpenAI Compatible
 - Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`) · `/v1/models`
@@ -103,7 +105,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 - Daily quota recovered at each provider's reset time, then re-probed for the real balance
 
 #### 💳 Billing & Operations
-- Credit-based (**pre-deduct + refund on failure**), priced per model / resolution / duration
+- Credit-based (**pre-deduct + refund on failure**), priced per model / resolution / duration; de-AI fingerprint adds a per-tier surcharge
 - **Agent pricing**: a user can be set as an "agent" role and models can carry agent prices; agent users (including their API key calls) are billed at the agent price, falling back to the normal price when unset
 - **Online top-up (易支付 / epay)**: WeChat / Alipay QR, preset + custom amounts, unpaid orders auto-cancel after 30 min, MD5-verified idempotent callback auto-credits; cumulative top-up tracked
 - **CDK redeem codes** · **referral rewards** · email sign-up / verification code / password reset
@@ -112,12 +114,15 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 
 #### 🖥️ User Frontend (Vue 3)
 - Playground · creations gallery · generation logs (with failure reasons / source tags)
+- Gallery **multi-select batch ops**: select page / bulk delete (videos take their frame stills along) / bulk download (multiple files auto-packed into a zip, fetched concurrently)
+- Lightbox preview with built-in **copy original / download / close** buttons; one-click copy of the original image from cards
 - **Top-up · Orders** (recharge history / resume unpaid) · API docs · API key management · referral · about, light / dark theme
 - **In-app announcements**: a Markdown notice pops up after login and re-shows whenever its content changes
 
 #### 🛠️ Admin Console
 - Overview dashboard (trends / DAU / top failures / top spenders)
-- Model management (normal + agent price) · account management (bulk import / dedup / quota) · **concurrency groups** · **order management** (filter / search / paginate) · site-wide logs · user management (set as agent / assign concurrency group / view cumulative top-up) · CDK · showcase · **announcements** · site config (incl. epay)
+- Model management (normal + agent price + aliases) · account management (bulk import / dedup / quota) · **concurrency groups** · **order management** (filter / search / paginate) · site-wide logs · user management (set as agent / assign concurrency group / view cumulative top-up / banned-word hits) · CDK · image management (multi-select bulk delete / zip download) · showcase · **announcements** · site config (incl. epay, de-AI fingerprint toggle & surcharge pricing)
+- **Banned words**: add / remove words in the console (paginated + multi-select bulk delete); prompts containing a banned word are rejected outright (playground + API, case-insensitive), with per-word / per-user hit counters
 
 **🧰 Engineering highlights**: tls-client (Chrome JA3/JA4 fingerprint) reliably passes Cloudflare · media stored in S3/RustFS, served through an authenticated proxy with retention cleanup · self-healing maintenance loop (quota recovery / credential refresh / orphan-job cleanup with refunds) · one-command Docker deploy (TLS via your own reverse proxy).
 

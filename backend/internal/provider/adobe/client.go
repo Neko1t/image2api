@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/url"
 	"strings"
 	"time"
@@ -36,7 +37,20 @@ var (
 	ErrQuotaExhausted    = errors.New("adobe quota exhausted")
 	ErrTemporaryUpstream = errors.New("adobe upstream temporary error")
 	ErrDeadUpstream      = errors.New("adobe upstream fatal error")
+	// ErrContentRejected is Adobe's content-safety filter refusing the prompt or
+	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
+	// the account's — every account rejects the same content — so the caller must
+	// surface it as-is without penalizing/killing the account or failing over.
+	ErrContentRejected = errors.New("adobe content rejected")
 )
+
+// isContentRejection reports whether an Adobe response (status + body) is a
+// content-safety refusal rather than a genuine upstream/account failure. Adobe
+// returns HTTP 451 with an "*_unsafe" error_code when moderation blocks the
+// prompt or the produced image.
+func isContentRejection(status int, body string) bool {
+	return status == 451 && strings.Contains(body, "unsafe")
+}
 
 var profileURLs = []string{
 	"https://ims-na1.adobelogin.com/ims/profile/v1",
@@ -60,11 +74,11 @@ func (c *Client) SetProxy(proxy string) {
 }
 
 func (c *Client) ExchangeCookie(ctx context.Context, cookie string) (*CookieExchangeResult, error) {
-	client, err := c.newTLSClient()
+	sess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err
 	}
-	return exchangeCookieWithTLSClient(ctx, client, cookie)
+	return exchangeCookieWithTLSClient(ctx, sess, cookie)
 }
 
 // uploadMaxRetries is how many extra in-place attempts a transient upload
@@ -77,6 +91,7 @@ const uploadMaxRetries = 5
 // its original (non-temporary) classification so the account is not penalized
 // for a network blip.
 func (c *Client) UploadImage(ctx context.Context, token string, content []byte, contentType, engine string) (string, error) {
+	// Reference-image upload runs on the local IP (not the proxy).
 	body, err, retryable := c.uploadImageOnce(ctx, token, content, contentType, engine)
 	for attempt := 0; err != nil && retryable && attempt < uploadMaxRetries && ctx.Err() == nil; attempt++ {
 		body, err, retryable = c.uploadImageOnce(ctx, token, content, contentType, engine)
@@ -106,7 +121,7 @@ func (c *Client) UploadImage(ctx context.Context, token string, content []byte, 
 // body plus whether a failure is retryable (transport error / 429/451/5xx).
 // Auth failures (401/403) and other non-200s are not retryable.
 func (c *Client) uploadImageOnce(ctx context.Context, token string, content []byte, contentType, engine string) ([]byte, error, bool) {
-	client, err := c.newTLSClient()
+	sess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err, false
 	}
@@ -125,7 +140,7 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 		"x-api-key":     {c.apiKey},
 		"content-type":  {defaultString(contentType, "image/png")},
 		"accept":        {"*/*"},
-		"user-agent":    {defaultUserAgent},
+		"user-agent":    {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -135,7 +150,7 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 		},
 	}
 
-	resp, err := client.Do(req)
+	resp, err := sess.client.Do(req)
 	if err != nil {
 		// Transport error (incl. Client.Timeout on the storage endpoint) — a
 		// network blip, retryable on a fresh connection.
@@ -160,7 +175,13 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 }
 
 func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string) ([]byte, map[string]any, error) {
-	client, err := c.newTLSClient()
+	// Only the generate submit goes through the proxy; polling + download run on
+	// the local IP.
+	submitSess, err := c.newTLSClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	pollSess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -178,9 +199,9 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 		candidates = BuildImagePayloadCandidates(modelID, prompt, aspectRatio, resolution, blobIDs)
 	}
 	for _, payload := range candidates {
-		respBody, pollURL, err := c.submitImage(ctx, client, token, prompt, endpoint, payload)
+		respBody, pollURL, err := c.submitImage(ctx, submitSess, token, prompt, endpoint, payload)
 		if err == nil {
-			meta, data, pollErr := c.pollImage(ctx, client, token, pollURL)
+			meta, data, pollErr := c.pollImage(ctx, pollSess, token, pollURL)
 			if pollErr != nil {
 				return nil, nil, pollErr
 			}
@@ -188,9 +209,14 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 		}
 		lastBody = respBody
 		lastErr = err
-		if errors.Is(err, ErrAuth) || errors.Is(err, ErrQuotaExhausted) {
+		if errors.Is(err, ErrAuth) || errors.Is(err, ErrQuotaExhausted) || errors.Is(err, ErrContentRejected) {
 			return nil, nil, err
 		}
+	}
+	// Content-safety refusal: the prompt/image is blocked, retrying other payloads
+	// or accounts is pointless — surface it as-is so the pool doesn't fail over.
+	if errors.Is(lastErr, ErrContentRejected) {
+		return nil, nil, fmt.Errorf("%w: adobe submit: %s", ErrContentRejected, clip(lastBody, 300))
 	}
 	// Preserve the temporary classification so the pool retries (overload / 5xx /
 	// rate-limit) instead of failing the request outright.
@@ -208,7 +234,12 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 // in meta["video_url"] — used by the async /v1/videos job, which proxies that URL
 // on /content instead of persisting the file.
 func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
-	client, err := c.newTLSClient()
+	// Only the submit goes through the proxy; polling + download run on the local IP.
+	submitSess, err := c.newTLSClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	pollSess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -218,12 +249,12 @@ func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspec
 	if engine == "firefly-video" {
 		endpoint = fireflyVideoSubmitURL
 	}
-	respBody, pollURL, err := c.submitVideo(ctx, client, token, endpoint, payload)
+	respBody, pollURL, err := c.submitVideo(ctx, submitSess, token, endpoint, payload)
 	if err != nil {
 		return nil, nil, err
 	}
 	_ = respBody
-	meta, data, pollErr := c.pollVideo(ctx, client, token, pollURL, downloadResult)
+	meta, data, pollErr := c.pollVideo(ctx, pollSess, token, pollURL, downloadResult)
 	if pollErr != nil {
 		return nil, nil, pollErr
 	}
@@ -235,7 +266,7 @@ func (c *Client) FetchAccountProfile(ctx context.Context, token string) (map[str
 	if token == "" {
 		return map[string]any{}, nil
 	}
-	client, err := c.newTLSClient()
+	sess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +280,7 @@ func (c *Client) FetchAccountProfile(ctx context.Context, token string) (map[str
 		req.Header = http.Header{
 			"authorization": {"Bearer " + token},
 			"accept":        {"application/json"},
-			"user-agent":    {defaultUserAgent},
+			"user-agent":    {sess.fp.userAgent},
 			http.HeaderOrderKey: {
 				"authorization",
 				"accept",
@@ -257,7 +288,7 @@ func (c *Client) FetchAccountProfile(ctx context.Context, token string) (map[str
 			},
 		}
 
-		resp, err := client.Do(req)
+		resp, err := sess.client.Do(req)
 		if err != nil {
 			continue
 		}
@@ -320,7 +351,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		}, nil
 	}
 
-	client, err := c.newTLSClient()
+	sess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +366,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		"x-account-id":  {accountID},
 		"accept":        {"application/json"},
 		"content-type":  {"application/json"},
-		"user-agent":    {defaultUserAgent},
+		"user-agent":    {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -346,7 +377,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		},
 	}
 
-	resp, err := client.Do(req)
+	resp, err := sess.client.Do(req)
 	if err != nil {
 		return map[string]any{
 			"remaining":       nil,
@@ -401,7 +432,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 	}, nil
 }
 
-func (c *Client) submitImage(ctx context.Context, client tlsclient.HttpClient, token, prompt, endpoint string, payload map[string]any) ([]byte, string, error) {
+func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, prompt, endpoint string, payload map[string]any) ([]byte, string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err
@@ -419,13 +450,13 @@ func (c *Client) submitImage(ctx context.Context, client tlsclient.HttpClient, t
 		"origin":             {"https://firefly.adobe.com"},
 		"referer":            {"https://firefly.adobe.com/"},
 		"accept-language":    {"en-US,en;q=0.9"},
-		"sec-ch-ua":          {defaultSecCHUA},
+		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
-		"sec-ch-ua-platform": {`"Windows"`},
+		"sec-ch-ua-platform": {sess.fp.platform},
 		"sec-fetch-site":     {"same-site"},
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
-		"user-agent":         {defaultUserAgent},
+		"user-agent":         {sess.fp.userAgent},
 		"x-arp-session-id":   {buildARPSessionID()},
 		http.HeaderOrderKey: {
 			"authorization",
@@ -450,7 +481,7 @@ func (c *Client) submitImage(ctx context.Context, client tlsclient.HttpClient, t
 		req.Header.Set("x-nonce", nonce)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := sess.client.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
@@ -469,6 +500,9 @@ func (c *Client) submitImage(ctx context.Context, client tlsclient.HttpClient, t
 	// non-5xx) — treat as temporary so the pool retries instead of failing.
 	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 		return respBody, "", ErrTemporaryUpstream
+	}
+	if isContentRejection(resp.StatusCode, string(respBody)) {
+		return respBody, "", ErrContentRejected
 	}
 	if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		return respBody, "", ErrDeadUpstream
@@ -497,11 +531,10 @@ func (c *Client) submitImage(ctx context.Context, client tlsclient.HttpClient, t
 	return respBody, "", errors.New("submit ok but no poll url")
 }
 
-func (c *Client) pollImage(ctx context.Context, client tlsclient.HttpClient, token, pollURL string) (map[string]any, []byte, error) {
-	start := time.Now()
+func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL string) (map[string]any, []byte, error) {
 	for {
-		if time.Since(start) > 3*time.Minute {
-			return nil, nil, errors.New("adobe generation timed out")
+		if err := ctx.Err(); err != nil {
+			return nil, nil, fmt.Errorf("adobe generation timed out: %w", err)
 		}
 
 		req, err := http.NewRequest(http.MethodGet, pollURL, nil)
@@ -514,7 +547,7 @@ func (c *Client) pollImage(ctx context.Context, client tlsclient.HttpClient, tok
 			"accept":        {"*/*"},
 			"origin":        {"https://firefly.adobe.com"},
 			"referer":       {"https://firefly.adobe.com/"},
-			"user-agent":    {defaultUserAgent},
+			"user-agent":    {sess.fp.userAgent},
 			http.HeaderOrderKey: {
 				"authorization",
 				"accept",
@@ -524,7 +557,7 @@ func (c *Client) pollImage(ctx context.Context, client tlsclient.HttpClient, tok
 			},
 		}
 
-		resp, err := client.Do(req)
+		resp, err := sess.client.Do(req)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 		}
@@ -535,6 +568,9 @@ func (c *Client) pollImage(ctx context.Context, client tlsclient.HttpClient, tok
 		}
 		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 			return nil, nil, ErrTemporaryUpstream
+		}
+		if isContentRejection(resp.StatusCode, string(body)) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrContentRejected, clip(body, 300))
 		}
 		if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 			return nil, nil, ErrDeadUpstream
@@ -551,7 +587,7 @@ func (c *Client) pollImage(ctx context.Context, client tlsclient.HttpClient, tok
 			if first, ok := outputs[0].(map[string]any); ok {
 				if image, ok := first["image"].(map[string]any); ok {
 					if url := strings.TrimSpace(stringValue(image["presignedUrl"])); url != "" {
-						data, err := c.download(ctx, client, url)
+						data, err := c.download(ctx, sess, url)
 						if err != nil {
 							return nil, nil, err
 						}
@@ -569,7 +605,7 @@ func (c *Client) pollImage(ctx context.Context, client tlsclient.HttpClient, tok
 	}
 }
 
-func (c *Client) submitVideo(ctx context.Context, client tlsclient.HttpClient, token, endpoint string, payload map[string]any) ([]byte, string, error) {
+func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpoint string, payload map[string]any) ([]byte, string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err
@@ -587,13 +623,13 @@ func (c *Client) submitVideo(ctx context.Context, client tlsclient.HttpClient, t
 		"origin":             {"https://firefly.adobe.com"},
 		"referer":            {"https://firefly.adobe.com/"},
 		"accept-language":    {"en-US,en;q=0.9"},
-		"sec-ch-ua":          {defaultSecCHUA},
+		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
-		"sec-ch-ua-platform": {`"Windows"`},
+		"sec-ch-ua-platform": {sess.fp.platform},
 		"sec-fetch-site":     {"same-site"},
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
-		"user-agent":         {defaultUserAgent},
+		"user-agent":         {sess.fp.userAgent},
 		"x-arp-session-id":   {buildARPSessionID()},
 		http.HeaderOrderKey: {
 			"authorization",
@@ -621,7 +657,7 @@ func (c *Client) submitVideo(ctx context.Context, client tlsclient.HttpClient, t
 		}
 	}
 
-	resp, err := client.Do(req)
+	resp, err := sess.client.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
@@ -638,6 +674,9 @@ func (c *Client) submitVideo(ctx context.Context, client tlsclient.HttpClient, t
 		// Surface Adobe's response body — "adobe auth failed" alone hides whether
 		// it's a bad token, a missing scope, or a WAF/fingerprint block.
 		return respBody, "", fmt.Errorf("%w (%d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
+	}
+	if isContentRejection(resp.StatusCode, string(respBody)) {
+		return respBody, "", ErrContentRejected
 	}
 	if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		return respBody, "", ErrDeadUpstream
@@ -671,11 +710,10 @@ func (c *Client) submitVideo(ctx context.Context, client tlsclient.HttpClient, t
 	return respBody, "", errors.New("video submit ok but no poll url")
 }
 
-func (c *Client) pollVideo(ctx context.Context, client tlsclient.HttpClient, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {
-	start := time.Now()
+func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {
 	for {
-		if time.Since(start) > 10*time.Minute {
-			return nil, nil, errors.New("adobe video generation timed out")
+		if err := ctx.Err(); err != nil {
+			return nil, nil, fmt.Errorf("adobe video generation timed out: %w", err)
 		}
 
 		req, err := http.NewRequest(http.MethodGet, pollURL, nil)
@@ -688,7 +726,7 @@ func (c *Client) pollVideo(ctx context.Context, client tlsclient.HttpClient, tok
 			"accept":        {"*/*"},
 			"origin":        {"https://firefly.adobe.com"},
 			"referer":       {"https://firefly.adobe.com/"},
-			"user-agent":    {defaultUserAgent},
+			"user-agent":    {sess.fp.userAgent},
 			http.HeaderOrderKey: {
 				"authorization",
 				"accept",
@@ -698,7 +736,7 @@ func (c *Client) pollVideo(ctx context.Context, client tlsclient.HttpClient, tok
 			},
 		}
 
-		resp, err := client.Do(req)
+		resp, err := sess.client.Do(req)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 		}
@@ -712,6 +750,9 @@ func (c *Client) pollVideo(ctx context.Context, client tlsclient.HttpClient, tok
 		}
 		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 			return nil, nil, ErrTemporaryUpstream
+		}
+		if isContentRejection(resp.StatusCode, string(body)) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrContentRejected, clip(body, 300))
 		}
 		if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 			return nil, nil, ErrDeadUpstream
@@ -732,7 +773,7 @@ func (c *Client) pollVideo(ctx context.Context, client tlsclient.HttpClient, tok
 						if !downloadResult {
 							return payload, nil, nil
 						}
-						data, err := c.download(ctx, client, raw)
+						data, err := c.download(ctx, sess, raw)
 						if err != nil {
 							return nil, nil, err
 						}
@@ -750,7 +791,37 @@ func (c *Client) pollVideo(ctx context.Context, client tlsclient.HttpClient, tok
 	}
 }
 
-func (c *Client) download(ctx context.Context, client tlsclient.HttpClient, url string) ([]byte, error) {
+// download fetches the generated artifact from Adobe's presigned S3 URL. The
+// asset is already produced at this point, so a transient network hiccup
+// (connection EOF/reset mid-body, S3 accelerate 5xx) must not fail the whole
+// generation — retry with backoff before giving up.
+const downloadTimeout = 3 * time.Minute
+
+func (c *Client) download(parent context.Context, sess *tlsSession, url string) ([]byte, error) {
+	// The artifact is already produced; detach from the (often nearly-elapsed)
+	// generation ctx deadline/cancel and give the download its own budget so a
+	// slow CDN read isn't killed mid-body and the backoff-retries can actually run.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), downloadTimeout)
+	defer cancel()
+	var data []byte
+	var err error
+	for _, wait := range []time.Duration{0, 1 * time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second} {
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+		data, err = c.downloadOnce(ctx, sess, url)
+		if err == nil || !errors.Is(err, ErrTemporaryUpstream) {
+			break
+		}
+	}
+	return data, err
+}
+
+func (c *Client) downloadOnce(ctx context.Context, sess *tlsSession, url string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -758,38 +829,116 @@ func (c *Client) download(ctx context.Context, client tlsclient.HttpClient, url 
 	req = req.WithContext(ctx)
 	req.Header = http.Header{
 		"accept":     {"*/*"},
-		"user-agent": {defaultUserAgent},
+		"user-agent": {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"accept",
 			"user-agent",
 		},
 	}
-	resp, err := client.Do(req)
+	resp, err := sess.client.Do(req)
 	if err != nil {
-		return nil, err
+		// Network-level failure (EOF, reset, timeout) — transient, worth a retry.
+		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 500 {
+			return nil, fmt.Errorf("%w: adobe download failed: %d %s", ErrTemporaryUpstream, resp.StatusCode, clip(body, 200))
+		}
 		return nil, fmt.Errorf("adobe download failed: %d %s", resp.StatusCode, clip(body, 200))
 	}
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// Body truncated mid-read (EOF) — transient, retry.
+		return nil, fmt.Errorf("%w: read body: %v", ErrTemporaryUpstream, err)
+	}
+	return data, nil
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) {
+// fingerprint bundles a TLS ClientProfile with the browser headers that match
+// it, so the JA3/JA4 handshake and the advertised User-Agent / client hints
+// stay internally consistent within a single request.
+type fingerprint struct {
+	profile   profiles.ClientProfile
+	userAgent string
+	secCHUA   string
+	platform  string // quoted sec-ch-ua-platform value, e.g. `"Windows"`
+}
+
+const (
+	osWindows = iota
+	osMac
+)
+
+func newChromeFingerprint(profile profiles.ClientProfile, major, osKind int) fingerprint {
+	ua := fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", major)
+	platform := `"Windows"`
+	if osKind == osMac {
+		ua = fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36", major)
+		platform = `"macOS"`
+	}
+	return fingerprint{
+		profile:   profile,
+		userAgent: ua,
+		secCHUA:   fmt.Sprintf(`"Not?A_Brand";v="99", "Google Chrome";v="%d", "Chromium";v="%d"`, major, major),
+		platform:  platform,
+	}
+}
+
+// adobeFingerprints is a small pool of recent desktop Chrome builds across
+// Windows/macOS. Each request draws one at random so the outbound TLS
+// fingerprint and headers vary from call to call instead of presenting a single
+// static signature to Adobe's anti-bot layer.
+var adobeFingerprints = []fingerprint{
+	newChromeFingerprint(profiles.Chrome_133, 133, osWindows),
+	newChromeFingerprint(profiles.Chrome_131, 131, osWindows),
+	newChromeFingerprint(profiles.Chrome_124, 124, osWindows),
+	newChromeFingerprint(profiles.Chrome_133, 133, osMac),
+	newChromeFingerprint(profiles.Chrome_131, 131, osMac),
+}
+
+func randomFingerprint() fingerprint {
+	return adobeFingerprints[rand.Intn(len(adobeFingerprints))]
+}
+
+// tlsSession pairs a configured TLS client with the fingerprint it was built
+// for, so downstream header builders advertise the matching UA / client hints.
+type tlsSession struct {
+	client tlsclient.HttpClient
+	fp     fingerprint
+}
+
+// newTLSClient builds a session that routes through the configured proxy (when
+// set). newDirectTLSClient builds one that always uses the local IP. Only the
+// image-generation submit goes through the proxy; reference-image upload,
+// polling and result download run on the local IP.
+func (c *Client) newTLSClient() (*tlsSession, error) {
+	return c.newTLSSession(randomFingerprint(), true)
+}
+
+func (c *Client) newDirectTLSClient() (*tlsSession, error) {
+	return c.newTLSSession(randomFingerprint(), false)
+}
+
+func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(60),
-		tlsclient.WithClientProfile(profiles.Chrome_133),
+		tlsclient.WithClientProfile(fp.profile),
 		tlsclient.WithNotFollowRedirects(),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if c.proxy != "" {
+	if useProxy && c.proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(c.proxy))
 	}
-	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, err
+	}
+	return &tlsSession{client: client, fp: fp}, nil
 }
 
-func exchangeCookieWithTLSClient(ctx context.Context, client tlsclient.HttpClient, cookie string) (*CookieExchangeResult, error) {
+func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie string) (*CookieExchangeResult, error) {
 	cookie = normalizeCookie(cookie)
 	if cookie == "" {
 		return nil, ErrAdobeCookieEmpty
@@ -808,7 +957,7 @@ func exchangeCookieWithTLSClient(ctx context.Context, client tlsclient.HttpClien
 		"cookie":          {cookie},
 		"origin":          {"https://firefly.adobe.com"},
 		"referer":         {"https://firefly.adobe.com/"},
-		"user-agent":      {defaultUserAgent},
+		"user-agent":      {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"accept",
 			"accept-language",
@@ -819,7 +968,7 @@ func exchangeCookieWithTLSClient(ctx context.Context, client tlsclient.HttpClien
 			"user-agent",
 		},
 	}
-	resp, err := client.Do(req)
+	resp, err := sess.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("adobe cookie exchange network error: %w", err)
 	}

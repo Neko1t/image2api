@@ -8,6 +8,7 @@ import Icon from '../components/Icon.vue'
 import Logo from '../components/Logo.vue'
 import { pointsLabel } from '../credits'
 import { draft } from '../playground'
+import { announcement, openAnnouncement } from '../announcement'
 
 const route = useRoute()
 
@@ -22,8 +23,8 @@ const nav = computed(() => {
     items.push({ to: '/orders', label: '订单', icon: 'receipt' })
   }
   // 文档 + 关于 are public — visible to guests too.
-  items.push({ to: '/docs', label: '文档', icon: 'log' })
-  items.push({ to: '/about', label: '关于', icon: 'accounts' })
+  items.push({ to: '/docs', label: '文档', icon: 'book' })
+  items.push({ to: '/about', label: '关于', icon: 'info' })
   return items
 })
 
@@ -65,15 +66,15 @@ const currentLabel = computed(() => {
           v-for="n in nav" :key="n.to" :to="n.to"
           :exact-active-class="n.to === '/' ? 'active' : ''"
           :active-class="n.to === '/' ? '' : 'active'"
+          :title="n.label"
           class="rail-link group">
           <span class="w-10 h-10 rounded-xl grid place-items-center transition-all ring-1 ring-transparent group-hover:bg-[var(--hover)] group-hover:ring-[color:var(--hairline)]">
             <Icon :name="n.icon" class="w-4 h-4 transition-colors" />
           </span>
-          <span class="rail-label">{{ n.label }}</span>
         </router-link>
       </nav>
 
-      <!-- Bottom: admin shortcut (admins only) + settings -->
+      <!-- Bottom: admin shortcut (admins only) + 公告 + settings -->
       <div class="flex flex-col items-center gap-3">
         <router-link v-if="isAdmin()" to="/admin/overview" title="进入管理后台"
                      class="rail-bottom">
@@ -86,9 +87,15 @@ const currentLabel = computed(() => {
           <svg v-if="isDark" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
           <svg v-else class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
         </button>
+        <!-- 公告 — sits right above 设置. Only for logged-in users, and only
+             when there actually is an announcement to show. -->
+        <button v-if="isAuthed() && announcement.content.trim()" type="button"
+                @click="openAnnouncement" title="公告" class="rail-bottom">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l18-7-4 14-6-3-3 4-1-6z"/></svg>
+        </button>
         <router-link to="/settings" title="设置" @click="onSettings"
                      :class="$route.path === '/settings' ? 'rail-bottom active' : 'rail-bottom'">
-          <Icon name="accounts" class="w-4 h-4" />
+          <Icon name="config" class="w-4 h-4" />
         </router-link>
       </div>
     </aside>
@@ -139,7 +146,6 @@ const currentLabel = computed(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.5rem;
   padding: 0.25rem 0;
   color: var(--fg-3);
   transition: color 0.15s ease;
@@ -163,11 +169,6 @@ const currentLabel = computed(() => {
 .rail-link.active > span:first-child {
   background: var(--hover) !important;
   --tw-ring-color: var(--hairline);
-}
-.rail-label {
-  font-size: 10px;
-  letter-spacing: 0.04em;
-  font-weight: 500;
 }
 
 .rail-bottom {

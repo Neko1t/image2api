@@ -966,12 +966,27 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 		if it.Pool != "grok" || it.Dead || it.Status == "disabled" || strings.TrimSpace(it.Value) == "" {
 			continue
 		}
-		sub, serr := s.grok.FetchSubscription(ctx, it.Value)
+		// A grok sso can momentarily 401 (upstream blip / proxy hiccup / anti-bot)
+		// while still being fully valid, so a single auth failure must never kill a
+		// live account. Retry the subscription probe up to 3 times on 401/403; only
+		// if all 3 attempts still return ErrAuth do we treat the session as dead.
+		var sub *grok.Subscription
+		var serr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			sub, serr = s.grok.FetchSubscription(ctx, it.Value)
+			if serr == nil || !errors.Is(serr, grok.ErrAuth) {
+				break
+			}
+			if attempt < 3 {
+				time.Sleep(2 * time.Second)
+			}
+		}
 		if serr != nil {
 			if errors.Is(serr, grok.ErrAuth) {
+				// 3 consecutive 401/403 → the sso session is genuinely dead.
 				_, _ = s.tokens.Update(ctx, "grok", it.ID, map[string]any{"status": "disabled", "dead": true})
 			}
-			continue // transient upstream error → leave as-is, retry next tick
+			continue // other transient upstream error → leave as-is, retry next tick
 		}
 		if sub == nil || !sub.Member {
 			// no ACTIVE subscription (INACTIVE / empty) → membership lapsed → dead.
@@ -980,9 +995,8 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 		}
 		data, derr := s.grok.FetchCreditsBalance(ctx, it.Value)
 		if derr != nil {
-			if errors.Is(derr, grok.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, "grok", it.ID, map[string]any{"status": "disabled", "dead": true})
-			}
+			// Same policy as the subscription probe: a credits-balance 401/403 is
+			// transient, never a reason to kill a live account. Skip and retry.
 			continue
 		}
 		meta := cloneJSONMap(it.Meta)

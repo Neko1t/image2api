@@ -38,6 +38,7 @@ async function load() {
   loading.value = true
   const qs = new URLSearchParams({ limit: String(pageSize), offset: String((page.value - 1) * pageSize) })
   if (status.value) qs.set('status', status.value)
+  if (search.value.trim()) qs.set('q', search.value.trim())
   const r = await api('/pay/orders?' + qs.toString())
   loading.value = false
   if (r.ok) {
@@ -47,14 +48,9 @@ async function load() {
 }
 onMounted(load)
 
-const displayed = computed(() => {
-  const q = search.value.trim().toLowerCase()
-  if (!q) return items.value
-  return items.value.filter((o) =>
-    (o.id || '').toLowerCase().includes(q) ||
-    String(o.amount).includes(q) ||
-    (METHOD[o.pay_type] || '').includes(q))
-})
+// 搜索走服务端(跨页)，直接展示服务端返回的当页结果。
+const displayed = computed(() => items.value)
+function doSearch() { page.value = 1; load() }
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 const pageStart = computed(() => total.value === 0 ? 0 : (page.value - 1) * pageSize + 1)
 const pageEnd = computed(() => Math.min(total.value, page.value * pageSize))
@@ -112,7 +108,8 @@ async function cont(o) {
                 :class="status === s[0] ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'">{{ s[1] }}</button>
       </div>
       <div class="flex-1 min-w-[180px]">
-        <input v-model="search" class="field !py-1.5 text-xs" placeholder="搜索 订单号 / 金额 / 方式…" />
+        <input v-model="search" @keyup.enter="doSearch" @change="doSearch"
+               class="field !py-1.5 text-xs" placeholder="搜索 订单号 / 金额 / 方式…" />
       </div>
       <button @click="load" class="btn-soft"><Icon name="refresh" class="w-3.5 h-3.5" /> 刷新</button>
     </div>

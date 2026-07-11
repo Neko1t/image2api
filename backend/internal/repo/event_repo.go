@@ -22,9 +22,13 @@ type EventListFilter struct {
 	Statuses      []string // multiple statuses (status IN (?)) — used by the 画图台 grid
 	Since         *time.Time
 	UserID        string
+	UserIDs       []string // when set, keep ONLY rows whose user_id is in this list (admin 用户搜索)
+	Query         string   // free-text search over prompt / model / error (server-side, 跨页)
 	ExcludeSource string // when set, omit rows with this source (e.g. hide API-key "v1" usage from the customer logs page)
 	Source        string // when set, keep ONLY rows with this source (admin 来源 filter): "v1" (API key) / "user" (前台) / "admin" (测试模型)
-	HasFile       bool   // when true, keep ONLY rows with a non-empty file (the 创作记录 gallery — paginates over real media)
+	HasFile       bool     // when true, keep ONLY rows with a non-empty file (the 创作记录 gallery — paginates over real media)
+	ExcludeFiles  []string // when set, omit rows whose file is in this list (e.g. hide homepage showcase media from user galleries)
+	MediaOnly     bool     // when true, keep only rows that are pending or have a stored file — the 画图台 grid, so deleted works don't eat a slot
 }
 
 type EventStats struct {
@@ -57,6 +61,13 @@ func (r *EventRepository) List(ctx context.Context, filter EventListFilter) ([]m
 	if filter.UserID != "" {
 		q = q.Where("user_id = ?", filter.UserID)
 	}
+	if len(filter.UserIDs) > 0 {
+		q = q.Where("user_id IN ?", filter.UserIDs)
+	}
+	if term := strings.TrimSpace(filter.Query); term != "" {
+		like := "%" + term + "%"
+		q = q.Where("(prompt ILIKE ? OR model ILIKE ? OR error ILIKE ?)", like, like, like)
+	}
 	if filter.ExcludeSource != "" {
 		q = q.Where("(source IS NULL OR source <> ?)", filter.ExcludeSource)
 	}
@@ -65,6 +76,12 @@ func (r *EventRepository) List(ctx context.Context, filter EventListFilter) ([]m
 	}
 	if filter.HasFile {
 		q = q.Where("file <> ''")
+	}
+	if len(filter.ExcludeFiles) > 0 {
+		q = q.Where("file NOT IN ?", filter.ExcludeFiles)
+	}
+	if filter.MediaOnly {
+		q = q.Where("(status = 'pending' OR file <> '')")
 	}
 
 	var total int64
@@ -583,11 +600,11 @@ func (r *EventRepository) MarkRefunded(ctx context.Context, eventID string) (boo
 // SetAccount stamps which provider account is fulfilling an in-flight event.
 // Called when generation commits to a token, so the accounts view can count
 // pending events per account and an abandoned-event purge can attribute back.
-func (r *EventRepository) SetAccount(ctx context.Context, eventID, accountID string) error {
+func (r *EventRepository) SetAccount(ctx context.Context, eventID, accountID, accountEmail string) error {
 	return r.db.WithContext(ctx).
 		Model(&model.EventLog{}).
 		Where("id = ?", eventID).
-		Update("account_id", accountID).Error
+		Updates(map[string]any{"account_id": accountID, "account_email": accountEmail}).Error
 }
 
 // InFlightByAccount counts pending (in-flight) events grouped by account_id, for

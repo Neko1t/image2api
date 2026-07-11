@@ -249,6 +249,13 @@ body {
    buttons keep the "not-allowed" cursor already applied via Tailwind. */
 button:not(:disabled), [role="button"]:not([aria-disabled="true"]) { cursor: pointer; }
 
+/* ===== Global horizontal table scroll =====
+   Data tables use fixed column widths; on a narrow screen the table can be
+   wider than its card. Instead of clipping (overflow-hidden) or squishing the
+   columns, let the card scroll horizontally. overflow-y is left to the card's
+   own utility so vertical clipping / rounded corners are preserved. */
+.card:has(> table) { overflow-x: auto; }
+
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: rgb(203 213 225); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: rgb(148 163 184); }

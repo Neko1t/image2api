@@ -5,7 +5,7 @@ import { announcement, dismissAnnouncement } from '../announcement'
 import Icon from './Icon.vue'
 
 marked.setOptions({ breaks: true, gfm: true })
-const html = computed(() => marked.parse(announcement.content || ''))
+const html = computed(() => marked.parse(announcement.content.trim() || '暂无公告'))
 </script>
 
 <template>

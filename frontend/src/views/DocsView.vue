@@ -19,8 +19,11 @@ onMounted(async () => {
 
 const imageModels = computed(() => models.value.filter((m) => m.type === 'image'))
 const videoModels = computed(() => models.value.filter((m) => m.type === 'video'))
-const sampleImage = computed(() => imageModels.value[0]?.id || 'firefly-image-4')
-const sampleVideo = computed(() => videoModels.value[0]?.id || 'firefly-kling3')
+function pubName(m) {
+  return m?.alias || m?.id || ''
+}
+const sampleImage = computed(() => pubName(imageModels.value[0]) || 'firefly-image-4')
+const sampleVideo = computed(() => pubName(videoModels.value[0]) || 'firefly-kling3')
 const sampleSeconds = computed(() => String(videoModels.value[0]?.durations?.[0] || '8s').replace(/s$/, ''))
 
 function priceOf(m) {
@@ -41,18 +44,18 @@ function priceOf(m) {
 
 // ---- request parameter tables ----
 const imageParams = [
-  ['model', 'string', '必填', '模型 id,见上表(图像)'],
+  ['model', 'string', '必填', '模型名(别名优先),见上表(图像)'],
   ['prompt', 'string', '必填', '文字描述'],
   ['size', 'string', '可选', '宽x高,如 "1024x1024"。同时决定「比例」+「分辨率档」(按长边)。具体怎么填见下方对照表;留空 = 1:1 · 2K'],
 ]
 const editParams = [
   ['image', 'file', '必填', '输入图;多张参考图重复 image[] 字段(multipart 文件上传)'],
   ['prompt', 'string', '必填', '编辑/参考描述'],
-  ['model', 'string', '必填', '模型 id(需支持图生图)'],
+  ['model', 'string', '必填', '模型名(别名优先,需支持图生图)'],
   ['size', 'string', '可选', '同图像:决定比例 + 分辨率档(见下方对照表)'],
 ]
 const videoParams = [
-  ['model', 'string', '必填', '模型 id,见上表(视频)'],
+  ['model', 'string', '必填', '模型名(别名优先),见上表(视频)'],
   ['prompt', 'string', '必填', '文字描述'],
   ['seconds', 'string|int', '必填', '时长秒数,如 "5" "8"(取决于模型支持)'],
   ['size', 'string', '可选', '如 "1280x720" / "720x1280" → 决定比例与分辨率'],
@@ -273,7 +276,7 @@ async function copy(text) {
           </thead>
           <tbody>
             <tr v-for="m in models" :key="m.id" class="border-b border-white/[0.04] last:border-0">
-              <td class="px-4 py-3 font-mono text-white/90">{{ m.id }}</td>
+              <td class="px-4 py-3 font-mono text-white/90">{{ pubName(m) }}</td>
               <td class="px-4 py-3 text-white/60">{{ m.type === 'video' ? '视频' : '图像' }}</td>
               <td class="px-4 py-3 text-white/60">{{ (m.type === 'video' ? m.durations : m.resolutions || [])?.join(' · ') || '—' }}</td>
               <td class="px-4 py-3 text-right tabular-nums text-white/80">{{ priceOf(m) }}</td>

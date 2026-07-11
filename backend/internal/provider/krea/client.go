@@ -139,7 +139,7 @@ func (c *Client) RefreshIfNeeded(ctx context.Context, cookie string) (string, bo
 }
 
 func (c *Client) refreshPost(ctx context.Context, refreshToken string) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -307,7 +307,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 	defer cancel()
 	// NOTE: no /app here — the heavy SSR activation is done separately (on recovery
 	// and at generation via Activate). This probe just reads the current balance.
-	body, status, err := c.apiGet(probeCtx, cookie, "/api/billing-data")
+	body, status, err := c.apiGetP(probeCtx, cookie, "/api/billing-data", false)
 	if err != nil {
 		return unknownBalance("network: " + err.Error()), nil
 	}
@@ -366,7 +366,7 @@ func (c *Client) Activate(ctx context.Context, cookie string) {
 	}
 	actCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancel()
-	_, _, _ = c.apiGet(actCtx, cookie, "/app")
+	_, _, _ = c.apiGetP(actCtx, cookie, "/app", false)
 	c.mu.Lock()
 	c.actAt[key] = time.Now().Unix()
 	c.mu.Unlock()
@@ -394,7 +394,12 @@ func accountKey(cookie string) string {
 
 // apiGet issues a GET to a krea.ai API path carrying the account cookie.
 func (c *Client) apiGet(ctx context.Context, cookie, path string) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+	return c.apiGetP(ctx, cookie, path, true)
+}
+
+// apiGetP picks the egress: polling / asset resolution run direct (local IP).
+func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool) ([]byte, int, error) {
+	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -426,12 +431,18 @@ func (c *Client) apiGet(ctx context.Context, cookie, path string) ([]byte, int, 
 	return b, resp.StatusCode, err
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) {
+func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+
+// newDirectTLSClient egresses on the local IP (never the proxy). Used for
+// reference-image upload, polling and result download.
+func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
+
+func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if c.proxy != "" {
+	if useProxy && c.proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(c.proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)

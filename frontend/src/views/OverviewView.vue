@@ -35,6 +35,8 @@ async function refreshAll() {
 
 // ---- windowed event aggregates (from /dashboard) ----
 const EMPTY_WINDOW = { total: 0, success: 0, failed: 0, pending: 0, image: 0, video: 0, api: 0, web: 0, spent: 0 }
+const today = computed(() => dash.value?.today || EMPTY_WINDOW)
+const todayDau = computed(() => dash.value?.today_dau || 0)
 const day = computed(() => dash.value?.day || EMPTY_WINDOW)
 const week = computed(() => dash.value?.week || EMPTY_WINDOW)
 // All-time persistent counters (stat_counters) — independent of log retention.
@@ -155,7 +157,7 @@ onUnmounted(() => clearInterval(timer))
     </div>
 
     <!-- ===== KPI strip ===== -->
-    <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+    <div class="grid grid-cols-2 lg:grid-cols-6 gap-3">
       <!-- 用户 -->
       <div class="card p-4">
         <div class="flex items-center justify-between">
@@ -169,6 +171,25 @@ onUnmounted(() => clearInterval(timer))
         <div class="text-[11px] text-emerald-300/80 mt-0.5">
           今日新增 <span class="tabular-nums font-medium">{{ fmtInt(userStats.new_24h) }}</span>
           · 7日 <span class="tabular-nums font-medium">{{ fmtInt(userStats.new_7d) }}</span>
+        </div>
+      </div>
+
+      <!-- 今日(零点起 · Asia/Shanghai) -->
+      <div class="card p-4">
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-white/55">今日生成</span>
+          <span class="w-7 h-7 rounded-lg bg-rose-500/15 text-rose-300 grid place-items-center ring-1 ring-rose-400/20">
+            <Icon name="spark" class="w-3.5 h-3.5" />
+          </span>
+        </div>
+        <div class="text-2xl font-semibold tabular-nums mt-2">{{ fmtInt(today.total) }}</div>
+        <div class="text-[11px] mt-1 flex flex-wrap gap-x-2">
+          <span class="text-emerald-300 tabular-nums">{{ today.success }} 成功</span>
+          <span v-if="today.failed" class="text-rose-300 tabular-nums">{{ today.failed }} 失败</span>
+          <span v-if="today.pending" class="text-amber-300 tabular-nums">{{ today.pending }} 进行中</span>
+        </div>
+        <div class="text-[11px] text-amber-300 mt-1 tabular-nums">
+          消耗 {{ fmtCredits(today.spent) }} 积分 · {{ fmtInt(todayDau) }} 活跃
         </div>
       </div>
 
