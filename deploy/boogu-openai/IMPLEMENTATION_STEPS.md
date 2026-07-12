@@ -220,10 +220,10 @@ def load_pipeline():
         )
 
     if OFFLOAD_MODE == "sequential":
-        pipe.enable_sequential_cpu_offload()   # ~10-12 GB VRAM (e.g. RTX 4060)
+        pipe.enable_sequential_cpu_offload(device=DEVICE)   # ~10-12 GB VRAM (e.g. RTX 4060)
         logger.info(json.dumps({"event": "offload_mode", "mode": "sequential"}))
     elif OFFLOAD_MODE == "model":
-        pipe.enable_model_cpu_offload()        # ~16 GB VRAM
+        pipe.enable_model_cpu_offload(device=DEVICE)        # ~16 GB VRAM
         logger.info(json.dumps({"event": "offload_mode", "mode": "model"}))
     else:
         pipe.to(DEVICE)                        # full VRAM, 24 GB+
@@ -332,6 +332,7 @@ def _sync_generate(prompt, width, height, seed, model_kind, pipe, device):
     generator = torch.Generator(device).manual_seed(seed)
     kwargs = dict(
         height=height, width=width, generator=generator,
+        device=device,
         negative_instruction="", empty_instruction="",
         image_guidance_scale=1.0,
         empty_instruction_guidance_scale=0.0,
@@ -517,21 +518,43 @@ FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System dependencies — Python 3.11 required for asyncio.wait_for compatibility
+ARG PYTHON_VERSION=3.11.13
+
+# System dependencies. Ubuntu 22.04's python3.11 package is 3.11.0rc1,
+# so build a stable CPython 3.11.x runtime inside the CUDA image.
 RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3.11-dev \
-    python3-pip \
-    git \
     build-essential \
+    ca-certificates \
     curl \
+    git \
+    libbz2-dev \
+    libffi-dev \
+    liblzma-dev \
+    libncursesw5-dev \
+    libreadline-dev \
+    libsqlite3-dev \
+    libssl-dev \
+    tk-dev \
+    uuid-dev \
+    wget \
+    xz-utils \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.11 the default python3
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+RUN curl -fsSLO "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz" \
+    && tar -xzf "Python-${PYTHON_VERSION}.tgz" \
+    && cd "Python-${PYTHON_VERSION}" \
+    && ./configure --enable-shared --with-ensurepip=install \
+    && make -j"$(nproc)" \
+    && make altinstall \
+    && cd / \
+    && rm -rf "Python-${PYTHON_VERSION}" "Python-${PYTHON_VERSION}.tgz" \
+    && ldconfig
 
-RUN python3.11 -m pip install --upgrade pip
+RUN ln -sf /usr/local/bin/python3.11 /usr/bin/python3.11 \
+    && ln -sf /usr/local/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/local/bin/python3.11 /usr/bin/python \
+    && python3.11 -m pip install --upgrade pip setuptools wheel
 
 # Pin Boogu source to the reviewed commit for reproducible builds.
 ARG BOOGU_GIT_REF=df9a219fccd8954df7cf16e71453c19f7a72dbba
@@ -540,7 +563,8 @@ RUN git clone https://github.com/boogu-project/Boogu-Image.git /opt/Boogu-Image 
     && git checkout ${BOOGU_GIT_REF}
 
 # Install Boogu's PyTorch + CUDA 12.6 dependencies
-RUN python3.11 -m pip install -r /opt/Boogu-Image/requirements/torch2.7-cu126.txt
+ARG BOOGU_TORCH_REQUIREMENTS=torch2.7-cu126.txt
+RUN python3.11 -m pip install -r "/opt/Boogu-Image/requirements/${BOOGU_TORCH_REQUIREMENTS}"
 
 # Install Boogu package
 RUN python3.11 -m pip install -e /opt/Boogu-Image
@@ -550,11 +574,32 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN python3.11 -m pip install -r /app/requirements.txt
 
-# Flash Attention — use Boogu's helper as the authority (it selects the
-# correct wheel for the installed torch/CUDA/Python combination).
-# Fall back to unversioned pip install only if the helper is absent.
-RUN python3.11 /opt/Boogu-Image/utils/get_flash_attn.py \
-    || python3.11 -m pip install flash-attn --no-build-isolation
+# Flash Attention. Default production builds use Boogu's helper. Local
+# RTX 4060 validation can set BOOGU_INSTALL_FLASH_ATTN=source to compile
+# against the exact Python/Torch/CUDA/SM combination in the image.
+ARG BOOGU_INSTALL_FLASH_ATTN=true
+ARG FLASH_ATTN_VERSION=2.8.3
+ARG TORCH_CUDA_ARCH_LIST=8.9
+ARG MAX_JOBS=1
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    MAX_JOBS=${MAX_JOBS}
+RUN case "$BOOGU_INSTALL_FLASH_ATTN" in \
+        true|helper) \
+            python3.11 /opt/Boogu-Image/utils/get_flash_attn.py \
+            || python3.11 -m pip install "flash-attn==${FLASH_ATTN_VERSION}" --no-build-isolation; \
+            ;; \
+        source) \
+            python3.11 -m pip install ninja packaging \
+            && python3.11 -m pip install -v "flash-attn==${FLASH_ATTN_VERSION}" --no-build-isolation --no-binary=flash-attn; \
+            ;; \
+        false|0|no) \
+            echo "Skipping flash-attn install; Boogu will use fallback attention/SwiGLU paths."; \
+            ;; \
+        *) \
+            echo "Invalid BOOGU_INSTALL_FLASH_ATTN=${BOOGU_INSTALL_FLASH_ATTN}. Use true, helper, source, or false." >&2; \
+            exit 1; \
+            ;; \
+    esac
 
 # HuggingFace cache — persisted via named volume at runtime
 ENV HF_HOME=/cache/hf
@@ -568,9 +613,10 @@ CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8008", "--log-level",
 
 ### Step 2.2 — Notes on Dockerfile
 
-- Python 3.11 is required; `asyncio.wait_for` with `run_in_executor` works from 3.4+, but Python 3.11 is the minimum for this wrapper to avoid other compatibility issues.
+- Python 3.11 is required; build a stable CPython 3.11.x runtime because Ubuntu 22.04's `python3.11` package is `3.11.0rc1`, which is not a good baseline for native CUDA extension debugging.
 - `BOOGU_GIT_REF` defaults to the reviewed commit `df9a219fccd8954df7cf16e71453c19f7a72dbba`. Override only after a new Boogu revision is reviewed.
-- Flash Attention uses Boogu's helper first — it knows the exact wheel for the installed torch build. No version is self-pinned here to avoid mismatch.
+- `BOOGU_TORCH_REQUIREMENTS` defaults to `torch2.7-cu126.txt`. If Python 3.11.13 still reproduces a native crash, the next Boogu-provided CUDA 12.6 matrix to test is `torch2.11-cu126.txt`.
+- Flash Attention uses Boogu's helper by default. For local RTX 4060 debugging, set `BOOGU_INSTALL_FLASH_ATTN=source`, `FLASH_ATTN_VERSION=2.8.3`, `TORCH_CUDA_ARCH_LIST=8.9`, and `MAX_JOBS=1` so the extension is compiled against the exact local Python/Torch/CUDA/SM combination.
 - Wrapper dependencies are installed from `/app/requirements.txt`. Keep this file as the source of truth instead of duplicating dependency versions in Dockerfile commands.
 - Model weights are NOT in the image. They are mounted at runtime via volume.
 - `HF_HOME=/cache/hf` persists tokenizer and module caches across restarts via the named volume declared in compose.
@@ -1207,7 +1253,7 @@ docker compose -f deploy/boogu-openai/docker-compose.boogu.yml run --rm boogu-op
 | `requirements.txt` | Dockerfile must copy and install from this file; do not duplicate wrapper dependency versions in two places |
 | `README.md` | Must contain the quick start; do not leave the file empty |
 | Timeout behavior | On inference timeout, return 504, mark wrapper not ready, log `inference_timeout_restart`, then exit with `os._exit(124)` so Docker restarts |
-| Flash Attention | Use Boogu's helper `utils/get_flash_attn.py` — do NOT self-pin a flash-attn version |
+| Flash Attention | Use Boogu's helper `utils/get_flash_attn.py` by default; for local RTX 4060 native-extension debugging, use source compilation with an explicit `FLASH_ATTN_VERSION` and `TORCH_CUDA_ARCH_LIST=8.9` |
 | base_url in admin | Must be `http://boogu-openai:8008` — no trailing `/v1` |
 | served_models field | Must be explicitly set to `boogu-image-0.1-turbo` — never leave empty |
 | Network name | Verify with `docker network ls`; update `name:` in compose before deploying |

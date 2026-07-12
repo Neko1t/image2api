@@ -40,10 +40,11 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	engine.Use(gin.Recovery())
 	engine.Use(middleware.RequestID())
 	engine.Use(cors.New(cors.Config{
-		AllowOrigins:     cfg.CORSOrigins,
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Authorization", "Content-Type", "X-Request-Id"},
-		AllowCredentials: true,
+		AllowOrigins:           cfg.CORSOrigins,
+		AllowMethods:           []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:           []string{"Accept", "Authorization", "Content-Type", "X-Request-Id"},
+		AllowCredentials:       true,
+		AllowBrowserExtensions: true,
 	}))
 
 	engine.GET("/health", handlers.Health.Handle)

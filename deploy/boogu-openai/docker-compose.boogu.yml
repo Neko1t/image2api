@@ -1,0 +1,62 @@
+services:
+  boogu-openai:
+    build:
+      context: .
+      args:
+        BOOGU_GIT_REF: df9a219fccd8954df7cf16e71453c19f7a72dbba
+        BOOGU_TORCH_REQUIREMENTS: torch2.7-cu126.txt
+        BOOGU_INSTALL_FLASH_ATTN: "true"
+    env_file:
+      - .env
+    environment:
+      BOOGU_MODEL_ID: boogu-image-0.1-turbo
+      BOOGU_MODEL_PATH: /models/Boogu-Image-0.1-Turbo
+      BOOGU_MODEL_KIND: turbo
+      BOOGU_DEVICE: cuda:0
+      BOOGU_GPU_PROFILE: production-high-vram
+      BOOGU_OFFLOAD_MODE: none
+      BOOGU_MAX_SIZE: 1024x1024
+      BOOGU_WARMUP: "true"
+      CUDA_VISIBLE_DEVICES: "0"
+      HF_HOME: /cache/hf
+    volumes:
+      - /opt/boogu/models:/models:ro
+      - boogu-cache:/cache
+    ports:
+      - "127.0.0.1:8008:8008"
+    networks:
+      boogu-net: {}
+      image2api-net:
+        aliases:
+          - boogu-openai
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/readyz', timeout=5).read()"
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 300s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Older Compose fallback: if deploy.resources is rejected, remove the
+    # deploy block above and uncomment the next line.
+    # gpus: all
+    restart: unless-stopped
+
+volumes:
+  boogu-cache:
+
+networks:
+  boogu-net:
+    driver: bridge
+  image2api-net:
+    external: true
+    name: image2api_default

@@ -79,7 +79,8 @@ services:
       RUSTFS_ACCESS_KEY: vividai
       RUSTFS_SECRET_KEY: vividai-secret-change-me
       # Set to the URL your reverse proxy serves the site on (comma-separated).
-      CORS_ORIGINS: http://localhost:2000
+      CORS_ORIGINS: http://localhost:2000,chrome-extension://gpokdplmoobjnjfoifaghkhdopdofobe
+      # CORS_ORIGINS: https://innovative-prove-colours-tier.trycloudflare.com
       # true only if your reverse proxy serves HTTPS; false for plain HTTP.
       COOKIE_SECURE: "false"
     volumes:

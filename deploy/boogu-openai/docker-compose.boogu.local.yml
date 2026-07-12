@@ -1,0 +1,18 @@
+services:
+  boogu-openai:
+    build:
+      args:
+        PYTHON_VERSION: "3.11.13"
+        BOOGU_INSTALL_FLASH_ATTN: "source"
+        FLASH_ATTN_VERSION: "2.8.3"
+        TORCH_CUDA_ARCH_LIST: "8.9"
+        MAX_JOBS: "1"
+    environment:
+      BOOGU_GPU_PROFILE: test-8gb
+      BOOGU_OFFLOAD_MODE: sequential
+      BOOGU_WARMUP: "false"
+      BOOGU_DISABLE_TRITON_LAYER_NORM: "false"
+      PYTHONFAULTHANDLER: "1"
+    volumes:
+      - E:/boogu/models:/models:ro
+      - boogu-cache:/cache

@@ -20,7 +20,7 @@ Canvas client
 Decisions made:
 
 - CUDA version: **12.6.3** (official Boogu baseline)
-- Python version: **3.11** for the wrapper runtime.
+- Python version: **stable CPython 3.11.x** for the wrapper runtime.
 - Deployment mode: **standalone Docker service**, not a sidecar in the image2api compose stack
 - Download source: **ModelScope** as primary (domestic server); Hugging Face as fallback
 - Phase 3 access: **all users** after wrapper validation passes; capacity remains protected by account concurrency `1`
@@ -323,9 +323,9 @@ def load_pipeline():
         )
 
     if OFFLOAD == "sequential":
-        pipe.enable_sequential_cpu_offload()   # ~10-12 GB VRAM, slowest
+        pipe.enable_sequential_cpu_offload(device=DEVICE)   # ~10-12 GB VRAM, slowest
     elif OFFLOAD == "model":
-        pipe.enable_model_cpu_offload()        # ~16 GB VRAM, moderate
+        pipe.enable_model_cpu_offload(device=DEVICE)        # ~16 GB VRAM, moderate
     else:
         pipe.to(DEVICE)                        # full VRAM, fastest (24 GB+)
 
@@ -381,6 +381,7 @@ def _sync_generate(prompt, width, height, seed, model_kind, pipe, device):
     generator = torch.Generator(device).manual_seed(seed)
     kwargs = dict(
         height=height, width=width, generator=generator,
+        device=device,
         negative_instruction="", empty_instruction="",
         image_guidance_scale=1.0,
         empty_instruction_guidance_scale=0.0,
@@ -503,12 +504,12 @@ Rationale:
 
 Expected Dockerfile responsibilities:
 
-- Install Python 3.11 and build basics.
+- Install stable CPython 3.11.x and build basics.
 - Clone Boogu-Image source at a pinned commit via `ARG BOOGU_GIT_REF`.
-- Install Boogu requirements such as `requirements/torch2.7-cu126.txt`.
+- Install Boogu requirements via `BOOGU_TORCH_REQUIREMENTS`, defaulting to `requirements/torch2.7-cu126.txt`.
 - Install Boogu package with `pip install -e`.
 - Copy `requirements.txt` into the image and install wrapper dependencies from it. `requirements.txt` is the single source of truth for wrapper dependencies.
-- Install Flash Attention via Boogu's own helper script (see below).
+- Install Flash Attention via Boogu's own helper script by default, with a source-build path for local native-extension debugging (see below).
 - Set `HF_HOME` for HuggingFace cache to persist across container restarts.
 - Do not copy model weights into the image.
 - Run `uvicorn app:app --host 0.0.0.0 --port 8008`.
@@ -528,16 +529,34 @@ Production builds should use the reviewed commit SHA:
 df9a219fccd8954df7cf16e71453c19f7a72dbba
 ```
 
-Flash Attention installation strategy — use Boogu's helper script as the authority, it selects the correct wheel for the current torch/CUDA/Python combination:
+Flash Attention installation strategy — use Boogu's helper script by default for reviewed production builds. For local RTX 4060 native-extension debugging, compile flash-attn from source against the exact Python/Torch/CUDA/SM combination:
 
 ```dockerfile
-# Boogu's helper resolves the correct flash-attn wheel automatically.
-# Fall back to unversioned pip install only if the helper is absent.
-RUN python3.11 /opt/Boogu-Image/utils/get_flash_attn.py \
-    || pip install flash-attn --no-build-isolation
+ARG BOOGU_INSTALL_FLASH_ATTN=true
+ARG FLASH_ATTN_VERSION=2.8.3
+ARG TORCH_CUDA_ARCH_LIST=8.9
+ARG MAX_JOBS=1
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    MAX_JOBS=${MAX_JOBS}
+RUN case "$BOOGU_INSTALL_FLASH_ATTN" in \
+        true|helper) \
+            python3.11 /opt/Boogu-Image/utils/get_flash_attn.py \
+            || python3.11 -m pip install "flash-attn==${FLASH_ATTN_VERSION}" --no-build-isolation; \
+            ;; \
+        source) \
+            python3.11 -m pip install ninja packaging \
+            && python3.11 -m pip install -v "flash-attn==${FLASH_ATTN_VERSION}" --no-build-isolation --no-binary=flash-attn; \
+            ;; \
+        false|0|no) \
+            echo "Skipping flash-attn install"; \
+            ;; \
+        *) \
+            exit 1; \
+            ;; \
+    esac
 ```
 
-This avoids pinning a flash-attn version that may not match the installed torch build.
+The default helper path avoids unnecessary version pinning. The source path is intentionally explicit so RTX 4060 debugging can validate `flash_attn.ops.activations.swiglu` without relying on a prebuilt wheel.
 
 Wrapper dependency installation should be driven by `deploy/boogu-openai/requirements.txt`:
 
@@ -931,7 +950,7 @@ Phase 4, capacity expansion (only after phase 3 data):
 |---|---|---|
 | Wrapper implementation bugs | Boogu unavailable or returns malformed responses | Treat wrapper as a required deliverable; test direct and through gateway before enabling upstream account |
 | CUDA image build instability | Slow deployment and failed builds | Start with CUDA 12.6.3 devel image; accept large size; optimize later |
-| Flash Attention build time | 10-20 minute builds or failures | Prefer prebuilt wheel; fall back to source compilation only if no wheel exists |
+| Flash Attention build time | 10-30 minute builds or failures | Prefer Boogu helper/prebuilt wheel for production; use source compilation for RTX 4060 native-extension debugging |
 | Model weights missing | Container starts but cannot become ready | Run `download_models.sh` as a deployment prerequisite; validate `model_index.json` before starting service |
 | GPU runtime not configured | Container cannot see GPU | Require host and container `nvidia-smi` checks before deploy |
 | Cold start exceeds expectations | First requests fail or queue too long | Use `/readyz` plus warmup; enable upstream account only after ready |
@@ -950,7 +969,7 @@ Phase 4, capacity expansion (only after phase 3 data):
 | Question | Decision |
 |---|---|
 | Docker sidecar or standalone service? | **Standalone Docker service**. Decouples Boogu lifecycle from image2api. |
-| Python version? | **Python 3.11** for the wrapper runtime. |
+| Python version? | **Stable CPython 3.11.x** for the wrapper runtime. |
 | GPU VRAM strategy? | **`BOOGU_GPU_PROFILE` + `BOOGU_OFFLOAD_MODE` env vars**. Test environment uses RTX 4060 8 GB with `BOOGU_GPU_PROFILE=test-8gb` and `BOOGU_OFFLOAD_MODE=sequential`. Production uses RTX 5090 or better with `BOOGU_GPU_PROFILE=production-high-vram` and usually `BOOGU_OFFLOAD_MODE=none`. |
 | Boogu source version? | **Pin via `BOOGU_GIT_REF=df9a219fccd8954df7cf16e71453c19f7a72dbba`**. This was the latest HEAD at review time and had been stable for about one week. |
 | HuggingFace or ModelScope as primary download source? | **ModelScope** primary for domestic servers; HuggingFace as documented fallback. |

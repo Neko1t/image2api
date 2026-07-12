@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+!.env.example
+*.log
+.git
+.gitignore
+README.md
+IMPLEMENTATION_STEPS.md
+download_models.sh
+tests/
