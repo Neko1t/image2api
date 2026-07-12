@@ -1785,6 +1785,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"concurrency":       item.Concurrency,
 		"base_url":          emptyToNil(strings.TrimSpace(stringValue(item.Meta["base_url"]))),
 		"models":            strings.TrimSpace(stringValue(item.Meta["models"])),
+		"adapter_type":      strings.TrimSpace(stringValue(item.Meta["adapter_type"])),
 	}
 }
 

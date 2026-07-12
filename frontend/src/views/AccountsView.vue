@@ -13,8 +13,25 @@ const loading = ref(false)
 const quotaStatus = ref('')
 const showImport = ref(false)
 const showUpstream = ref(false)
+const upstreamMode = ref('custom')
 const editingUpstream = ref(null)
-function editUpstream(a) { editingUpstream.value = a; showUpstream.value = true }
+function upstreamFormat(a) {
+  return a?.type === 'ycy' || a?.pool === 'ycy' || a?.adapter_type === 'ycy' ? 'ycy' : 'custom'
+}
+function isUpstreamAccount(a) {
+  return a?.type === 'custom' || a?.type === 'ycy' || a?.adapter_type === 'ycy'
+}
+function openUpstream(mode = 'custom', account = null) {
+  upstreamMode.value = mode
+  editingUpstream.value = account
+  showUpstream.value = true
+}
+function editUpstream(a) { openUpstream(upstreamFormat(a), a) }
+function closeUpstream() {
+  showUpstream.value = false
+  editingUpstream.value = null
+  upstreamMode.value = 'custom'
+}
 const editingAccount = ref(null)
 function editAccount(a) { editingAccount.value = a }
 const testingAccount = ref(null)
@@ -384,7 +401,7 @@ onMounted(() => { loadAccounts(); loadModelList() })
       <button @click="showImport = true" class="btn-primary">
         <Icon name="plus" class="w-3.5 h-3.5" /> 导入账号
       </button>
-      <button @click="editingUpstream = null; showUpstream = true" class="btn-soft">
+      <button @click="openUpstream('custom')" class="btn-soft">
         <Icon name="plus" class="w-3.5 h-3.5" /> 添加上游
       </button>
     </div>
@@ -478,7 +495,7 @@ onMounted(() => { loadAccounts(); loadModelList() })
             </td>
             <!-- concurrency (custom = configured value; others = system fixed) -->
             <td class="px-3 py-3.5 align-middle text-center whitespace-nowrap text-xs tabular-nums">
-              <span v-if="a.type === 'custom'" class="text-white/70">{{ a.concurrency || 1 }}</span>
+              <span v-if="isUpstreamAccount(a)" class="text-white/70">{{ a.concurrency || 1 }}</span>
               <span v-else class="text-white/25" title="系统固定">{{ a.type === 'grok' ? 10 : 1 }}</span>
             </td>
             <!-- reset_after -->
@@ -535,10 +552,10 @@ onMounted(() => { loadAccounts(); loadModelList() })
                 <button @click="testAccount(a)" class="act" title="生图测试">
                   <Icon name="spark" class="w-3.5 h-3.5" />
                 </button>
-                <button v-if="a.type !== 'custom'" @click="editAccount(a)" class="act" title="编辑">
+                <button v-if="!isUpstreamAccount(a)" @click="editAccount(a)" class="act" title="编辑">
                   <Icon name="config" class="w-3.5 h-3.5" />
                 </button>
-                <button v-if="a.type === 'custom'" @click="editUpstream(a)" class="act" title="编辑上游">
+                <button v-if="isUpstreamAccount(a)" @click="editUpstream(a)" class="act" title="编辑上游">
                   <Icon name="config" class="w-3.5 h-3.5" />
                 </button>
                 <button @click="deleteAccount(a.pool, a.id)" class="act danger" title="删除">
@@ -567,7 +584,7 @@ onMounted(() => { loadAccounts(); loadModelList() })
     </div>
 
     <ImportModal v-if="showImport" @close="showImport = false" @imported="loadAccounts" />
-    <UpstreamModal v-if="showUpstream" :account="editingUpstream" @close="showUpstream = false; editingUpstream = null" @imported="loadAccounts" />
+    <UpstreamModal v-if="showUpstream" :account="editingUpstream" :mode="upstreamMode" @close="closeUpstream" @imported="loadAccounts" />
     <AccountEditModal v-if="editingAccount" :account="editingAccount" @saved="applyEdit" @close="editingAccount = null" />
     <AccountTestModal v-if="testingAccount" :account="testingAccount" :all-models="allModels" @close="testingAccount = null" />
   </section>

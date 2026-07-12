@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { api, jsonBody } from '../api'
 import Icon from './Icon.vue'
 
@@ -10,13 +10,15 @@ const props = defineProps({
 const emit = defineEmits(['close', 'imported'])
 
 const isEdit = !!props.account
-const providerMode = props.mode === 'ycy' ? 'ycy' : 'custom'
-const isYCY = providerMode === 'ycy'
+const initialMode = props.account?.pool === 'ycy' || props.account?.type === 'ycy' || props.account?.adapter_type === 'ycy' || props.mode === 'ycy' ? 'ycy' : 'custom'
 const name = ref(props.account?.email || '')
-const baseUrl = ref(props.account?.base_url || (isYCY ? 'https://ycyapi.cn' : ''))
+const baseUrl = ref(props.account?.base_url || (initialMode === 'ycy' ? 'https://ycyapi.cn' : ''))
 const key = ref('')            // edit: blank = keep existing key
-const adapterType = ref(props.account?.adapter_type || (isYCY ? 'ycy' : 'openai')) // NEW: adapter type
+const adapterType = ref(props.account?.adapter_type || (initialMode === 'ycy' ? 'ycy' : 'openai')) // NEW: adapter type
+const isYCYFormat = computed(() => adapterType.value === 'ycy')
+const isYCY = computed(() => isYCYFormat.value)
 const allModels = ref([])      // existing models to pick from
+const modelOptions = computed(() => allModels.value.filter((m) => !isYCY.value || m.type === 'video'))
 const selected = ref(props.account?.models ? String(props.account.models).split(',').map((x) => x.trim()).filter(Boolean) : [])
 const weight = ref(Number(props.account?.weight) || 0)
 const concurrency = ref(Number(props.account?.concurrency) || 1)
@@ -28,9 +30,14 @@ onMounted(async () => {
   try {
     const r = await api('/managed-models')
     allModels.value = (r.data?.data || [])
-      .filter((m) => !isYCY || m.type === 'video')
       .map((m) => ({ id: m.id, type: m.type, alias: m.alias }))
   } catch (_) {}
+})
+
+watch(adapterType, (value) => {
+  if (value === 'ycy' && !baseUrl.value.trim()) {
+    baseUrl.value = 'https://ycyapi.cn'
+  }
 })
 
 function toggle(id) {
@@ -45,7 +52,9 @@ async function submit() {
   }
   submitting.value = true; status.value = ''; isError.value = false
   try {
-    const endpoint = isYCY ? '/tokens/import-ycy-account' : '/tokens/import-custom-account'
+    const endpoint = isEdit && props.account?.pool === 'custom'
+      ? '/tokens/import-custom-account'
+      : (isYCYFormat.value ? '/tokens/import-ycy-account' : '/tokens/import-custom-account')
     const r = await api(endpoint, jsonBody('POST', {
       id: isEdit ? props.account.id : undefined,
       name: name.value.trim(),
@@ -115,11 +124,11 @@ async function submit() {
             <label class="text-xs text-slate-500">支持的模型(多选,不选 = 全部)</label>
             <span class="text-[11px] text-slate-400">{{ selected.length ? `已选 ${selected.length}` : '全部' }}</span>
           </div>
-          <div v-if="!allModels.length" class="text-xs text-slate-400 rounded-lg ring-1 ring-slate-200 bg-slate-50/60 p-3">
+          <div v-if="!modelOptions.length" class="text-xs text-slate-400 rounded-lg ring-1 ring-slate-200 bg-slate-50/60 p-3">
             暂无模型 —— 可先去模型管理加自定义模型
           </div>
           <div v-else class="flex flex-wrap gap-1.5 max-h-44 overflow-y-auto rounded-lg ring-1 ring-slate-200 bg-slate-50/60 p-2">
-            <button v-for="m in allModels" :key="m.id" type="button" @click="toggle(m.id)"
+            <button v-for="m in modelOptions" :key="m.id" type="button" @click="toggle(m.id)"
                     class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs ring-1 transition-colors"
                     :class="selected.includes(m.id) ? 'bg-indigo-500/15 text-indigo-700 ring-indigo-300 font-medium' : 'bg-white text-slate-600 ring-slate-200 hover:ring-slate-300'">
               <span class="w-1.5 h-1.5 rounded-full" :class="m.type === 'video' ? 'bg-violet-400' : 'bg-emerald-400'"></span>{{ m.alias || m.id }}

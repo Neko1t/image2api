@@ -133,6 +133,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 		authed.POST("/tokens/import-imagine-token", handlers.ProviderAdmin.ImportImagineToken)
 		authed.POST("/tokens/import-grok-token", handlers.ProviderAdmin.ImportGrokToken)
 		authed.POST("/tokens/import-custom-account", handlers.ProviderAdmin.ImportCustomAccount)
+		authed.POST("/tokens/import-ycy-account", handlers.ProviderAdmin.ImportYCYAccount)
 		authed.POST("/tokens/delete-bulk", handlers.ProviderAdmin.TokenDeleteBulk)
 		authed.PATCH("/tokens/:pool/:id", handlers.ProviderAdmin.TokenUpdate)
 		authed.DELETE("/tokens/:pool/:id", handlers.ProviderAdmin.TokenDelete)
