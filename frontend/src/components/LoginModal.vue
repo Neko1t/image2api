@@ -165,8 +165,8 @@ async function submit() {
 
       <div class="card relative z-10 w-full max-w-[26rem]">
         <!-- ambient brand glow -->
-        <div class="pointer-events-none absolute -top-24 -right-16 h-56 w-56 rounded-full bg-fuchsia-500/20 blur-3xl"></div>
-        <div class="pointer-events-none absolute -bottom-24 -left-16 h-56 w-56 rounded-full bg-violet-500/20 blur-3xl"></div>
+        <div class="ambient-glow ambient-glow-primary pointer-events-none absolute -top-24 -right-16 h-56 w-56 rounded-full blur-3xl"></div>
+        <div class="ambient-glow ambient-glow-accent pointer-events-none absolute -bottom-24 -left-16 h-56 w-56 rounded-full blur-3xl"></div>
 
         <div class="relative p-7">
           <button class="absolute top-4 right-4 grid h-7 w-7 place-items-center rounded-lg text-[color:var(--fg-3)] hover:text-[color:var(--fg)] hover:bg-[var(--hover)] transition-colors"
@@ -262,31 +262,51 @@ async function submit() {
 
 <style scoped>
 .card {
+  --lm-deep: #06101f;
+  --lm-surface: #ffffff;
+  --lm-surface-soft: #f3f8ff;
+  --lm-border: #d5e3f2;
+  --lm-primary: #0ea5e9;
+  --lm-focus: #38bdf8;
+  --lm-accent: #9b8ceb;
+  --lm-dark-surface: #0b1728;
+  --lm-dark-field: #0f2237;
+  --lm-dark-border: #1e3852;
+
   border-radius: 1.25rem;
-  background: linear-gradient(165deg, #ffffff 0%, #f6f6fb 100%);
+  background: linear-gradient(165deg, var(--lm-surface) 0%, var(--lm-surface-soft) 100%);
   color: var(--fg);
-  border: 1px solid var(--hairline);
-  box-shadow: 0 30px 70px -22px rgb(15 23 42 / 0.25);
+  border: 1px solid var(--lm-border);
+  box-shadow: 0 30px 70px -22px rgb(16 45 82 / 0.24);
   overflow: hidden;
 }
 html.dark .card {
-  background: linear-gradient(165deg, #14161f 0%, #0d0f15 100%);
+  background: linear-gradient(165deg, var(--lm-dark-surface) 0%, var(--lm-deep) 100%);
   color: rgb(255 255 255 / 0.9);
-  border: none;
+  border-color: rgb(30 56 82 / 0.9);
   box-shadow: 0 30px 70px -20px rgb(0 0 0 / 0.7);
 }
 
+.ambient-glow-primary { background: rgb(56 189 248 / 0.18); }
+.ambient-glow-accent { background: rgb(155 140 235 / 0.14); }
+html.dark .ambient-glow-primary { background: rgb(56 189 248 / 0.2); }
+html.dark .ambient-glow-accent { background: rgb(155 140 235 / 0.12); }
+
 .logo-halo {
   position: relative;
-  filter: drop-shadow(0 8px 18px rgb(168 85 247 / 0.45));
+  filter: drop-shadow(0 8px 18px rgb(56 189 248 / 0.34));
 }
 
 /* segmented tab control */
 .tabs {
   display: flex; gap: 0.25rem; padding: 0.25rem;
   border-radius: 0.75rem;
-  background: var(--surface-2);
-  border: 1px solid var(--hairline);
+  background: rgb(247 251 255 / 0.84);
+  border: 1px solid var(--lm-border);
+}
+html.dark .tabs {
+  background: rgb(15 34 55 / 0.72);
+  border-color: rgb(36 65 92 / 0.78);
 }
 .tab {
   flex: 1; padding: 0.45rem 0; border-radius: 0.55rem;
@@ -295,11 +315,15 @@ html.dark .card {
 }
 .tab:hover { color: var(--fg-2); }
 .tab-on {
-  color: rgb(124 58 237);
-  background: linear-gradient(135deg, rgb(167 139 250 / 0.22), rgb(236 72 153 / 0.18));
-  box-shadow: 0 1px 0 rgb(255 255 255 / 0.08) inset, 0 4px 12px -4px rgb(168 85 247 / 0.5);
+  color: rgb(3 105 161);
+  background: linear-gradient(135deg, rgb(14 165 233 / 0.16), rgb(155 140 235 / 0.1));
+  box-shadow: 0 1px 0 rgb(255 255 255 / 0.65) inset, 0 4px 12px -4px rgb(14 165 233 / 0.42);
 }
-html.dark .tab-on { color: white; }
+html.dark .tab-on {
+  color: rgb(224 242 254);
+  background: linear-gradient(135deg, rgb(56 189 248 / 0.22), rgb(155 140 235 / 0.12));
+  box-shadow: 0 1px 0 rgb(255 255 255 / 0.08) inset, 0 4px 12px -4px rgb(56 189 248 / 0.42);
+}
 
 /* icon-prefixed input */
 .lm-field { position: relative; }
@@ -308,21 +332,27 @@ html.dark .tab-on { color: white; }
   width: 1.05rem; height: 1.05rem; color: var(--fg-3);
   pointer-events: none; transition: color 0.18s;
 }
-.lm-field:focus-within .ic { color: rgb(124 58 237 / 0.95); }
-html.dark .lm-field:focus-within .ic { color: rgb(196 181 253 / 0.95); }
+.lm-field:focus-within .ic { color: rgb(14 165 233 / 0.96); }
+html.dark .lm-field:focus-within .ic { color: rgb(56 189 248 / 0.96); }
 .fld {
   width: 100%; padding: 0.7rem 0.85rem 0.7rem 2.4rem; border-radius: 0.7rem;
-  background: rgb(15 23 42 / 0.03); border: 1px solid var(--hairline);
+  background: rgb(247 251 255 / 0.84); border: 1px solid rgb(199 215 232 / 0.95);
   color: var(--fg); font-size: 0.875rem; outline: none;
   transition: border-color 0.18s, box-shadow 0.18s, background 0.18s;
 }
-html.dark .fld { background: rgb(255 255 255 / 0.04); }
-.fld:focus {
-  border-color: rgb(167 139 250 / 0.65);
-  background: rgb(124 58 237 / 0.04);
-  box-shadow: 0 0 0 3px rgb(167 139 250 / 0.18);
+html.dark .fld {
+  background: rgb(15 34 55 / 0.74);
+  border-color: rgb(36 65 92 / 0.82);
 }
-html.dark .fld:focus { background: rgb(255 255 255 / 0.06); }
+.fld:focus {
+  border-color: rgb(56 189 248 / 0.74);
+  background: rgb(240 251 255 / 0.92);
+  box-shadow: 0 0 0 3px rgb(56 189 248 / 0.18);
+}
+html.dark .fld:focus {
+  background: rgb(17 42 67 / 0.86);
+  box-shadow: 0 0 0 3px rgb(56 189 248 / 0.2);
+}
 .fld::placeholder { color: var(--fg-faint); }
 /* Keep autofill on-theme in dark (otherwise it paints white/yellow). */
 html.dark .fld:-webkit-autofill,
@@ -330,8 +360,8 @@ html.dark .fld:-webkit-autofill:hover,
 html.dark .fld:-webkit-autofill:focus {
   -webkit-text-fill-color: white;
   caret-color: white;
-  -webkit-box-shadow: 0 0 0 1000px #1a1c26 inset;
-  box-shadow: 0 0 0 1000px #1a1c26 inset;
+  -webkit-box-shadow: 0 0 0 1000px var(--lm-dark-field) inset;
+  box-shadow: 0 0 0 1000px var(--lm-dark-field) inset;
   transition: background-color 9999s ease-in-out 0s;
 }
 .eye {
@@ -347,12 +377,12 @@ html.dark .fld:-webkit-autofill:focus {
   min-width: 5.5rem; /* keep width stable between text / spinner */
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 0.75rem; white-space: nowrap;
-  color: rgb(124 58 237); /* violet-600 — readable on the light card */
-  background: rgb(167 139 250 / 0.12); border: 1px solid rgb(167 139 250 / 0.4);
+  color: rgb(3 105 161);
+  background: rgb(14 165 233 / 0.12); border: 1px solid rgb(14 165 233 / 0.34);
   transition: background 0.15s, opacity 0.15s;
 }
-html.dark .code-btn { color: rgb(196 181 253 / 0.95); background: rgb(167 139 250 / 0.1); border-color: rgb(167 139 250 / 0.3); }
-.code-btn:hover:not(:disabled) { background: rgb(167 139 250 / 0.2); }
+html.dark .code-btn { color: rgb(125 211 252 / 0.96); background: rgb(56 189 248 / 0.11); border-color: rgb(56 189 248 / 0.32); }
+.code-btn:hover:not(:disabled) { background: rgb(14 165 233 / 0.2); }
 /* Disabled (sending / countdown): just dim — keep the theme text color so it
    never washes out to invisible white on the light card. */
 .code-btn:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -363,13 +393,22 @@ html.dark .code-btn { color: rgb(196 181 253 / 0.95); background: rgb(167 139 25
   display: flex; align-items: center; justify-content: center; gap: 0.5rem;
   padding: 0.72rem 0; border-radius: 0.7rem; font-size: 0.9rem; font-weight: 600;
   letter-spacing: 0.02em; color: white; margin-top: 0.35rem;
-  background: linear-gradient(135deg, #a855f7 0%, #7c3aed 50%, #ec4899 100%);
-  box-shadow: 0 10px 24px -8px rgb(168 85 247 / 0.6);
-  transition: transform 0.12s, box-shadow 0.18s, filter 0.18s;
+  background: var(--lm-primary);
+  box-shadow: 0 10px 24px -8px rgb(14 165 233 / 0.62);
+  transition: transform 0.12s, box-shadow 0.18s, background 0.18s;
 }
-.btn-primary:hover:not(:disabled) { filter: brightness(1.08); box-shadow: 0 12px 28px -8px rgb(168 85 247 / 0.75); }
+.btn-primary:hover:not(:disabled) { background: #0284c7; box-shadow: 0 12px 28px -8px rgb(14 165 233 / 0.72); }
 .btn-primary:active:not(:disabled) { transform: translateY(1px); }
 .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+html.dark .btn-primary {
+  color: #04111f;
+  background: var(--lm-focus);
+  box-shadow: 0 10px 24px -8px rgb(56 189 248 / 0.56);
+}
+html.dark .btn-primary:hover:not(:disabled) {
+  background: #7dd3fc;
+  box-shadow: 0 12px 28px -8px rgb(56 189 248 / 0.64);
+}
 
 .spinner {
   width: 0.95rem; height: 0.95rem; border-radius: 9999px;
