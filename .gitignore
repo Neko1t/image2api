@@ -68,6 +68,7 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+.worktrees/
 
 # fast-deploy build artifact
 /frontend/dist.tar.gz
