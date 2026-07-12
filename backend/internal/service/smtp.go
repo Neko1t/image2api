@@ -38,7 +38,7 @@ func (s *SMTPService) SendCode(ctx context.Context, cfg SMTPConfig, to, code, pu
 	}
 	subject := strings.TrimSpace(cfg.Subject)
 	if subject == "" {
-		subject = "Vivid AI 邮箱验证码"
+		subject = "Lunixai 邮箱验证码"
 	}
 	body := fmt.Sprintf("你正在进行%s，验证码为：%s\n\n验证码 6 分钟内有效。", action, code)
 	msg := buildSMTPMessage(cfg.FromAddr, to, subject, body)

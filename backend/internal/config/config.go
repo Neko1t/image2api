@@ -39,7 +39,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		AppEnv:            envString("APP_ENV", "development"),
 		HTTPAddr:          envString("HTTP_ADDR", ":6061"),
-		AppTitle:          envString("APP_TITLE", "Vivid AI"),
+		AppTitle:          envString("APP_TITLE", "Lunixai"),
 		PostgresDSN:       envString("POSTGRES_DSN", "host=127.0.0.1 user=postgres password=postgres dbname=vivid_ai port=5432 sslmode=disable TimeZone=Asia/Shanghai"),
 		RedisAddr:         envString("REDIS_ADDR", "127.0.0.1:6379"),
 		RedisPassword:     envString("REDIS_PASSWORD", ""),

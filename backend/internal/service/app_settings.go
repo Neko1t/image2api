@@ -488,7 +488,7 @@ func (s *AppSettingsService) loadSMTPConfig(ctx context.Context) (SMTPConfig, er
 	title, _ := s.settings.GetValue(ctx, "site.title")
 	title = strings.TrimSpace(title)
 	if title == "" {
-		title = "Vivid"
+		title = "Lunixai"
 	}
 	return SMTPConfig{
 		Host:     current.Host,

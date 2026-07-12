@@ -39,7 +39,7 @@ async function saveMedia() {
 
 // ---- site (branding shown across the app) ----
 // Default homepage 子标题 — shown on the home Hero when unset, and pre-filled
-// into the input so the admin edits from it (same idea as 标题 defaulting to Vivid).
+// into the input so the admin edits from it (same idea as 标题 defaulting to Lunixai).
 const DEFAULT_SUBTITLE = '把脑海里的画面写成一句话,GPT、Gemini、Firefly、Flux 等顶级模型替你变成图像与视频。'
 const siteForm = reactive({ title: '', logo: '', subtitle: '', qq: '', qq_link: '', qq_group: '', qq_group_link: '', email: '', shop: '' })
 const siteBusy = ref(false); const siteSaved = ref(false)
@@ -301,8 +301,8 @@ onMounted(() => { loadSite(); loadReg(); loadSmtp(); loadCredits(); loadAnnounce
       </div>
       <div class="space-y-3">
         <label class="row">
-          <span><span class="lbl">网页主标题</span><span class="hint">显示在浏览器标签、首页 Logo、侧栏和登录卡上。未设置时默认显示 "Vivid"。</span></span>
-          <input v-model="siteForm.title" placeholder="Vivid" class="txt" />
+          <span><span class="lbl">网页主标题</span><span class="hint">显示在浏览器标签、首页 Logo、侧栏和登录卡上。未设置时默认显示 "Lunixai"。</span></span>
+          <input v-model="siteForm.title" placeholder="Lunixai" class="txt" />
         </label>
         <div class="row">
           <span><span class="lbl">Logo</span><span class="hint">侧栏 / 公开页头部 / 浏览器标签的 Logo。点击或拖拽图片到下图替换,点「保存设置」后才上传到存储(替换会自动删旧图)。下图当前显示的就是默认 Logo。</span></span>

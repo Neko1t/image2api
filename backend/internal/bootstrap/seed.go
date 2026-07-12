@@ -9,7 +9,7 @@ import (
 
 func seedDefaults(ctx context.Context, db *gorm.DB) error {
 	defaults := []model.SiteSetting{
-		{Key: "site.title", Value: "Vivid"},
+		{Key: "site.title", Value: "Lunixai"},
 		{Key: "site.logo", Value: ""},
 		{Key: "site.subtitle", Value: ""},
 		{Key: "contact.qq", Value: "1114639355"},
@@ -54,6 +54,13 @@ func seedDefaults(ctx context.Context, db *gorm.DB) error {
 		if err := db.WithContext(ctx).Create(&item).Error; err != nil {
 			return err
 		}
+	}
+	// Upgrade only untouched legacy brand defaults. Explicitly customized site
+	// titles remain unchanged, and this update is safe to run on every startup.
+	if err := db.WithContext(ctx).Model(&model.SiteSetting{}).
+		Where("key = ? AND value IN ?", "site.title", []string{"Vivid", "Vivid AI"}).
+		Update("value", "Lunixai").Error; err != nil {
+		return err
 	}
 	// One-time backfill of the persistent per-model generation counter from
 	// historical success logs, so the admin "次数" keeps its running total when we

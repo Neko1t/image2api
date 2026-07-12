@@ -112,7 +112,7 @@ const currentLabel = computed(() => {
              style="background: radial-gradient(circle, #f43f5e, transparent 60%); filter: blur(100px)"></div>
       </div>
 
-      <!-- Page header — shows the Vivid wordmark on home, route label
+      <!-- Page header — shows the Lunixai wordmark on home, route label
            elsewhere. Same vertical position across routes so the brand
            stamp doesn't jump around. -->
       <header class="relative z-10 px-8 md:px-14 pt-10 pb-4 flex items-center justify-between gap-4">

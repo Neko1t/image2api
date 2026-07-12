@@ -7,7 +7,7 @@ import { reactive } from 'vue'
 const BASE = import.meta.env.VITE_API_BASE || ''
 
 export const site = reactive({
-  title: 'Vivid',
+  title: 'Lunixai',
   logo: '',
   subtitle: '',
   cdkRedeemEnabled: true,
@@ -34,7 +34,7 @@ export function applyFavicon(url) {
     document.head.appendChild(link)
   }
   link.removeAttribute('type') // a png/jpg logo must not be forced as svg
-  link.href = url || '/favicon.svg'
+  link.href = url || '/lunixai-logo.png'
 }
 
 export async function loadSite() {

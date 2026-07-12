@@ -65,7 +65,7 @@ Do not commit a permanently failing test alone; keep it in the working tree thro
 
 - [ ] **Step 1: Crop the supplied RGBA source deterministically**
 
-Use Pillow to crop `(256, 64, 768, 576)` from `C:/Users/20895/Downloads/20260711-141014-VFYRBSDI.png` and save it losslessly as `frontend/public/lunixai-logo.png`. This 512x512 crop contains the upper standalone mark and excludes the lower lockup.
+Use Pillow to crop `(302, 85, 722, 505)` from `C:/Users/20895/Downloads/20260711-141014-VFYRBSDI.png`, resize the 420x420 crop to 512x512 with Lanczos resampling, and save it losslessly as `frontend/public/lunixai-logo.png`. This centered crop contains the upper standalone mark and excludes the lower lockup.
 
 - [ ] **Step 2: Validate the asset before consuming it**
 

@@ -25,7 +25,7 @@ let cooldownTimer = null
 // Per-mode copy for the header so each tab reads as its own little page.
 const heading = computed(() => ({
   login: { title: '欢迎回来', sub: '登录以继续你的创作' },
-  register: { title: '创建账号', sub: '加入 Vivid,开始 AI 生图' },
+  register: { title: '创建账号', sub: '加入 Lunixai,开始 AI 生图' },
   forgot: { title: '找回密码', sub: '通过邮箱验证重置你的密码' },
 }[mode.value]))
 
