@@ -10,7 +10,6 @@ import (
 	"time"
 
 	tlsclient "github.com/bogdanfinn/tls-client"
-	"github.com/google/uuid"
 )
 
 // GenerateImage runs a Runway gemini image text/image-to-image pipeline:
@@ -21,7 +20,7 @@ import (
 // anything else → workflow_gemini_image / gemini-3-pro-image-preview. imageSize
 // is the "1K"/"2K"/"4K" tier. teamID is the workspace id; if empty it's derived
 // from the token. refs may be empty (pure text-to-image).
-func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prompt, aspectRatio, imageSize string, refs [][]byte) ([]byte, map[string]any, error) {
+func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prompt, aspectRatio, imageSize string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
 	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
 	if token == "" {
 		return nil, nil, ErrAuth
@@ -48,6 +47,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 	}
 
 	var refImages []map[string]any
+	var refAssetIDs []string
 	for i, raw := range refs {
 		if len(raw) == 0 {
 			continue
@@ -62,19 +62,27 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 			"assetId": assetID,
 			"url":     url,
 		})
+		refAssetIDs = append(refAssetIDs, assetID)
 	}
 
-	assetGroupID, _ := c.assetGroupID(ctx, directClient, token, teamID) // best-effort
+	// Browser order: create the real session FIRST, attach the references and its
+	// own asset group, THEN submit the task into it (see createSession). The task
+	// carries this session's assetGroupId, NOT the account-wide "Generations"
+	// group.
+	sessionID, err := c.createSession(ctx, submitClient, token, teamID)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, aid := range refAssetIDs {
+		c.attachReference(ctx, submitClient, token, teamID, sessionID, aid)
+	}
+	assetGroupID, _ := c.sessionAssetGroup(ctx, submitClient, token, teamID, sessionID) // best-effort
 
-	taskID, err := c.createImageTask(ctx, submitClient, token, teamID, modelID, prompt, aspectRatio, imageSize, assetGroupID, refImages)
+	taskID, err := c.createImageTask(ctx, submitClient, token, teamID, modelID, prompt, aspectRatio, imageSize, sessionID, assetGroupID, refImages)
 	if err != nil {
 		return nil, nil, err
 	}
 	artifactURL, err := c.pollTask(ctx, directClient, token, teamID, taskID)
-	if err != nil {
-		return nil, nil, err
-	}
-	data, err := c.download(ctx, directClient, artifactURL)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -83,6 +91,15 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 		"task_id":   taskID,
 		"team_id":   teamID,
 		"image_url": artifactURL,
+	}
+	// downloadResult=false (API-key url-only mode): return the upstream artifact
+	// URL without downloading the PNG.
+	if !downloadResult {
+		return nil, meta, nil
+	}
+	data, err := c.download(ctx, directClient, artifactURL)
+	if err != nil {
+		return nil, nil, err
 	}
 	return data, meta, nil
 }
@@ -111,13 +128,19 @@ func (c *Client) uploadReference(ctx context.Context, client tlsclient.HttpClien
 	return assetID, refURL, nil
 }
 
-// createImageTask creates a gemini image task (workflow_gemini_image for Pro,
-// gemini_3_1_flash_image for Nano Banana 2) and returns its id.
-func (c *Client) createImageTask(ctx context.Context, client tlsclient.HttpClient, token, teamID, modelID, prompt, aspectRatio, imageSize, assetGroupID string, refImages []map[string]any) (string, error) {
+// createImageTask submits a gemini image task (workflow_gemini_image for Pro,
+// gemini_3_1_flash_image for Nano Banana 2) INTO the pre-created session and
+// returns its id. sessionID must be a real server-side session (see
+// createSession) and assetGroupID must be that session's own group.
+func (c *Client) createImageTask(ctx context.Context, client tlsclient.HttpClient, token, teamID, modelID, prompt, aspectRatio, imageSize, sessionID, assetGroupID string, refImages []map[string]any) (string, error) {
+	if strings.TrimSpace(aspectRatio) == "" {
+		aspectRatio = "16:9"
+	}
 	taskType := "workflow_gemini_image"
 	opts := map[string]any{
 		"name":           "Nano Banana Pro - " + prompt,
 		"text_prompt":    prompt,
+		"aspect_ratio":   aspectRatio,
 		"num_images":     1,
 		"image_size":     imageSize,
 		"model":          "gemini-3-pro-image-preview",
@@ -128,25 +151,21 @@ func (c *Client) createImageTask(ctx context.Context, client tlsclient.HttpClien
 		taskType = "gemini_3_1_flash_image"
 		opts["name"] = "Nano Banana 2 - " + prompt
 		opts["model"] = "gemini-3.1-flash-image-preview"
-		if strings.TrimSpace(aspectRatio) == "" {
-			aspectRatio = "16:9"
-		}
-		opts["aspect_ratio"] = aspectRatio
 	}
-	// assetGroupId is present on every real browser task submit; omitting it is a
-	// bot tell. Best-effort — only attach when we resolved the "Generations"
-	// group for this workspace.
 	if assetGroupID != "" {
 		opts["assetGroupId"] = assetGroupID
 	}
 	if len(refImages) > 0 {
 		opts["reference_images"] = refImages
 	}
+	// Pre-flight cost estimate, exactly as the web app does before every spend.
+	c.estimateCost(ctx, client, token, teamID, "gemini_image", opts)
+
 	res, err := c.submitTask(ctx, client, token, teamID, map[string]any{
 		"taskType":  taskType,
 		"options":   opts,
 		"asTeamId":  jsonNumberOrString(teamID),
-		"sessionId": uuid.NewString(),
+		"sessionId": sessionID,
 	})
 	if err != nil {
 		return "", err
@@ -156,5 +175,7 @@ func (c *Client) createImageTask(ctx context.Context, client tlsclient.HttpClien
 	if id == "" {
 		return "", fmt.Errorf("%w: image task missing id", ErrTemporaryUpstream)
 	}
+	// Post-submit: generation record + session play (session already exists).
+	c.recordGeneration(ctx, client, token, teamID, id, sessionID, prompt, opts)
 	return id, nil
 }

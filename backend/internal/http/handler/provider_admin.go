@@ -3,6 +3,7 @@ package handler
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"backend/internal/service"
 	"github.com/gin-gonic/gin"
@@ -375,7 +376,91 @@ func (h *ProviderAdminHandler) AccountsList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load accounts"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": data})
+
+	// KPI stats are computed over the FULL set (每个类型的 成功/失败/限额), independent
+	// of the current filter/page — mirrors the old client-side `stats` computed.
+	stats := accountsStats(data)
+
+	// Server-side filtering (类型 / 状态 / 搜索 邮箱·ID·类型 / dead) so pagination is
+	// correct across pages. ?dead=1 returns only 异常(已失效) accounts — used by
+	// 「删除异常账号」to collect every dead id regardless of the current page.
+	typeFilter := strings.TrimSpace(c.Query("type"))
+	statusFilter := strings.TrimSpace(c.Query("status"))
+	deadOnly := c.Query("dead") == "1"
+	q := strings.ToLower(strings.TrimSpace(c.Query("q")))
+	filtered := make([]map[string]any, 0, len(data))
+	for _, row := range data {
+		if deadOnly && !rowBool(row, "dead") {
+			continue
+		}
+		if typeFilter != "" && rowStr(row, "type") != typeFilter {
+			continue
+		}
+		if statusFilter != "" && rowStr(row, "status") != statusFilter {
+			continue
+		}
+		if q != "" {
+			email := strings.ToLower(rowStr(row, "email"))
+			id := strings.ToLower(rowStr(row, "id"))
+			typ := strings.ToLower(rowStr(row, "type"))
+			if !strings.Contains(email, q) && !strings.Contains(id, q) && !strings.Contains(typ, q) {
+				continue
+			}
+		}
+		filtered = append(filtered, row)
+	}
+
+	total := len(filtered)
+	limit, offset := pageParams(c, 20)
+	page := pageSlice(filtered, limit, offset)
+	c.JSON(http.StatusOK, gin.H{"data": page, "total": total, "limit": limit, "offset": offset, "stats": stats})
+}
+
+// accountsStats reproduces the 账号 KPI strip: per-type 正常/失效/限额 counts plus a
+// grand total and total dead count (drives 「删除异常账号 (N)」).
+func accountsStats(rows []map[string]any) gin.H {
+	types := []string{"openai", "adobe", "runway", "leonardo", "krea", "imagine", "grok"}
+	by := map[string]*struct{ N, Ok, Dead, Quota int }{}
+	for _, t := range types {
+		by[t] = &struct{ N, Ok, Dead, Quota int }{}
+	}
+	deadTotal := 0
+	for _, row := range rows {
+		dead := rowBool(row, "dead")
+		if dead {
+			deadTotal++
+		}
+		g, ok := by[rowStr(row, "type")]
+		if !ok {
+			continue
+		}
+		g.N++
+		status := rowStr(row, "status")
+		switch {
+		case status == "active":
+			g.Ok++
+		case dead || status == "disabled":
+			g.Dead++
+		case status == "quota":
+			g.Quota++
+		}
+	}
+	out := gin.H{"total": len(rows), "dead_total": deadTotal}
+	for _, t := range types {
+		g := by[t]
+		out[t] = gin.H{"n": g.N, "ok": g.Ok, "dead": g.Dead, "quota": g.Quota}
+	}
+	return out
+}
+
+func rowStr(m map[string]any, key string) string {
+	s, _ := m[key].(string)
+	return s
+}
+
+func rowBool(m map[string]any, key string) bool {
+	b, _ := m[key].(bool)
+	return b
 }
 
 func (h *ProviderAdminHandler) AccountQuota(c *gin.Context) {

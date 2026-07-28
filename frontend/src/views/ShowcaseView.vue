@@ -6,7 +6,7 @@
 //   - work  : "我们的作品" marquee — admin-curated featured outputs
 // All three kinds use a real image as the background; admins pick one from
 // the already-generated files or paste an external URL.
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { api, jsonBody, generatedUrl } from '../api'
 import Icon from '../components/Icon.vue'
 
@@ -18,6 +18,7 @@ const picking = ref(false)        // truthy when the image-picker modal is open
 const recentFiles = ref([])       // populated from /stats.recent for the picker
 const page = ref(1)
 const pageSize = ref(12)
+const total = ref(0)
 const form = reactive({
   id: '', kind: 'hero', title: '', subtitle: '', prompt: '',
   image: '', weight: 100, span: '',
@@ -27,28 +28,28 @@ const error = ref('')
 
 async function refresh() {
   loading.value = true
-  const r = await api('/showcase')
-  const grouped = r.data?.data || {}
-  // Guard every group — a payload missing hero/bento would throw on spread of
-  // undefined and freeze the page on "加载中…".
-  items.value = [...(grouped.hero || []), ...(grouped.bento || []), ...(grouped.work || [])]
+  const qs = new URLSearchParams({
+    limit: String(pageSize.value),
+    offset: String((page.value - 1) * pageSize.value),
+  })
+  if (filter.value !== 'all') qs.set('kind', filter.value)
+  const r = await api('/showcase/admin?' + qs.toString())
+  items.value = r.data?.data || []
+  total.value = Number(r.data?.total ?? items.value.length)
   loading.value = false
 }
 
-const filtered = computed(() => {
-  if (filter.value === 'all') return items.value
-  return items.value.filter((x) => x.kind === filter.value)
-})
+// Server-side pagination: items IS the current page (kind 筛选在后端)。
+const filtered = computed(() => items.value)
+const pagedItems = computed(() => items.value)
 
-// Client-side pagination over the filtered set. The showcase store is small
-// (admin curates manually) so paging client-side is fine — no extra API calls
-// when the admin flips pages.
-const totalPages = computed(() => Math.max(1, Math.ceil(filtered.value.length / pageSize.value)))
-const pagedItems = computed(() => {
-  const start = (page.value - 1) * pageSize.value
-  return filtered.value.slice(start, start + pageSize.value)
-})
-function setFilter(v) { filter.value = v; page.value = 1 }
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+watch(page, () => { refresh() })
+function setFilter(v) {
+  filter.value = v
+  if (page.value !== 1) page.value = 1
+  else refresh()
+}
 function goPage(n) {
   const target = Math.max(1, Math.min(totalPages.value, n))
   if (target !== page.value) page.value = target
@@ -234,8 +235,8 @@ onMounted(refresh)
     <div v-if="!loading && totalPages > 1"
          class="card !p-3 flex items-center justify-between gap-3">
       <div class="text-xs text-[color:var(--fg-3)] tabular-nums px-2">
-        <span class="text-[color:var(--fg)]">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(filtered.length, page * pageSize) }}</span>
-        / {{ filtered.length }} 条
+        <span class="text-[color:var(--fg)]">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(total, page * pageSize) }}</span>
+        / {{ total }} 条
       </div>
       <div class="flex items-center gap-1">
         <template v-for="(n, i) in pageNumbers" :key="i">

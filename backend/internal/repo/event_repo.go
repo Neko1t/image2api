@@ -552,6 +552,16 @@ func (r *EventRepository) MarkVideoReady(ctx context.Context, eventID, fileURL s
 	return res.Error
 }
 
+// SetFile stores an arbitrary file reference (relative path OR upstream URL) on
+// an event WITHOUT touching status/counters — used for already-succeeded no-store
+// events whose auth-gated upstream URL is proxied on demand.
+func (r *EventRepository) SetFile(ctx context.Context, eventID, fileURL string) error {
+	return r.db.WithContext(ctx).
+		Model(&model.EventLog{}).
+		Where("id = ?", eventID).
+		Update("file", fileURL).Error
+}
+
 func (r *EventRepository) UpdateStatus(ctx context.Context, eventID, status, errMsg string, elapsedMS int) error {
 	patch := map[string]any{
 		"status":     status,

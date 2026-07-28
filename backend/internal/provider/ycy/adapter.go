@@ -27,8 +27,8 @@ func NewAdapter() *Adapter {
 
 // GenerateImage implements adapter.ImageAdapter but YCY does not support image
 // generation, so this always returns ErrAdapterUnsupported.
-func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte) ([]byte, error) {
-	return nil, adapter.ErrAdapterUnsupported
+func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte, downloadResult bool) ([]byte, string, error) {
+	return nil, "", adapter.ErrAdapterUnsupported
 }
 
 // GenerateVideo implements adapter.VideoAdapter by calling the YCY video API.

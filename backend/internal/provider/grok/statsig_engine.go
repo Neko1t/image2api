@@ -13,6 +13,8 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	_ "embed"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,18 +38,24 @@ const sigPoolSize = 4
 // homepage fetched, or chunk location failed). Callers fall back to the static path.
 var errEngineNotReady = errors.New("statsig engine not ready")
 
+// locateConcurrency bounds parallel chunk fetches during signer discovery.
+const locateConcurrency = 24
+
 var (
-	// signer-chunk location patterns (Turbopack). The caller chunk contains the
-	// literal "x-statsig-id" and a lazy import `.A(<moduleId>).then(e=>t(e.default()))`.
-	statsigCallerRe = regexp.MustCompile(`\.A\((\d+)\)\.then\(`)
-	chunkPathRe     = regexp.MustCompile(`/_next/static/chunks/[a-zA-Z0-9_.\-/]+\.js`)
+	// chunkPathRe matches chunk URLs in the homepage; allChunkRefRe additionally
+	// matches the loader-manifest's lazy refs (which drop the /_next/ prefix).
+	// The Turbopack content-hash alphabet includes '~' (e.g. 0~4v1h2zpw7n0.js) -
+	// the signer chunk is frequently one of these, so the class MUST list it or
+	// the signer is never fetched/located (403 anti-bot, static fallback goes stale).
+	chunkPathRe   = regexp.MustCompile(`/_next/static/chunks/[a-zA-Z0-9_.~\-/]+\.js`)
+	allChunkRefRe = regexp.MustCompile(`(?:/_next/)?static/chunks/[a-zA-Z0-9_.~\-/]+\.js`)
 	// goja's parser tries to fetch //# sourceMappingURL=... from disk and errors.
 	sourceMapRe = regexp.MustCompile(`(?m)//[#@]\s*sourceMappingURL=\S*`)
 
 	sigMgrMu    sync.Mutex
-	sigBuildKey string           // hash of the homepage chunk list; changes on reship
-	sigChunkSrc string           // current signer chunk source
-	sigPool     chan *sigEngine  // pool of ready engines for sigChunkSrc
+	sigBuildKey string          // hash of the homepage chunk list; changes on reship
+	sigChunkSrc string          // current signer chunk source
+	sigPool     chan *sigEngine // pool of ready engines for sigChunkSrc
 )
 
 // sigEngine wraps one goja runtime with grok's signer chunk loaded. A goja runtime
@@ -171,7 +179,28 @@ func ensureEngine(ctx context.Context, client tlsclient.HttpClient, homeHTML str
 		return
 	}
 
-	src, err := locateSignerChunk(ctx, client, dedupe(paths))
+	// Inputs for build-agnostic behavioral verification of candidate chunks.
+	mm := statsigMetaRe.FindStringSubmatch(homeHTML)
+	if mm == nil {
+		log.Printf("grok statsig: no seed meta in homepage; cannot locate signer")
+		return
+	}
+	seed, err := decodeStatsigSeed(mm[1])
+	if err != nil {
+		log.Printf("grok statsig: seed decode failed: %v", err)
+		return
+	}
+	curves, err := parseStatsigCurves(homeHTML)
+	if err != nil {
+		log.Printf("grok statsig: curves parse failed: %v", err)
+		return
+	}
+	cj, err := json.Marshal(curves)
+	if err != nil {
+		return
+	}
+
+	src, err := locateSignerChunk(ctx, client, dedupe(paths), mm[1], string(cj), seed)
 	if err != nil {
 		log.Printf("grok statsig: locate signer chunk failed (will use static fallback): %v", err)
 		return
@@ -192,50 +221,132 @@ func ensureEngine(ctx context.Context, client tlsclient.HttpClient, homeHTML str
 	log.Printf("grok statsig: self-heal engine ready (build %s..)", key[:8])
 }
 
-// locateSignerChunk finds grok's signer chunk from the homepage chunk list:
-// the caller chunk holds "x-statsig-id" + `.A(<id>)`; a loader chunk registers that
-// <id> with `Promise.all(["static/chunks/XXX.js"]...)` — XXX is the signer.
-func locateSignerChunk(ctx context.Context, client tlsclient.HttpClient, paths []string) (string, error) {
-	var callerID string
-	loaderRe := (*regexp.Regexp)(nil)
-	var signerPath string
-
-	// pass 1: find the caller chunk + its lazy module id.
-	for _, p := range paths {
-		body, err := fetchChunk(ctx, client, p)
-		if err != nil || !strings.Contains(body, "x-statsig-id") {
-			continue
-		}
-		if m := statsigCallerRe.FindStringSubmatch(body); m != nil {
-			callerID = m[1]
-		}
-		break
+// locateSignerChunk finds grok's obfuscated anti-bot signer chunk build-agnostically,
+// with no dependency on rotating literals (header name, class names, module ids).
+// It screens every reachable chunk with a cheap obfuscator.io fingerprint, then
+// confirms the true signer by RUNNING it in goja and checking its output embeds the
+// homepage seed (signerEmbedsSeed). The signer is lazily loaded (not referenced in
+// the HTML directly), so candidates also include the chunk paths named inside the
+// homepage's Turbopack loader manifest.
+func locateSignerChunk(ctx context.Context, client tlsclient.HttpClient, homeChunks []string, seedB64, curvesJSON string, seed []byte) (string, error) {
+	seen := map[string]bool{}
+	var lazy []string
+	for _, p := range homeChunks {
+		seen[p] = true
 	}
-	if callerID == "" {
-		return "", errors.New("statsig caller module id not found")
-	}
-	// loader registers: ,<callerID>,<param>=>{ ... Promise.all(["static/chunks/XXX.js"] ...
-	loaderRe = regexp.MustCompile(`,` + callerID + `,\w+=>\{[^}]*?Promise\.all\(\["(static/chunks/[^"]+\.js)"`)
 
-	// pass 2: find the loader chunk that maps callerID -> signer chunk path.
-	for _, p := range paths {
+	// Pass 1 (sequential): fetch the homepage chunks, verify them directly, and
+	// harvest every chunk path they reference (the loader manifest lists the signer).
+	for _, p := range homeChunks {
 		body, err := fetchChunk(ctx, client, p)
 		if err != nil {
 			continue
 		}
-		if m := loaderRe.FindStringSubmatch(body); m != nil {
-			signerPath = m[1]
-			break
+		if src, ok := verifySignerChunk(body, seedB64, curvesJSON, seed); ok {
+			return src, nil
+		}
+		for _, ref := range allChunkRefRe.FindAllString(body, -1) {
+			np := normalizeChunkPath(ref)
+			if !seen[np] {
+				seen[np] = true
+				lazy = append(lazy, np)
+			}
 		}
 	}
-	if signerPath == "" {
-		return "", fmt.Errorf("signer chunk path for module %s not found", callerID)
+
+	// Pass 2 (concurrent): fetch the lazily-referenced chunks, cheap-fingerprint each,
+	// behaviorally verify the matches, and stop at the first chunk that round-trips seed.
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
+	found := make(chan string, 1)
+	sem := make(chan struct{}, locateConcurrency)
+	var wg sync.WaitGroup
+	for _, p := range lazy {
+		if ctx2.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx2.Err() != nil {
+				return
+			}
+			body, err := fetchChunk(ctx2, client, p)
+			if err != nil {
+				return
+			}
+			if src, ok := verifySignerChunk(body, seedB64, curvesJSON, seed); ok {
+				select {
+				case found <- src:
+					cancel()
+				default:
+				}
+			}
+		}(p)
 	}
-	src, err := fetchChunk(ctx, client, "/_next/"+signerPath)
+	go func() { wg.Wait(); close(found) }()
+	if src, ok := <-found; ok {
+		return src, nil
+	}
+	return "", fmt.Errorf("statsig signer chunk not found among %d candidates", len(homeChunks)+len(lazy))
+}
+
+// verifySignerChunk returns the goja-ready source if body is grok's signer: it must
+// carry the obfuscator.io fingerprint AND, when executed, produce an x-statsig-id
+// whose decoded record embeds the homepage seed.
+func verifySignerChunk(body, seedB64, curvesJSON string, seed []byte) (string, bool) {
+	if !isObfuscatedSigner(body) {
+		return "", false
+	}
+	clean := sourceMapRe.ReplaceAllString(body, "")
+	eng, err := newSigEngine(clean)
 	if err != nil {
-		return "", fmt.Errorf("fetch signer chunk: %w", err)
+		return "", false
 	}
-	return src, nil
+	id, err := eng.statsigID(seedB64, curvesJSON, "/rest/app-chat/conversations/new", "POST")
+	if err != nil {
+		return "", false
+	}
+	if !signerEmbedsSeed(id, seed) {
+		return "", false
+	}
+	return clean, true
+}
+
+// normalizeChunkPath turns a bare or /_next/-prefixed chunk ref into a fetch path.
+func normalizeChunkPath(ref string) string {
+	return "/_next/" + strings.TrimPrefix(ref, "/_next/")
+}
+
+// isObfuscatedSigner cheaply screens a chunk for the obfuscator.io string-array
+// decoder that grok applies ONLY to its anti-bot signer (the rest of the app is
+// plain Turbopack output). The RC4-style byte decoder (`...^...%256`) is the stable
+// tell; it matches a handful of chunks, which behavioral verification then narrows
+// to exactly one. This is deliberately build-agnostic (no rotating class/id/header).
+func isObfuscatedSigner(src string) bool {
+	return strings.Contains(src, "%256") &&
+		strings.Contains(src, "String.fromCharCode") &&
+		strings.Contains(src, "charCodeAt")
+}
+
+// signerEmbedsSeed decodes a candidate x-statsig-id, strips the per-call XOR mask
+// (plaintext[0] is 0x00, so masked[0] is the key), and checks the plaintext record
+// begins with 0x00 + the exact homepage seed. Only grok's real signer round-trips
+// OUR seed, so this uniquely identifies the signer chunk regardless of obfuscation.
+func signerEmbedsSeed(id string, seed []byte) bool {
+	raw, err := base64.RawStdEncoding.DecodeString(id)
+	if err != nil || len(raw) < 1+len(seed) {
+		return false
+	}
+	key := raw[0] // plaintext[0] is 0x00, so the mask key == masked byte 0
+	for i := 0; i < len(seed); i++ {
+		if raw[1+i]^key != seed[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func fetchChunk(ctx context.Context, client tlsclient.HttpClient, path string) (string, error) {

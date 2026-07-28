@@ -9,12 +9,13 @@ const items = ref([])
 const total = ref(0)
 const loading = ref(false)
 const status = ref('')
+const source = ref('')
 const search = ref('')
 const page = ref(1)
 const pageSize = 20
 
 const STATUS = { pending: '待支付', paid: '已支付', cancelled: '已取消' }
-const METHOD = { wxpay: '微信', alipay: '支付宝' }
+const METHOD = { wxpay: '微信', alipay: '支付宝', admin: '后台充值', cdk: '兑换码' }
 const chipClass = (s) => ({
   paid: 'fp-emerald', pending: 'fp-amber', cancelled: '',
 }[s] || '')
@@ -30,6 +31,7 @@ async function load() {
   loading.value = true
   const qs = new URLSearchParams({ limit: String(pageSize), offset: String((page.value - 1) * pageSize) })
   if (status.value) qs.set('status', status.value)
+  if (source.value) qs.set('source', source.value)
   if (search.value.trim()) qs.set('q', search.value.trim())
   const r = await api('/pay/admin/orders?' + qs.toString())
   loading.value = false
@@ -47,6 +49,7 @@ const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize))
 const pageStart = computed(() => total.value === 0 ? 0 : (page.value - 1) * pageSize + 1)
 const pageEnd = computed(() => Math.min(total.value, page.value * pageSize))
 function setStatus(v) { status.value = v; page.value = 1; load() }
+function setSource(v) { source.value = v; page.value = 1; load() }
 const pageNumbers = computed(() => {
   const n = totalPages.value, cur = page.value
   if (n <= 7) return Array.from({ length: n }, (_, i) => i + 1)
@@ -80,6 +83,10 @@ function goPage(n) {
           <button v-for="s in [['','全部'],['pending','待支付'],['paid','已支付'],['cancelled','已取消']]" :key="s[0]"
                   @click="setStatus(s[0])" class="fp" :class="status === s[0] && 'fp-on'">{{ s[1] }}</button>
         </div>
+        <div class="flex items-center gap-1.5">
+          <button v-for="s in [['','全部来源'],['epay','在线充值'],['admin','后台充值'],['cdk','兑换码']]" :key="s[0]"
+                  @click="setSource(s[0])" class="fp" :class="source === s[0] && 'fp-on'">{{ s[1] }}</button>
+        </div>
         <input v-model="search" @keyup.enter="doSearch" @change="doSearch"
                class="field !py-1.5 text-xs !w-52" placeholder="搜索 订单号 / 用户名 / 金额…" />
         <button @click="load" class="btn-soft"><Icon name="refresh" class="w-3.5 h-3.5" /> 刷新</button>
@@ -104,12 +111,12 @@ function goPage(n) {
         </thead>
         <tbody>
           <tr v-for="o in displayed" :key="o.id" class="log-row">
-            <td class="px-5 py-3.5 align-middle font-mono text-xs text-white/80">{{ o.id }}</td>
+            <td class="px-5 py-3.5 align-middle font-mono text-xs text-white/80" :title="o.remark">{{ o.id }}<span v-if="o.remark" class="ml-2 font-sans text-[10px] text-white/40">{{ o.remark }}</span></td>
             <td class="px-3 py-3.5 align-middle text-white/85 truncate max-w-[140px]" :title="o.user_name">{{ o.user_name || '—' }}</td>
             <td class="px-3 py-3.5 align-middle text-xs text-white/55 whitespace-nowrap">{{ fmt(o.created_at) }}</td>
             <td class="px-3 py-3.5 align-middle text-xs text-white/55 whitespace-nowrap">{{ fmt(o.paid_at) }}</td>
-            <td class="px-3 py-3.5 align-middle text-right tabular-nums text-white/85">¥{{ o.amount }}</td>
-            <td class="px-3 py-3.5 align-middle text-right tabular-nums text-violet-300">{{ o.points }}</td>
+            <td class="px-3 py-3.5 align-middle text-right tabular-nums text-white/85">{{ o.source && o.source !== 'epay' ? '—' : '¥' + o.amount }}</td>
+            <td class="px-3 py-3.5 align-middle text-right tabular-nums" :class="o.points < 0 ? 'text-rose-300' : 'text-violet-300'">{{ o.points }}</td>
             <td class="px-3 py-3.5 align-middle">
               <span class="chip" :class="chipClass(o.status)">{{ STATUS[o.status] }}<span class="opacity-50 ml-1">· {{ METHOD[o.pay_type] || o.pay_type }}</span></span>
             </td>

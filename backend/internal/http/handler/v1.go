@@ -147,6 +147,10 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			Prompt  string          `json:"prompt"`
 			Seconds json.RawMessage `json:"seconds"`
 			Size    string          `json:"size"`
+			// Reference frames (image-to-video / first-last frames) as base64 or
+			// data-URI strings — the JSON equivalent of multipart input_reference.
+			InputReference  []string `json:"input_reference"`
+			ReferenceImages []string `json:"reference_images"`
 		}
 		if err := c.ShouldBindJSON(&body); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
@@ -154,6 +158,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		}
 		modelID, prompt, size = body.Model, body.Prompt, body.Size
 		seconds = rawToString(body.Seconds)
+		refs = append(body.InputReference, body.ReferenceImages...)
 	}
 	duration := strings.TrimSpace(seconds)
 	if duration != "" && !strings.HasSuffix(duration, "s") {
@@ -200,6 +205,25 @@ func (h *V1Handler) GetVideoContent(c *gin.Context) {
 		return
 	}
 	body, contentType, err := h.v1.OpenVideoContent(c.Request.Context(), principal, c.Param("id"))
+	if err != nil {
+		h.writeV1Error(c, err, nil)
+		return
+	}
+	defer body.Close()
+	c.Header("Content-Type", contentType)
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, body)
+}
+
+// GetImageContent — GET /v1/images/{id}/content. Streams a no-store image by
+// proxying its stored (possibly auth-gated) upstream URL. Never persisted.
+func (h *V1Handler) GetImageContent(c *gin.Context) {
+	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
+	if err != nil {
+		h.writeAuthError(c, err)
+		return
+	}
+	body, contentType, err := h.v1.OpenImageContent(c.Request.Context(), principal, c.Param("id"))
 	if err != nil {
 		h.writeV1Error(c, err, nil)
 		return

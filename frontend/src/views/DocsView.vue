@@ -113,7 +113,7 @@ const examples = computed(() => [
   {
     title: '文生图 · Python (openai SDK)',
     code:
-`import base64
+`import urllib.request
 from openai import OpenAI
 
 client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
@@ -123,9 +123,8 @@ resp = client.images.generate(
     prompt="a corgi running in a golden wheat field, cinematic",
     size="2048x2048",   # 2K · 1:1,见下方对照表
 )
-# 结果是 base64(无 URL)
-with open("out.png", "wb") as f:
-    f.write(base64.b64decode(resp.data[0].b64_json))`,
+# 结果是图片 URL(上游原始直链,会过期 → 尽快下载/转存)
+urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
   },
   {
     title: '图生图 / 参考图 · curl (multipart)',
@@ -141,7 +140,7 @@ with open("out.png", "wb") as f:
   {
     title: '图生图 · Python (openai SDK)',
     code:
-`import base64
+`import urllib.request
 from openai import OpenAI
 
 client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
@@ -151,8 +150,8 @@ resp = client.images.edit(
     image=open("input.png", "rb"),     # 多张:image=[open("a.png","rb"), open("b.png","rb")]
     prompt="把这张图改成赛博朋克风格",
 )
-with open("out.png", "wb") as f:
-    f.write(base64.b64decode(resp.data[0].b64_json))`,
+# 结果是图片 URL(上游原始直链,会过期 → 尽快下载/转存)
+urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
   },
   {
     title: '视频 · curl(创建 → 轮询 → 下载)',
@@ -424,7 +423,7 @@ async function copy(text) {
     <section>
       <h2 class="text-lg font-semibold mb-3">响应 & 计费</h2>
       <div class="card p-6 space-y-3 text-sm text-white/70">
-        <p><strong class="text-white/90">图像</strong>(generations / edits)返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "b64_json": "..." }] }' }}</code> —— 产物以 <strong class="text-white/90">base64</strong> 直接放在 <code class="text-white/85 font-mono">data[0].b64_json</code>(原始 base64、无 <code class="text-white/70">data:</code> 前缀),自行解码保存为图片。<strong class="text-white/90">不返回 URL、服务端不留存</strong>。</p>
+        <p><strong class="text-white/90">图像</strong>(generations / edits)返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code> —— <code class="text-white/85 font-mono">data[0].url</code> 是产物 URL,服务端不留存(<strong class="text-white/90">不返回 base64</strong>)。多数模型返回上游<strong class="text-white/90">原始直链</strong>;少数上游需鉴权的(如 gpt-image)会返回一个本站转发链 <code class="text-white/85 font-mono">/v1/images/{id}/content</code>,由服务端带账号凭据取回。<strong class="text-white/90">两种链接都会过期</strong>,请<strong class="text-white/90">尽快下载或转存到你自己的存储</strong>。</p>
         <p><strong class="text-white/90">视频</strong>(异步,Sora 风格三步):</p>
         <ol class="list-decimal list-inside space-y-1 text-white/65 pl-1">
           <li><code class="text-white/85 font-mono">POST /v1/videos</code> 立即返回任务对象 <code class="text-white/85 font-mono">{{ '{ "id": "...", "object": "video", "status": "queued", ... }' }}</code></li>

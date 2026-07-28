@@ -253,14 +253,19 @@ func AutoMigrateModels() []any {
 
 // Order is a points-recharge order paid via 易支付 (epay). ID is our merchant
 // order number (out_trade_no). Status: pending | paid | cancelled. Unpaid orders
-// auto-cancel 30 min after creation (ExpiresAt).
+// auto-cancel 30 min after creation (ExpiresAt). Besides epay recharges, the
+// table also records credit grants from admin manual adjustments (source=admin)
+// and CDK redemptions (source=cdk) as already-paid rows, so 订单管理 shows the
+// full credit history in one place.
 type Order struct {
 	ID          string    `gorm:"primaryKey;size:40"`
 	UserID      string    `gorm:"size:32;index;not null"`
 	Amount      float64   `gorm:"not null"`               // 充值金额(元)
 	Points      int       `gorm:"not null"`               // 到账积分
-	PayType     string    `gorm:"size:16"`                // wxpay | alipay
+	PayType     string    `gorm:"size:16"`                // wxpay | alipay | admin | cdk
 	Status      string    `gorm:"size:16;index;not null"` // pending | paid | cancelled
+	Source      string    `gorm:"size:16;index;not null;default:'epay'"` // epay | admin | cdk
+	Remark      string    `gorm:"type:text"`              // e.g. 兑换码 code / 管理员操作说明
 	TradeNo     string    `gorm:"size:64;index"`          // 易支付平台订单号
 	PayInfo     string    `gorm:"type:text"`              // 二维码 url / 跳转 url
 	PayInfoType string    `gorm:"size:16"`                // qrcode | jump | html | ...

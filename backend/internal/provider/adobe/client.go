@@ -174,7 +174,7 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 	return body, nil, true
 }
 
-func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string) ([]byte, map[string]any, error) {
+func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
 	// Only the generate submit goes through the proxy; polling + download run on
 	// the local IP.
 	submitSess, err := c.newTLSClient()
@@ -201,7 +201,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 	for _, payload := range candidates {
 		respBody, pollURL, err := c.submitImage(ctx, submitSess, token, prompt, endpoint, payload)
 		if err == nil {
-			meta, data, pollErr := c.pollImage(ctx, pollSess, token, pollURL)
+			meta, data, pollErr := c.pollImage(ctx, pollSess, token, pollURL, downloadResult)
 			if pollErr != nil {
 				return nil, nil, pollErr
 			}
@@ -531,7 +531,7 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 	return respBody, "", errors.New("submit ok but no poll url")
 }
 
-func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL string) (map[string]any, []byte, error) {
+func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, fmt.Errorf("adobe generation timed out: %w", err)
@@ -587,6 +587,11 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 			if first, ok := outputs[0].(map[string]any); ok {
 				if image, ok := first["image"].(map[string]any); ok {
 					if url := strings.TrimSpace(stringValue(image["presignedUrl"])); url != "" {
+						// Expose the presigned URL for callers that want it directly.
+						payload["image_url"] = url
+						if !downloadResult {
+							return payload, nil, nil
+						}
 						data, err := c.download(ctx, sess, url)
 						if err != nil {
 							return nil, nil, err

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { api, jsonBody } from '../api'
 import Icon from '../components/Icon.vue'
 
@@ -12,9 +12,16 @@ function flash(msg) { toast.value = msg; clearTimeout(toastTimer); toastTimer = 
 
 async function load() {
   loading.value = true
-  const r = await api('/banned-words')
+  const qs = new URLSearchParams({
+    limit: String(pageSize),
+    offset: String((page.value - 1) * pageSize),
+  })
+  const r = await api('/banned-words?' + qs.toString())
   items.value = r.data?.data || []
+  total.value = Number(r.data?.total ?? items.value.length)
   loading.value = false
+  // Deleting the last row of the last page can leave the cursor past the end.
+  if (page.value > totalPages.value) page.value = totalPages.value
 }
 
 async function add() {
@@ -79,14 +86,13 @@ async function delSelected() {
   load()
 }
 
-// pagination (client-side; the full list arrives in one payload)
+// Server-side pagination: items IS the current page.
 const page = ref(1)
 const pageSize = 20
-const totalPages = computed(() => Math.max(1, Math.ceil(items.value.length / pageSize)))
-const pagedItems = computed(() => {
-  const start = (Math.min(page.value, totalPages.value) - 1) * pageSize
-  return items.value.slice(start, start + pageSize)
-})
+const total = ref(0)
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+const pagedItems = computed(() => items.value)
+watch(page, () => { load() })
 function goPage(n) {
   const t = Math.max(1, Math.min(totalPages.value, n))
   if (t !== page.value) page.value = t
@@ -156,7 +162,7 @@ onMounted(load)
         </tbody>
       </table>
       <div v-if="totalPages > 1" class="flex items-center justify-between px-5 py-3 border-t border-white/[0.06] text-xs text-white/45">
-        <div><span class="tabular-nums text-white/75">{{ items.length ? (Math.min(page, totalPages) - 1) * pageSize + 1 : 0 }}–{{ Math.min(items.length, Math.min(page, totalPages) * pageSize) }}</span><span class="ml-1">/ {{ items.length }} 条</span></div>
+        <div><span class="tabular-nums text-white/75">{{ total ? (Math.min(page, totalPages) - 1) * pageSize + 1 : 0 }}–{{ Math.min(total, Math.min(page, totalPages) * pageSize) }}</span><span class="ml-1">/ {{ total }} 条</span></div>
         <div class="flex items-center gap-1">
           <template v-for="(n, i) in pageNumbers" :key="i">
             <span v-if="n === null" class="px-1 text-white/30">…</span>

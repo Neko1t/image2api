@@ -15,7 +15,7 @@ type UpstreamAdapter interface {
 
 // ImageAdapter handles image generation for an upstream format.
 type ImageAdapter interface {
-	GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte) ([]byte, error)
+	GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte, downloadResult bool) ([]byte, string, error)
 }
 
 // VideoAdapter handles video generation for an upstream format.

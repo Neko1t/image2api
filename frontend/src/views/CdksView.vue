@@ -14,18 +14,18 @@ const loading = ref(false)
 const statusFilter = ref('')   // '' | 'active'(未使用) | 'used'(已使用)
 const typeFilter = ref('')     // '' | 'normal' | 'marketing'
 const search = ref('')
-function setFilter(fn) { fn(); page.value = 1 }
-watch(search, () => { page.value = 1 })
-const filtered = computed(() => {
-  let list = items.value
-  if (statusFilter.value === 'active') list = list.filter((c) => c.status === 'active')
-  else if (statusFilter.value === 'used') list = list.filter((c) => c.status !== 'active')
-  if (typeFilter.value === 'marketing') list = list.filter((c) => c.type === 'marketing')
-  else if (typeFilter.value === 'normal') list = list.filter((c) => c.type !== 'marketing')
-  const q = search.value.trim().toUpperCase()
-  if (q) list = list.filter((c) => (c.code || '').toUpperCase().includes(q))
-  return list
+function setFilter(fn) { fn(); resetAndLoad() }
+function resetAndLoad() {
+  if (page.value !== 1) page.value = 1
+  else load()
+}
+let searchTimer = null
+watch(search, () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => { resetAndLoad() }, 300)
 })
+// Server-side pagination: items IS the current page (筛选/搜索均在后端)。
+const filtered = computed(() => items.value)
 
 const form = ref({ amount: 5000, count: 10, type: 'normal' })
 const lastBatch = ref([])      // codes from the most recent generate
@@ -35,14 +35,27 @@ function flash(m) { flashMsg.value = m; clearTimeout(flashTimer); flashTimer = s
 
 const page = ref(1)
 const pageSize = ref(20)
+const total = ref(0)
 
 async function load() {
   loading.value = true
-  const r = await api('/cdks')
+  const qs = new URLSearchParams({
+    limit: String(pageSize.value),
+    offset: String((page.value - 1) * pageSize.value),
+  })
+  if (statusFilter.value) qs.set('status', statusFilter.value)
+  if (typeFilter.value) qs.set('type', typeFilter.value)
+  if (search.value.trim()) qs.set('q', search.value.trim())
+  const r = await api('/cdks?' + qs.toString())
   loading.value = false
-  if (r.ok) { items.value = r.data?.data || []; stats.value = r.data?.stats || stats.value }
+  if (r.ok) {
+    items.value = r.data?.data || []
+    total.value = Number(r.data?.total ?? items.value.length)
+    stats.value = r.data?.stats || stats.value
+  }
 }
 onMounted(load)
+watch(page, () => { load() })
 
 async function generate() {
   const amount = Number(form.value.amount), count = Number(form.value.count)
@@ -102,13 +115,8 @@ async function copy(text) {
 }
 function copyBatch() { copy(lastBatch.value.join('\n')) }
 
-// Client-side pagination over the full list (CDK volumes are bounded by
-// how many the admin generates — comfortably small).
-const totalPages = computed(() => Math.max(1, Math.ceil(filtered.value.length / pageSize.value)))
-const pagedItems = computed(() => {
-  const start = (page.value - 1) * pageSize.value
-  return filtered.value.slice(start, start + pageSize.value)
-})
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+const pagedItems = computed(() => items.value)
 function goPage(n) {
   const target = Math.max(1, Math.min(totalPages.value, n))
   if (target !== page.value) page.value = target
@@ -220,8 +228,8 @@ const pageNumbers = computed(() => {
     <!-- table -->
     <div class="card overflow-hidden">
       <div v-if="loading && !items.length" class="text-center text-sm text-white/40 py-16">加载中…</div>
-      <div v-else-if="!items.length" class="text-center text-sm text-white/40 py-16">还没有兑换码</div>
-      <div v-else-if="!filtered.length" class="text-center text-sm text-white/40 py-16">没有匹配的兑换码</div>
+      <div v-else-if="!items.length && !stats.total" class="text-center text-sm text-white/40 py-16">还没有兑换码</div>
+      <div v-else-if="!items.length" class="text-center text-sm text-white/40 py-16">没有匹配的兑换码</div>
       <table v-else class="w-full text-sm">
         <colgroup>
           <col class="w-9" />
@@ -291,8 +299,8 @@ const pageNumbers = computed(() => {
       <div v-if="!loading && totalPages > 1"
            class="flex items-center justify-between gap-3 border-t border-white/[0.06] px-5 py-3 text-xs text-white/55">
         <div>
-          <span class="tabular-nums text-white/85">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(items.length, page * pageSize) }}</span>
-          <span class="ml-1">/ {{ items.length }} 条</span>
+          <span class="tabular-nums text-white/85">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(total, page * pageSize) }}</span>
+          <span class="ml-1">/ {{ total }} 条</span>
         </div>
         <div class="flex items-center gap-1">
           <template v-for="(n, i) in pageNumbers" :key="i">

@@ -68,8 +68,12 @@ func (c *Client) SetProxy(proxy string) {
 	c.proxy = strings.TrimSpace(proxy)
 }
 
-func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte) ([]byte, map[string]any, error) {
-	session, err := c.newSession(accessToken)
+func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
+	// Everything except the generation submit egresses on the local IP. Only
+	// startImageGeneration (the /backend-api/f/conversation POST) goes through
+	// the proxy; the bootstrap / chat-requirements / reference upload / prepare
+	// handshake and the poll / resolve / download run direct.
+	session, err := c.newDirectSession(accessToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -100,7 +104,12 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if err != nil {
 		return nil, nil, err
 	}
-	conversationID, fileIDs, sedimentIDs, err := c.startImageGeneration(ctx, session, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs)
+	// The generation submit is the only request that egresses via the proxy.
+	submitSession, err := c.newSession(accessToken)
+	if err != nil {
+		return nil, nil, err
+	}
+	conversationID, fileIDs, sedimentIDs, err := c.startImageGeneration(ctx, submitSession, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -110,12 +119,6 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	refIDs := uploadedRefIDSet(uploadedRefs)
 	fileIDs = dropIDs(fileIDs, refIDs)
 	sedimentIDs = dropIDs(sedimentIDs, refIDs)
-	// Poll / resolve / download run on the local IP (fresh direct session);
-	// only the submit phase above egressed via the proxy.
-	session, err = c.newDirectSession(accessToken)
-	if err != nil {
-		return nil, nil, err
-	}
 	fileIDs, sedimentIDs, err = c.pollForImage(ctx, session, accessToken, conversationID, fileIDs, sedimentIDs, refIDs, pollBudget(ctx))
 	if err != nil {
 		return nil, nil, err
@@ -127,6 +130,17 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if len(urls) == 0 {
 		return nil, nil, errors.New("no image urls resolved")
 	}
+	meta := map[string]any{
+		"provider":        "chatgpt",
+		"model":           model,
+		"conversation_id": conversationID,
+		"image_url":       urls[0], // auth-gated (files.oaiusercontent.com) — needs the account token to fetch
+	}
+	// downloadResult=false: skip the (auth-gated) download and return just the URL;
+	// the caller proxies it via OpenAsset with the account token.
+	if !downloadResult {
+		return nil, meta, nil
+	}
 	images, err := c.downloadBytes(ctx, session, accessToken, urls)
 	if err != nil {
 		return nil, nil, err
@@ -134,11 +148,36 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if len(images) == 0 {
 		return nil, nil, errors.New("download produced no bytes")
 	}
-	return images[0], map[string]any{
-		"provider":        "chatgpt",
-		"model":           model,
-		"conversation_id": conversationID,
-	}, nil
+	return images[0], meta, nil
+}
+
+// OpenAsset streams an auth-gated ChatGPT image URL (files.oaiusercontent.com)
+// using the generating account's token — a plain GET 403s. Mirrors downloadBytes
+// but returns a live stream instead of buffering.
+func (c *Client) OpenAsset(ctx context.Context, accessToken, rawURL string) (io.ReadCloser, string, error) {
+	session, err := c.newDirectSession(accessToken)
+	if err != nil {
+		return nil, "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header = c.baseHeaders(accessToken)
+	req.Header.Set("accept", "*/*")
+	resp, err := session.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("%w: chatgpt asset status %d", ErrTemporaryUpstream, resp.StatusCode)
+	}
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct == "" {
+		ct = "image/png"
+	}
+	return resp.Body, ct, nil
 }
 
 func ExtractAccountInfo(token string) map[string]any {
@@ -224,9 +263,9 @@ func (c *Client) newSession(accessToken string) (tlsclient.HttpClient, error) {
 	return c.newSessionP(accessToken, true)
 }
 
-// newDirectSession egresses on the local IP (never the proxy). Used for the
-// poll / resolve / download phase; only the anti-bot-guarded submit phase
-// (bootstrap, chat-requirements, upload, conversation create) uses the proxy.
+// newDirectSession egresses on the local IP (never the proxy). Used for
+// everything except the generation submit (the /backend-api/f/conversation
+// POST), which is the only request that uses the proxy.
 func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, error) {
 	return c.newSessionP(accessToken, false)
 }

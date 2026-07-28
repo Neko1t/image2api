@@ -24,8 +24,22 @@ func (h *BannedWordsHandler) List(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load banned words"})
 		return
 	}
-	out := make([]gin.H, 0, len(items))
-	for _, w := range items {
+	// Server-side 搜索(违禁词) + pagination.
+	q := strings.ToLower(strings.TrimSpace(c.Query("q")))
+	if q != "" {
+		kept := items[:0]
+		for _, w := range items {
+			if strings.Contains(strings.ToLower(w.Word), q) {
+				kept = append(kept, w)
+			}
+		}
+		items = kept
+	}
+	total := len(items)
+	limit, offset := pageParams(c, 20)
+	page := pageSlice(items, limit, offset)
+	out := make([]gin.H, 0, len(page))
+	for _, w := range page {
 		out = append(out, gin.H{
 			"id":         w.ID,
 			"word":       w.Word,
@@ -33,7 +47,7 @@ func (h *BannedWordsHandler) List(c *gin.Context) {
 			"created_at": w.CreatedAt,
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"data": out})
+	c.JSON(http.StatusOK, gin.H{"data": out, "total": total, "limit": limit, "offset": offset})
 }
 
 func (h *BannedWordsHandler) Create(c *gin.Context) {

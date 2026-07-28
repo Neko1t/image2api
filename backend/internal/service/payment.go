@@ -255,7 +255,7 @@ func (s *PaymentService) ListByUser(ctx context.Context, userID, status, query s
 
 // ListAll — admin order list. A search query also matches 用户名/邮箱: resolve
 // the term to user ids first so "张三" finds that user's orders.
-func (s *PaymentService) ListAll(ctx context.Context, status, query string, limit, offset int) ([]model.Order, int64, error) {
+func (s *PaymentService) ListAll(ctx context.Context, status, source, query string, limit, offset int) ([]model.Order, int64, error) {
 	var userIDs []string
 	if term := strings.ToLower(strings.TrimSpace(query)); term != "" {
 		if users, err := s.users.List(ctx); err == nil {
@@ -268,7 +268,36 @@ func (s *PaymentService) ListAll(ctx context.Context, status, query string, limi
 			}
 		}
 	}
-	return s.orders.List(ctx, status, query, userIDs, limit, offset)
+	return s.orders.List(ctx, status, source, query, userIDs, limit, offset)
+}
+
+// RecordCreditOrder persists a synthetic already-paid order for a credit grant
+// that didn't go through epay — admin manual adjustments (source="admin") and
+// CDK redemptions (source="cdk") — so 订单管理 lists them alongside recharges.
+// Best-effort: a failed insert must never fail the credit operation itself.
+func RecordCreditOrder(ctx context.Context, orders *repo.OrderRepository, userID string, points float64, source, remark string) {
+	if orders == nil {
+		return
+	}
+	prefix := "X"
+	switch source {
+	case "admin":
+		prefix = "M"
+	case "cdk":
+		prefix = "C"
+	}
+	now := time.Now()
+	_ = orders.Create(ctx, &model.Order{
+		ID:        prefix + strconv.FormatInt(now.Unix(), 10) + randomUpper(6),
+		UserID:    userID,
+		Points:    int(math.Round(points)),
+		PayType:   source,
+		Status:    "paid",
+		Source:    source,
+		Remark:    remark,
+		ExpiresAt: now,
+		PaidAt:    &now,
+	})
 }
 
 // UserNames maps user id → display name (name, else email, else id) so the admin

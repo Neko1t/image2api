@@ -68,9 +68,10 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	// Self-heal the x-statsig-id anti-bot challenge for THIS session before the
 	// gated submit. Without it the header falls back to the static defaults,
 	// which go stale on a new grok web build and make conversations/new answer
-	// 403 (anti-bot). Fetch via the proxy client so the derived seed matches the
-	// submit's egress IP. Failure is non-fatal (statsigID then uses defaults).
-	c.ensureChallenge(ctx, submitClient, token)
+	// 403 (anti-bot). Fetch on the local IP (the proxy is rotating, so pinning
+	// the seed to a proxy egress IP is pointless). Failure is non-fatal
+	// (statsigID then uses defaults).
+	c.ensureChallenge(ctx, directClient, token)
 
 	// Image-to-video: upload each reference frame and collect its asset URL.
 	var imageRefs []string
@@ -85,89 +86,82 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		imageRefs = append(imageRefs, url)
 	}
 
-	// grok occasionally accepts the conversation (HTTP 200) but closes the stream
-	// after only the conversation object — no progress events, no videoUrl. This
-	// is transient and surfaces as ErrTemporaryUpstream so the caller fails over
-	// to the NEXT account (换号重试) instead of retrying this one.
-	const maxAttempts = 1
-	var (
-		postID   string
-		artifact string
-		lastBody string
-		lastErr  error
-	)
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-		pid, cpErr := c.createPost(ctx, submitClient, token, prompt)
-		if cpErr != nil {
-			lastErr = cpErr
-			continue
-		}
-		postID = pid
+	// grok streams progress inline, but the stream is fragile: it regularly dies
+	// mid-body ("unexpected EOF") after only the conversation object / an early
+	// progress event — while grok keeps rendering the clip server-side. The
+	// rendered clip always lands at the deterministic URL
+	// assets.grok.com/users/{userId}/generated/{postId}/generated_video.mp4, so a
+	// dead stream is NOT a failed generation: poll that URL until the clip is
+	// ready instead of failing the job (which would also fail over and burn
+	// another account's credits for a video that already exists).
+	postID, userID, err := c.createPost(ctx, submitClient, token, prompt)
+	if err != nil {
+		return nil, nil, err
+	}
 
-		videoCfg := map[string]any{
-			"parentPostId":       postID,
-			"aspectRatio":        aspectRatio,
-			"videoLength":        seconds,
-			"resolutionName":     resolution,
-			"isReferenceToVideo": len(imageRefs) > 0,
-		}
-		if len(imageRefs) > 0 {
-			videoCfg["imageReferences"] = imageRefs
-		}
-		payload := map[string]any{
-			"temporary":        true,
-			"modelName":        "imagine-video-gen",
-			"message":          prompt + " --mode=custom",
-			"enableSideBySide": true,
-			"responseMetadata": map[string]any{
-				"modelConfigOverride": map[string]any{
-					"modelMap": map[string]any{"videoGenModelConfig": videoCfg},
-				},
+	videoCfg := map[string]any{
+		"parentPostId":       postID,
+		"aspectRatio":        aspectRatio,
+		"videoLength":        seconds,
+		"resolutionName":     resolution,
+		"isReferenceToVideo": len(imageRefs) > 0,
+	}
+	if len(imageRefs) > 0 {
+		videoCfg["imageReferences"] = imageRefs
+	}
+	payload := map[string]any{
+		"temporary":        true,
+		"modelName":        "imagine-video-gen",
+		"message":          prompt + " --mode=custom",
+		"enableSideBySide": true,
+		"responseMetadata": map[string]any{
+			"modelConfigOverride": map[string]any{
+				"modelMap": map[string]any{"videoGenModelConfig": videoCfg},
 			},
-		}
+		},
+	}
 
-		body, psErr := c.postStream(ctx, submitClient, token, "/rest/app-chat/conversations/new", payload)
-		if psErr != nil {
-			// Transient HTTP/2 stream resets etc. — retry.
-			lastErr = psErr
-			continue
+	// body may be partial when psErr != nil — still worth scanning.
+	body, psErr := c.postStream(ctx, submitClient, token, "/rest/app-chat/conversations/new", payload)
+	if dir := strings.TrimSpace(os.Getenv("GROK_DUMP")); dir != "" {
+		_ = os.WriteFile(dir+"/grok_body_"+postID+".txt", []byte(body), 0o644)
+	}
+	// Out-of-credits surfaces as a stream error (HTTP is still 200) — not retryable.
+	if strings.Contains(body, "usagePoolExhausted") || strings.Contains(body, "media generation credits") {
+		return nil, nil, fmt.Errorf("%w: media generation credits exhausted", ErrQuotaExhausted)
+	}
+	if psErr != nil && (errors.Is(psErr, ErrAuth) || errors.Is(psErr, ErrQuotaExhausted)) {
+		return nil, nil, psErr
+	}
+	// A fatal stream error means grok definitively rejected this generation
+	// (content moderation, an unsupported parameter, etc.). Retrying — on this
+	// or any other account — fails identically and only burns the pool, so fail
+	// fast with a non-temporary error the pool won't fail over on.
+	if strings.Contains(body, "STREAM_ERROR_SEVERITY_FATAL") {
+		return nil, nil, fmt.Errorf("grok: video generation rejected by upstream (fatal stream error): %s", clip([]byte(body), 200))
+	}
+	// Fast path: the artifact appears as "videoUrl":"users/.../generated_video.mp4".
+	artifact := ""
+	for _, m := range videoURLRe.FindAllStringSubmatch(body, -1) {
+		if v := strings.TrimSpace(m[1]); v != "" {
+			artifact = v // keep the last (progress=100) one
 		}
-		if dir := strings.TrimSpace(os.Getenv("GROK_DUMP")); dir != "" {
-			_ = os.WriteFile(dir+"/grok_body_"+postID+".txt", []byte(body), 0o644)
+	}
+	if artifact == "" && userID != "" {
+		// Stream ended without the artifact (dropped connection or early close):
+		// the render continues upstream — wait for the deterministic asset URL.
+		url := fmt.Sprintf("%susers/%s/generated/%s/generated_video.mp4", assetBase, userID, postID)
+		if werr := c.waitForAsset(ctx, directClient, token, url); werr == nil {
+			artifact = url
+		} else if errors.Is(werr, ErrAuth) || errors.Is(werr, context.Canceled) || errors.Is(werr, context.DeadlineExceeded) {
+			return nil, nil, werr
 		}
-		// Out-of-credits surfaces as a stream error (HTTP is still 200) — not retryable.
-		if strings.Contains(body, "usagePoolExhausted") || strings.Contains(body, "media generation credits") {
-			return nil, nil, fmt.Errorf("%w: media generation credits exhausted", ErrQuotaExhausted)
-		}
-		// The artifact path appears as "videoUrl":"users/.../generated_video.mp4".
-		lastBody = body
-		artifact = ""
-		for _, m := range videoURLRe.FindAllStringSubmatch(body, -1) {
-			if v := strings.TrimSpace(m[1]); v != "" {
-				artifact = v // keep the last (progress=100) one
-			}
-		}
-		if artifact != "" {
-			break
-		}
-		// A fatal stream error means grok definitively rejected this generation
-		// (content moderation, an unsupported parameter, etc.). Retrying — on this
-		// or any other account — fails identically and only burns the pool, so fail
-		// fast with a non-temporary error the pool won't fail over on.
-		if strings.Contains(body, "STREAM_ERROR_SEVERITY_FATAL") {
-			return nil, nil, fmt.Errorf("grok: video generation rejected by upstream (fatal stream error): %s", clip([]byte(body), 200))
-		}
-		// No artifact and no fatal error: grok closed the stream early. Retry.
-		lastErr = nil
 	}
 	if artifact == "" {
-		if lastErr != nil {
-			return nil, nil, lastErr
+		if psErr != nil {
+			return nil, nil, psErr
 		}
-		return nil, nil, fmt.Errorf("%w: no video artifact in response: %s", ErrTemporaryUpstream, clip([]byte(lastBody), 200))
+		return nil, nil, fmt.Errorf("%w: no video artifact in response: %s", ErrTemporaryUpstream, clip([]byte(body), 200))
 	}
 	fullURL := artifact
 	if !strings.HasPrefix(fullURL, "http") {
@@ -274,20 +268,65 @@ func (c *Client) uploadFileV2(ctx context.Context, client tlsclient.HttpClient, 
 }
 
 // createPost registers a video media post and returns its id (parentPostId).
-func (c *Client) createPost(ctx context.Context, client tlsclient.HttpClient, token, prompt string) (string, error) {
+// createPost creates the parent media post. grok uses its id as the videoId,
+// and the rendered clip is stored under users/{userId}/generated/{postId}/.
+func (c *Client) createPost(ctx context.Context, client tlsclient.HttpClient, token, prompt string) (postID, userID string, err error) {
 	res, err := c.postJSON(ctx, client, token, "/rest/media/post/create", map[string]any{
 		"mediaType": "MEDIA_POST_TYPE_VIDEO",
 		"prompt":    prompt,
 	})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	post, _ := res["post"].(map[string]any)
-	id := strings.TrimSpace(stringValue(post["id"]))
-	if id == "" {
-		return "", fmt.Errorf("%w: media post missing id", ErrTemporaryUpstream)
+	postID = strings.TrimSpace(stringValue(post["id"]))
+	userID = strings.TrimSpace(stringValue(post["userId"]))
+	if postID == "" {
+		return "", "", fmt.Errorf("%w: media post missing id", ErrTemporaryUpstream)
 	}
-	return id, nil
+	return postID, userID, nil
+}
+
+// waitForAsset polls a generated-asset URL (ranged GET on the local IP —
+// assets.grok.com is not anti-bot gated) until grok finishes rendering it.
+// 404 means "still rendering"; auth failures abort.
+func (c *Client) waitForAsset(ctx context.Context, client tlsclient.HttpClient, token, url string) error {
+	deadline := time.Now().Add(6 * time.Minute)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		req = req.WithContext(ctx)
+		req.Header = http.Header{
+			"user-agent": {userAgent},
+			"referer":    {origin + "/"},
+			"cookie":     {"sso=" + token + "; sso-rw=" + token},
+			"range":      {"bytes=0-0"},
+		}
+		if resp, derr := client.Do(req); derr == nil {
+			code := resp.StatusCode
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			switch {
+			case code == http.StatusOK || code == http.StatusPartialContent:
+				return nil
+			case code == http.StatusUnauthorized || code == http.StatusForbidden:
+				return fmt.Errorf("%w: asset %d", ErrAuth, code)
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: video render did not complete in time", ErrTemporaryUpstream)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(4 * time.Second):
+		}
+	}
 }
 
 // postJSON does an authed JSON POST and parses a single JSON object response.
@@ -313,10 +352,10 @@ func (c *Client) postJSON(ctx context.Context, client tlsclient.HttpClient, toke
 func (c *Client) postStream(ctx context.Context, client tlsclient.HttpClient, token, path string, body any) (string, error) {
 	raw, status, err := c.doPost(ctx, client, token, path, body)
 	if err != nil {
-		return "", err
+		return string(raw), err
 	}
 	if e := mapStatus(path, status, raw); e != nil {
-		return "", e
+		return string(raw), e
 	}
 	return string(raw), nil
 }
@@ -340,9 +379,9 @@ func (c *Client) doPost(ctx context.Context, client tlsclient.HttpClient, token,
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		// Mid-body HTTP/2 stream resets ("stream error: ... INTERNAL_ERROR") are
-		// transient — surface them as retryable.
-		return nil, resp.StatusCode, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+		// Mid-body stream drops ("unexpected EOF", HTTP/2 resets) are common on
+		// long renders — return what was received so callers can still use it.
+		return raw, resp.StatusCode, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
 	return raw, resp.StatusCode, nil
 }
@@ -447,7 +486,9 @@ func mapStatus(path string, status int, raw []byte) error {
 	case status == 403 && isBotChallenge(string(raw)):
 		// grok bot-detection or a Cloudflare challenge page ("Just a moment…"),
 		// NOT a dead token — transient, so a good account isn't killed by an
-		// IP/anti-bot hiccup.
+		// IP/anti-bot hiccup. A statsig anti-bot rejection means the recipe likely
+		// went stale on a reship; kick the headless refresher to re-capture.
+		TriggerStatsigRefresh()
 		return fmt.Errorf("%w: %s 403 %s", ErrTemporaryUpstream, path, clip(raw, 160))
 	case status == 401 || status == 403:
 		return fmt.Errorf("%w: %s %d %s", ErrAuth, path, status, clip(raw, 160))

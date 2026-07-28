@@ -136,7 +136,7 @@ func (c *Client) uploadInitImage(ctx context.Context, accessToken string, img []
 // mint a JWT, (for image-to-image) upload each reference image, submit the
 // Generate mutation, poll until COMPLETE, then download the first produced image.
 // Returns the image bytes, an info map, and a classified error.
-func (c *Client) GenerateImage(ctx context.Context, cookie, model, prompt string, width, height int, styleIDs []string, refImages [][]byte) ([]byte, map[string]any, error) {
+func (c *Client) GenerateImage(ctx context.Context, cookie, model, prompt string, width, height int, styleIDs []string, refImages [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
 	sess, err := c.GetSession(ctx, cookie)
 	if err != nil {
 		return nil, nil, err
@@ -226,15 +226,18 @@ func (c *Client) GenerateImage(ctx context.Context, cookie, model, prompt string
 		return nil, nil, err
 	}
 
-	// 3. download bytes
-	data, err := c.downloadImage(ctx, imageURL)
-	if err != nil {
-		return nil, nil, err
-	}
 	info := map[string]any{
 		"generation_id": genID,
 		"image_url":     imageURL,
 		"user_id":       sess.UserID,
+	}
+	if !downloadResult {
+		return nil, info, nil
+	}
+	// 3. download bytes
+	data, err := c.downloadImage(ctx, imageURL)
+	if err != nil {
+		return nil, nil, err
 	}
 	return data, info, nil
 }

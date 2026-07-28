@@ -134,16 +134,20 @@
     createElement: function (tag) { return makeEl({ nodeName: String(tag || 'div').toUpperCase() }); },
     querySelectorAll: function (sel) {
       sel = String(sel);
-      if (/aufz1o/.test(sel)) {
-        var curves = JSON.parse(g.__CURVES);
-        return curves.map(function (grp) {
-          return groupEl(grp.map(function (cv) { return cv.color.concat([cv.deg], cv.bezier); }));
-        });
-      }
+      // The seed <meta> is selected by a name/verification attribute selector
+      // (e.g. [name^=gr] or [name*=verification]); the curve group container is
+      // selected by a per-build hashed CLASS selector (e.g. .r-aufz1o, .r-3nqkqc)
+      // which rotates on every reship — so match by shape, not literal class.
       if (/verification|name/i.test(sel)) {
         var seed = g.__SEED;
         return [{ nodeName: 'META', getAttribute: function (a) { return a === 'content' ? seed : null; },
                   get content() { return seed; } }];
+      }
+      if (/(^|\s|,)\./.test(sel)) {
+        var curves = JSON.parse(g.__CURVES);
+        return curves.map(function (grp) {
+          return groupEl(grp.map(function (cv) { return cv.color.concat([cv.deg], cv.bezier); }));
+        });
       }
       return [];
     },

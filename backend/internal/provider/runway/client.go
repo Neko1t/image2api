@@ -19,6 +19,7 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	"github.com/google/uuid"
 )
 
 const (
@@ -29,7 +30,45 @@ const (
 	// registration + generation in the reference HAR (Edge 150 on Windows).
 	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
 	secChUA   = `"Not;A=Brand";v="8", "Chromium";v="150", "Microsoft Edge";v="150"`
+
+	// sourceApp / buildHash are the x-runway-source-application[-version] the real
+	// web app stamps on EVERY authed API call (319/336 requests in the reference
+	// HAR). buildHash is the web bundle's git sha; it also appears as the
+	// `sentry-release` segment of the baggage header. Runway anti-abuse keys on
+	// these being present + client-id (see clientIDFromToken): a write/upload that
+	// lacks them is judged a non-web client and the account's free credits are
+	// zeroed on the FIRST upload ("上传清零积分"). buildHash tracks Runway's web
+	// releases — refresh it from a current HAR if uploads start getting flagged.
+	sourceApp = "web"
+	buildHash = "3e96b2f0f85b8c0cafb7c0dcd7a6878305aaa0f0"
 )
+
+// clientIDOverride, when non-empty, forces the x-runway-client-id (used to pin an
+// account to the exact persistent device id its real browser session used).
+var clientIDOverride string
+
+// clientIDUUIDNamespace is a fixed namespace so clientIDFromToken is stable
+// across processes/restarts — the same account always derives the same
+// x-runway-client-id, exactly like the browser's localStorage-persisted id.
+var clientIDUUIDNamespace = uuid.MustParse("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+
+// clientIDFromToken derives the persistent per-account x-runway-client-id. The
+// real SPA generates this UUID once and stores it in localStorage; every request
+// from that browser reuses the SAME value (5b89c786-… appears on all 319 authed
+// calls in the HAR). We reproduce that stability by deterministically deriving a
+// v5 UUID from the account's JWT "id" claim, so one account == one client-id for
+// its whole lifetime without needing a DB column. Falls back to the raw token if
+// the id claim is missing.
+func clientIDFromToken(token string) string {
+	if clientIDOverride != "" {
+		return clientIDOverride
+	}
+	seed := TeamIDFromToken(token)
+	if seed == "" {
+		seed = strings.TrimPrefix(token, "Bearer ")
+	}
+	return uuid.NewSHA1(clientIDUUIDNamespace, []byte("runway-client-id:"+seed)).String()
+}
 
 // randHex returns n random bytes hex-encoded (2n chars), for sentry trace ids.
 func randHex(n int) string {
@@ -49,29 +88,37 @@ func browserHeaders(token, teamID string) http.Header {
 	traceID := randHex(16)
 	spanID := randHex(8)
 	h := http.Header{
-		"accept":             {"application/json"},
-		"accept-language":    {"zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"},
-		"authorization":      {"Bearer " + strings.TrimPrefix(token, "Bearer ")},
-		"baggage":            {"sentry-environment=production,sentry-public_key=8ea832c064ed4bbcb4b8952c02ba119a,sentry-trace_id=" + traceID},
-		"content-type":       {"application/json"},
-		"origin":             {origin},
-		"priority":           {"u=1, i"},
-		"referer":            {origin + "/"},
-		"sec-ch-ua":          {secChUA},
-		"sec-ch-ua-mobile":   {"?0"},
-		"sec-ch-ua-platform": {`"Windows"`},
-		"sec-fetch-dest":     {"empty"},
-		"sec-fetch-mode":     {"cors"},
-		"sec-fetch-site":     {"same-site"},
-		"sentry-trace":       {traceID + "-" + spanID},
-		"user-agent":         {userAgent},
-		"x-runway-workspace": {teamID},
+		"accept":                              {"application/json"},
+		"accept-language":                     {"zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"},
+		"authorization":                       {"Bearer " + strings.TrimPrefix(token, "Bearer ")},
+		"baggage":                             {"sentry-environment=production,sentry-release=" + buildHash + ",sentry-public_key=8ea832c064ed4bbcb4b8952c02ba119a,sentry-trace_id=" + traceID},
+		"content-type":                        {"application/json"},
+		"origin":                              {origin},
+		"priority":                            {"u=1, i"},
+		"referer":                             {origin + "/"},
+		"sec-ch-ua":                           {secChUA},
+		"sec-ch-ua-mobile":                    {"?0"},
+		"sec-ch-ua-platform":                  {`"Windows"`},
+		"sec-fetch-dest":                      {"empty"},
+		"sec-fetch-mode":                      {"cors"},
+		"sec-fetch-site":                      {"same-site"},
+		"sentry-trace":                        {traceID + "-" + spanID},
+		"user-agent":                          {userAgent},
+		// x-runway-* identify this as the real web app to Runway's anti-abuse.
+		// client-id must be persistent per account (see clientIDFromToken);
+		// omitting these is what zeroes an account's credits on first upload.
+		"x-runway-client-id":                  {clientIDFromToken(token)},
+		"x-runway-source-application":         {sourceApp},
+		"x-runway-source-application-version": {buildHash},
+		"x-runway-workspace":                  {teamID},
 		http.HeaderOrderKey: {
 			"accept", "accept-language", "authorization", "baggage",
 			"content-type", "origin", "priority", "referer",
 			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
 			"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-			"sentry-trace", "user-agent", "x-runway-workspace",
+			"sentry-trace", "user-agent",
+			"x-runway-client-id", "x-runway-source-application",
+			"x-runway-source-application-version", "x-runway-workspace",
 		},
 	}
 	if strings.TrimSpace(teamID) == "" {

@@ -29,9 +29,10 @@ type AdminWriteService struct {
 	events   *repo.EventRepository
 	apiKeys  *repo.APIKeyRepository
 	tokens   *repo.TokenRepository
+	orders   *repo.OrderRepository
 }
 
-func NewAdminWriteService(users *repo.UserRepository, showcase *repo.ShowcaseRepository, models *repo.ModelRepository, events *repo.EventRepository, apiKeys *repo.APIKeyRepository, tokens *repo.TokenRepository) *AdminWriteService {
+func NewAdminWriteService(users *repo.UserRepository, showcase *repo.ShowcaseRepository, models *repo.ModelRepository, events *repo.EventRepository, apiKeys *repo.APIKeyRepository, tokens *repo.TokenRepository, orders *repo.OrderRepository) *AdminWriteService {
 	return &AdminWriteService{
 		users:    users,
 		showcase: showcase,
@@ -39,6 +40,7 @@ func NewAdminWriteService(users *repo.UserRepository, showcase *repo.ShowcaseRep
 		events:   events,
 		apiKeys:  apiKeys,
 		tokens:   tokens,
+		orders:   orders,
 	}
 }
 
@@ -224,6 +226,9 @@ func (s *AdminWriteService) AdjustUserCredits(ctx context.Context, userID string
 		}
 		return nil, err
 	}
+	if delta != 0 {
+		RecordCreditOrder(ctx, s.orders, userID, delta, "admin", "管理员调整余额")
+	}
 	return user, nil
 }
 
@@ -234,12 +239,22 @@ func (s *AdminWriteService) SetUserCredits(ctx context.Context, userID string, v
 	if value < 0 {
 		value = 0
 	}
+	before, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
 	user, err := s.users.SetCredits(ctx, userID, value)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrNotFound
 		}
 		return nil, err
+	}
+	if delta := user.Credits - before.Credits; delta != 0 {
+		RecordCreditOrder(ctx, s.orders, userID, delta, "admin", "管理员设置余额")
 	}
 	return user, nil
 }

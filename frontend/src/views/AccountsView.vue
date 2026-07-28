@@ -56,31 +56,26 @@ const search = ref('')
 
 const page = ref(1)
 const pageSize = ref(20)
-// Typing a search term must jump back to page 1 — otherwise a narrowed result
-// set can leave you stranded on a now-empty page.
-watch(search, () => { page.value = 1 })
+const total = ref(0)
+// Typing a search term must jump back to page 1 and re-query the server —
+// search is cross-page now (server-side).
+let searchTimer = null
+watch(search, () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => { resetAndLoad() }, 300)
+})
 
-// 每个类型的 成功/失败/限额 三个数(成功=正常可用, 失败=失效/禁用, 限额=额度耗尽)。
-const stats = computed(() => {
-  const by = (t) => {
-    const s = rows.value.filter((r) => r.type === t)
-    return {
-      n: s.length,
-      ok: s.filter((r) => r.status === 'active').length,
-      dead: s.filter((r) => r.dead || r.status === 'disabled').length,
-      quota: s.filter((r) => r.status === 'quota').length,
-    }
-  }
-  return {
-    total: rows.value.length,
-    openai: by('openai'), adobe: by('adobe'), runway: by('runway'),
-    leonardo: by('leonardo'), krea: by('krea'), imagine: by('imagine'),
-    grok: by('grok'),
-  }
+const EMPTY_TYPE = { n: 0, ok: 0, dead: 0, quota: 0 }
+// 每个类型的 成功/失败/限额 三个数 — 由后端对全量账号统计(与筛选/分页无关)。
+const stats = ref({
+  total: 0, dead_total: 0,
+  openai: { ...EMPTY_TYPE }, adobe: { ...EMPTY_TYPE }, runway: { ...EMPTY_TYPE },
+  leonardo: { ...EMPTY_TYPE }, krea: { ...EMPTY_TYPE }, imagine: { ...EMPTY_TYPE },
+  grok: { ...EMPTY_TYPE },
 })
 
 // 异常账号 = 已失效(401)被锁定的号(红色锁定行)。用于「一键删除异常账号」。
-const deadCount = computed(() => rows.value.filter((r) => r.dead).length)
+const deadCount = computed(() => stats.value.dead_total || 0)
 
 function typePill(t) {
   return {
@@ -94,31 +89,21 @@ function typePill(t) {
 }
 const STATUS_LABEL = { active: '正常', quota: '额度耗尽', disabled: '已禁用', pending: '检测中' }
 
-const filtered = computed(() => {
-  const q = search.value.trim().toLowerCase()
-  const sorted = [...rows.value].sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
-  return sorted.filter((a) => {
-    if (typeFilter.value && a.type !== typeFilter.value) return false
-    if (statusFilter.value && a.status !== statusFilter.value) return false
-    if (q && !(
-      (a.email || '').toLowerCase().includes(q) ||
-      (a.id || '').toLowerCase().includes(q) ||
-      (a.type || '').toLowerCase().includes(q)
-    )) return false
-    return true
-  })
-})
+// Server-side pagination: rows IS the current page, already filtered/sorted
+// by the backend. total = server-side filtered count.
+const filtered = computed(() => rows.value)
+const pagedItems = computed(() => rows.value)
 
-const totalPages = computed(() => Math.max(1, Math.ceil(filtered.value.length / pageSize.value)))
-const pagedItems = computed(() => {
-  const start = (page.value - 1) * pageSize.value
-  return filtered.value.slice(start, start + pageSize.value)
-})
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
 function goPage(n) {
   const target = Math.max(1, Math.min(totalPages.value, n))
   if (target !== page.value) page.value = target
 }
-function setFilter(fn) { fn(); page.value = 1 }
+function setFilter(fn) { fn(); resetAndLoad() }
+function resetAndLoad() {
+  if (page.value !== 1) page.value = 1  // the page watcher triggers the load
+  else loadAccounts()
+}
 const pageNumbers = computed(() => {
   const n = totalPages.value
   const cur = page.value
@@ -137,11 +122,28 @@ const pageNumbers = computed(() => {
 
 let pendingTimer = null
 
+function buildQs() {
+  const qs = new URLSearchParams({
+    limit: String(pageSize.value),
+    offset: String((page.value - 1) * pageSize.value),
+  })
+  if (typeFilter.value) qs.set('type', typeFilter.value)
+  if (statusFilter.value) qs.set('status', statusFilter.value)
+  if (search.value.trim()) qs.set('q', search.value.trim())
+  return qs.toString()
+}
+
+async function fetchAccounts() {
+  const r = await api('/accounts?' + buildQs())
+  rows.value = r.data?.data || []
+  total.value = Number(r.data?.total ?? rows.value.length)
+  if (r.data?.stats) stats.value = r.data.stats
+}
+
 async function loadAccounts() {
   loading.value = true
   quotaStatus.value = ''
-  const r = await api('/accounts')
-  rows.value = r.data?.data || []
+  await fetchAccounts()
   loading.value = false
   if (rows.value.length) reconcile()
   schedulePendingPoll()
@@ -153,8 +155,7 @@ function schedulePendingPoll() {
   if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null }
   if (!rows.value.some((r) => r.pending)) return
   pendingTimer = setTimeout(async () => {
-    const r = await api('/accounts')
-    rows.value = r.data?.data || []
+    await fetchAccounts()
     schedulePendingPoll()
   }, 2000)
 }
@@ -228,12 +229,10 @@ async function reconcile() {
   if (myToken === reconcileToken) quotaStatus.value = ''
 }
 
-// Re-check the newly visible accounts whenever the page or filters change.
-// Only the on-screen page is ever probed (see reconcile), so flipping pages is
-// what triggers checking the rest — never all rows at once.
-watch([page, typeFilter, statusFilter], () => {
-  if (rows.value.length) reconcile()
-})
+// Flipping pages re-queries the server for the new page; loadAccounts() then
+// reconciles just the freshly visible rows. Filter buttons go through
+// setFilter → resetAndLoad, so everything funnels into loadAccounts.
+watch(page, () => { loadAccounts() })
 
 // Bounded-concurrency runner: keeps at most `limit` thunks in flight at once.
 async function runWithLimit(thunks, limit) {
@@ -289,12 +288,14 @@ async function deleteAccount(pool, id) {
   loadAccounts()
 }
 
-// 一键删除全部异常(已失效/红色锁定)账号。逐个走与单删相同的 DELETE 接口。
+// 一键删除全部异常(已失效/红色锁定)账号。先向服务端要全量 dead 列表(跨页),再逐个删除。
 async function deleteDeadAccounts() {
-  const dead = rows.value.filter((r) => r.dead)
+  if (!deadCount.value) return
+  if (!confirm(`确认删除全部 ${deadCount.value} 个异常(已失效)账号?此操作不可撤销。`)) return
+  const r = await api('/accounts?dead=1&limit=0')
+  const dead = r.data?.data || []
   if (!dead.length) return
-  if (!confirm(`确认删除全部 ${dead.length} 个异常(已失效)账号?此操作不可撤销。`)) return
-  await Promise.all(dead.map((r) => api(`/tokens/${r.pool}/${r.id}`, { method: 'DELETE' })))
+  await Promise.all(dead.map((a) => api(`/tokens/${a.pool}/${a.id}`, { method: 'DELETE' })))
   loadAccounts()
 }
 
@@ -413,8 +414,8 @@ onMounted(() => { loadAccounts(); loadModelList() })
         <span class="w-14 h-14 rounded-2xl bg-white/[0.04] grid place-items-center">
           <Icon name="accounts" class="w-6 h-6" />
         </span>
-        <span class="text-sm">{{ rows.length ? '没有匹配的账号' : '还没有账号' }}</span>
-        <button v-if="!rows.length" @click="showImport = true" class="btn-soft mt-1">导入第一个</button>
+        <span class="text-sm">{{ stats.total ? '没有匹配的账号' : '还没有账号' }}</span>
+        <button v-if="!stats.total" @click="showImport = true" class="btn-soft mt-1">导入第一个</button>
       </div>
 
       <table v-else class="w-full text-sm table-fixed min-w-[1080px]">
@@ -571,8 +572,8 @@ onMounted(() => { loadAccounts(); loadModelList() })
       <div v-if="!loading && totalPages > 1"
            class="flex items-center justify-between gap-3 border-t border-white/[0.06] px-5 py-3 text-xs text-white/55">
         <div>
-          <span class="tabular-nums text-white/85">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(filtered.length, page * pageSize) }}</span>
-          <span class="ml-1">/ {{ filtered.length }} 条</span>
+          <span class="tabular-nums text-white/85">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(total, page * pageSize) }}</span>
+          <span class="ml-1">/ {{ total }} 条</span>
         </div>
         <div class="flex items-center gap-1">
           <template v-for="(n, i) in pageNumbers" :key="i">

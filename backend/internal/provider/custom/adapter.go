@@ -22,12 +22,12 @@ func NewAdapter() *Adapter {
 
 // GenerateImage implements adapter.ImageAdapter by calling the OpenAI-compatible
 // /v1/images/generations or /v1/images/edits endpoint.
-func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte) ([]byte, error) {
-	imageBytes, err := a.Client.GenerateImage(ctx, baseURL, apiKey, upstreamModel, prompt, size, quality, refs)
+func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size, quality string, refs [][]byte, downloadResult bool) ([]byte, string, error) {
+	imageBytes, contentURL, err := a.Client.GenerateImage(ctx, baseURL, apiKey, upstreamModel, prompt, size, quality, refs, downloadResult)
 	if err != nil {
-		return nil, mapAdapterError(err)
+		return nil, "", mapAdapterError(err)
 	}
-	return imageBytes, nil
+	return imageBytes, contentURL, nil
 }
 
 // GenerateVideo implements adapter.VideoAdapter by calling the OpenAI Sora-style
@@ -36,7 +36,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, baseURL, apiKey, upstreamMo
 	// Note: custom.Client.GenerateVideo expects duration in seconds as an int,
 	// which matches our interface. The size parameter is passed directly (OpenAI
 	// uses size strings like "1280x720").
-	videoBytes, contentURL, err := a.Client.GenerateVideo(ctx, baseURL, apiKey, upstreamModel, prompt, size, duration, downloadResult)
+	videoBytes, contentURL, err := a.Client.GenerateVideo(ctx, baseURL, apiKey, upstreamModel, prompt, size, duration, refs, downloadResult)
 	if err != nil {
 		return nil, "", mapAdapterError(err)
 	}

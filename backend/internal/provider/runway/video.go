@@ -17,7 +17,6 @@ import (
 
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
-	"github.com/google/uuid"
 )
 
 // ratioDimensions maps an aspect ratio to the Gen-4 Turbo native output size.
@@ -70,37 +69,47 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 		return nil, nil, errors.New("runway: failed to decode first-frame image")
 	}
 
-	// Use a single client (and therefore a single exit IP) for the whole flow.
-	// The web app runs upload, task-create, polling and download from one IP; a
-	// mid-flow IP switch (proxy for submit, local for the rest) is a strong
-	// bot/risk signal, so we route everything through the proxy-aware client.
-	apiClient, err := c.newTLSClient()
+	// Only the task-create (generate submit) egresses via the proxy; reference
+	// upload, dataset create, polling and download run on the local IP (matches
+	// the image pipeline).
+	submitClient, err := c.newTLSClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	directClient, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
 
 	filename := "frame_" + time.Now().UTC().Format("20060102_150405") + ".png"
-	previewUploadID, _, err := c.uploadFile(ctx, apiClient, token, teamID, filename, "DATASET_PREVIEW", frame)
+	previewUploadID, _, err := c.uploadFile(ctx, directClient, token, teamID, filename, "DATASET_PREVIEW", frame)
 	if err != nil {
 		return nil, nil, err
 	}
-	datasetUploadID, _, err := c.uploadFile(ctx, apiClient, token, teamID, filename, "DATASET", frame)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	assetID, imageURL, err := c.createDataset(ctx, apiClient, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
-	if err != nil {
-		return nil, nil, err
-	}
-	assetGroupID, _ := c.assetGroupID(ctx, apiClient, token, teamID) // best-effort
-
-	taskID, err := c.createTask(ctx, apiClient, token, teamID, prompt, imageURL, assetID, assetGroupID, aspectRatio, seconds)
+	datasetUploadID, _, err := c.uploadFile(ctx, directClient, token, teamID, filename, "DATASET", frame)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	artifactURL, err := c.pollTask(ctx, apiClient, token, teamID, taskID)
+	assetID, imageURL, err := c.createDataset(ctx, directClient, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Browser order: real session first, attach the first-frame asset + its own
+	// asset group, THEN submit the task into it (see createSession).
+	sessionID, err := c.createSession(ctx, submitClient, token, teamID)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.attachReference(ctx, submitClient, token, teamID, sessionID, assetID)
+	assetGroupID, _ := c.sessionAssetGroup(ctx, submitClient, token, teamID, sessionID) // best-effort
+
+	taskID, err := c.createTask(ctx, submitClient, token, teamID, prompt, imageURL, assetID, assetGroupID, sessionID, aspectRatio, seconds)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	artifactURL, err := c.pollTask(ctx, directClient, token, teamID, taskID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -113,7 +122,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 	if !downloadResult {
 		return nil, meta, nil
 	}
-	data, err := c.download(ctx, apiClient, artifactURL)
+	data, err := c.download(ctx, directClient, artifactURL)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -192,7 +201,7 @@ func (c *Client) assetGroupID(ctx context.Context, client tlsclient.HttpClient, 
 	return strings.TrimSpace(stringValue(ag["id"])), nil
 }
 
-func (c *Client) createTask(ctx context.Context, client tlsclient.HttpClient, token, teamID, prompt, imageURL, assetID, assetGroupID, aspectRatio string, seconds int) (string, error) {
+func (c *Client) createTask(ctx context.Context, client tlsclient.HttpClient, token, teamID, prompt, imageURL, assetID, assetGroupID, sessionID, aspectRatio string, seconds int) (string, error) {
 	w, h := ratioDimensions(aspectRatio)
 	opts := map[string]any{
 		"route":          "i2v",
@@ -215,7 +224,7 @@ func (c *Client) createTask(ctx context.Context, client tlsclient.HttpClient, to
 		"taskType":  "gen4_turbo",
 		"options":   opts,
 		"asTeamId":  jsonNumberOrString(teamID),
-		"sessionId": uuid.NewString(),
+		"sessionId": sessionID,
 	})
 	if err != nil {
 		return "", err
@@ -225,6 +234,8 @@ func (c *Client) createTask(ctx context.Context, client tlsclient.HttpClient, to
 	if id == "" {
 		return "", fmt.Errorf("%w: task missing id", ErrTemporaryUpstream)
 	}
+	// Post-submit: generation record + session play (session already exists).
+	c.recordGeneration(ctx, client, token, teamID, id, sessionID, prompt, opts)
 	return id, nil
 }
 
@@ -269,6 +280,98 @@ func (c *Client) pollTask(ctx context.Context, client tlsclient.HttpClient, toke
 	}
 }
 
+// estimateCost fires the /v1/billing/estimate_feature_cost_credits pre-flight the
+// web app ALWAYS does before a spend (52 times in the reference HAR, always with
+// the exact taskOptions right before /v1/tasks). It returns no reservation token,
+// so its purpose is purely to mark the spend as coming from the real UI flow;
+// submitting a task with no preceding estimate for that spec is a scripted-abuse
+// tell. Best-effort — the estimate itself costs nothing.
+func (c *Client) estimateCost(ctx context.Context, client tlsclient.HttpClient, token, teamID, feature string, taskOptions map[string]any) {
+	_, _ = c.apiJSON(ctx, client, token, teamID, http.MethodPost, "/v1/billing/estimate_feature_cost_credits", map[string]any{
+		"feature":     feature,
+		"count":       1,
+		"asTeamId":    jsonNumberOrString(teamID),
+		"taskOptions": taskOptions,
+	})
+}
+
+// createSession creates an EMPTY tool-mode session (POST /v1/sessions with an
+// empty taskIds array) and returns its real server-side id. This is the crux of
+// the whole flow: the browser creates the session BEFORE submitting the first
+// task, then submits the task INTO that real session. Submitting /v1/tasks with a
+// sessionId that was never created server-side is a forgery tell that makes
+// Runway revoke the account's free credits (permitted numPlanCredits 500 -> 0)
+// the instant the task lands ("提交生图就清零"). Note taskIds must be [] — passing
+// a bogus id yields "Invalid task IDs".
+func (c *Client) createSession(ctx context.Context, client tlsclient.HttpClient, token, teamID string) (string, error) {
+	res, err := c.apiJSON(ctx, client, token, teamID, http.MethodPost, "/v1/sessions", map[string]any{
+		"asTeamId": jsonNumberOrString(teamID),
+		"taskIds":  []string{},
+	})
+	if err != nil {
+		return "", err
+	}
+	sess, _ := res["session"].(map[string]any)
+	id := strings.TrimSpace(stringValue(sess["id"]))
+	if id == "" {
+		return "", fmt.Errorf("%w: session missing id", ErrTemporaryUpstream)
+	}
+	return id, nil
+}
+
+// attachReference attaches an uploaded asset to the session (the browser does
+// this before the task, so the task's reference_images belong to a real session).
+func (c *Client) attachReference(ctx context.Context, client tlsclient.HttpClient, token, teamID, sessionID, assetID string) {
+	if strings.TrimSpace(assetID) == "" {
+		return
+	}
+	_, _ = c.apiJSON(ctx, client, token, teamID, http.MethodPost,
+		"/v1/sessions/"+sessionID+"/references", map[string]any{
+			"assetId":  assetID,
+			"asTeamId": jsonNumberOrString(teamID),
+		})
+}
+
+// sessionAssetGroup creates the session's OWN asset group (POST
+// /v1/sessions/{id}/assetGroup) and returns its id — this, NOT the account-wide
+// "Generations" group, is the assetGroupId the browser puts on the task.
+func (c *Client) sessionAssetGroup(ctx context.Context, client tlsclient.HttpClient, token, teamID, sessionID string) (string, error) {
+	res, err := c.apiJSON(ctx, client, token, teamID, http.MethodPost,
+		"/v1/sessions/"+sessionID+"/assetGroup", map[string]any{"asTeamId": jsonNumberOrString(teamID)})
+	if err != nil {
+		return "", err
+	}
+	ag, _ := res["assetGroup"].(map[string]any)
+	return strings.TrimSpace(stringValue(ag["id"])), nil
+}
+
+// recordGeneration is the post-submit lifecycle the browser fires AFTER the task
+// lands: the generation record (POST /v1/generations, recordingEnabled=true) and
+// a session /play. The session itself already exists (createSession ran before
+// the task), so this no longer creates it. Best-effort.
+func (c *Client) recordGeneration(ctx context.Context, client tlsclient.HttpClient, token, teamID, taskID, sessionID, prompt string, taskOptions map[string]any) {
+	settings := map[string]any{"taskId": taskID, "recordingEnabled": true}
+	for k, v := range taskOptions {
+		if k == "exploreMode" { // not present on the browser's generation record
+			continue
+		}
+		settings[k] = v
+	}
+	// The generation record carries the model id WITHOUT the "-preview" suffix
+	// the task uses (gemini-3-pro-image-preview -> gemini-3-pro-image in the HAR).
+	if m, ok := settings["model"].(string); ok {
+		settings["model"] = strings.TrimSuffix(m, "-preview")
+	}
+	_, _ = c.apiJSON(ctx, client, token, teamID, http.MethodPost, "/v1/generations", map[string]any{
+		"toolId":   "generate",
+		"prompt":   prompt,
+		"outputs":  map[string]any{"outputUrls": []any{}},
+		"settings": settings,
+	})
+	_, _ = c.apiJSON(ctx, client, token, teamID, http.MethodPost, "/v1/sessions/"+sessionID+"/play",
+		map[string]any{"asTeamId": jsonNumberOrString(teamID), "taskId": taskID})
+}
+
 // submitTask POSTs a /v1/tasks create. Transient (network / 5xx) failures
 // surface as ErrTemporaryUpstream so the pool fails over to the NEXT account
 // (换号重试) instead of retrying this one.
@@ -290,6 +393,21 @@ func (c *Client) apiJSON(ctx context.Context, client tlsclient.HttpClient, token
 	}
 	req = req.WithContext(ctx)
 	req.Header = browserHeaders(token, teamID)
+	// The generate-submit endpoint is the ONE authed call the real web bundle
+	// sends WITHOUT x-runway-client-id / source-application[-version] — every
+	// other endpoint carries them, /v1/tasks carries only x-runway-workspace
+	// (verified across the whole reference HAR). Leaving them on /v1/tasks is a
+	// bot tell that gets the account's free credits revoked (permitted
+	// numPlanCredits 500 -> 0) the instant a task is submitted. Strip them here so
+	// the submit matches the browser exactly.
+	if method == http.MethodPost && path == "/v1/tasks" {
+		// NOTE: raw map delete, NOT req.Header.Del() — fhttp canonicalizes the key
+		// in Del() ("X-Runway-Client-Id") but our headers are stored lowercase (so
+		// they go on the h2 wire lowercase like Chrome), so Del() silently no-ops.
+		delete(req.Header, "x-runway-client-id")
+		delete(req.Header, "x-runway-source-application")
+		delete(req.Header, "x-runway-source-application-version")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)

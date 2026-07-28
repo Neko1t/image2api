@@ -28,6 +28,8 @@ func orderJSON(o *model.Order) gin.H {
 		"status":        o.Status,
 		"pay_info":      o.PayInfo,
 		"pay_info_type": o.PayInfoType,
+		"source":        o.Source,
+		"remark":        o.Remark,
 		"created_at":    o.CreatedAt.Unix(),
 		"expires_at":    o.ExpiresAt.Unix(),
 		"server_now":    time.Now().Unix(), // lets the popup count down on server time
@@ -129,7 +131,7 @@ func (h *PaymentHandler) AdminOrders(c *gin.Context) {
 	status := c.Query("status")
 	limit := parseInt(c.Query("limit"), 100)
 	offset := parseInt(c.Query("offset"), 0)
-	orders, total, err := h.pay.ListAll(c.Request.Context(), status, strings.TrimSpace(c.Query("q")), limit, offset)
+	orders, total, err := h.pay.ListAll(c.Request.Context(), status, strings.TrimSpace(c.Query("source")), strings.TrimSpace(c.Query("q")), limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load orders"})
 		return

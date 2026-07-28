@@ -56,6 +56,8 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	engine.POST("/v1/videos", handlers.V1.CreateVideo)
 	engine.GET("/v1/videos/:id", handlers.V1.GetVideo)
 	engine.GET("/v1/videos/:id/content", handlers.V1.GetVideoContent)
+	// No-store image content proxy (auth-gated upstream URLs, e.g. chatgpt).
+	engine.GET("/v1/images/:id/content", handlers.V1.GetImageContent)
 
 	publicAdmin := engine.Group("/admin/api")
 	{
@@ -157,6 +159,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 		authed.DELETE("/managed-models/:model_id", handlers.AdminWrite.DeleteModel)
 		authed.DELETE("/logs", handlers.AdminWrite.ClearLogs)
 		authed.DELETE("/logs/pending", handlers.AdminWrite.ClearPendingLogs)
+		authed.GET("/showcase/admin", handlers.Showcase.AdminList)
 		authed.POST("/showcase", handlers.AdminWrite.CreateShowcase)
 		authed.PATCH("/showcase/:entry_id", handlers.AdminWrite.UpdateShowcase)
 		authed.DELETE("/showcase/:entry_id", handlers.AdminWrite.DeleteShowcase)

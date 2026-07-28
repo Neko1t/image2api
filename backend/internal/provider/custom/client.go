@@ -8,7 +8,6 @@ package custom
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,10 +60,10 @@ func httpClient() *http.Client { return &http.Client{Timeout: 10 * time.Minute} 
 // GenerateImage calls the upstream OpenAI image API. With reference images it
 // uses /v1/images/edits (multipart); otherwise /v1/images/generations. Returns
 // the raw image bytes (decoded from b64_json, or downloaded from url).
-func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prompt, size, quality string, refs [][]byte) ([]byte, error) {
+func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prompt, size, quality string, refs [][]byte, downloadResult bool) ([]byte, string, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" || apiKey == "" {
-		return nil, ErrAuth
+		return nil, "", ErrAuth
 	}
 	var req *http.Request
 	var err error
@@ -73,24 +72,26 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 		w := multipart.NewWriter(body)
 		_ = w.WriteField("model", model)
 		_ = w.WriteField("prompt", prompt)
+		// Ask the upstream for a URL (not base64) so we can pass it through directly.
+		_ = w.WriteField("response_format", "url")
 		if size != "" {
 			_ = w.WriteField("size", size)
 		}
 		for i, r := range refs {
 			fw, e := w.CreateFormFile("image[]", fmt.Sprintf("ref_%d.png", i+1))
 			if e != nil {
-				return nil, e
+				return nil, "", e
 			}
 			_, _ = fw.Write(r)
 		}
 		_ = w.Close()
 		req, err = http.NewRequest(http.MethodPost, baseURL+"/v1/images/edits", body)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		req.Header.Set("Content-Type", w.FormDataContentType())
 	} else {
-		payload := map[string]any{"model": model, "prompt": prompt, "n": 1}
+		payload := map[string]any{"model": model, "prompt": prompt, "n": 1, "response_format": "url"}
 		if size != "" {
 			payload["size"] = size
 		}
@@ -100,7 +101,7 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 		raw, _ := json.Marshal(payload)
 		req, err = http.NewRequest(http.MethodPost, baseURL+"/v1/images/generations", bytes.NewReader(raw))
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -109,33 +110,59 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 
 	resp, err := httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
+		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if e := mapStatus(resp.StatusCode, body); e != nil {
-		return nil, e
+		return nil, "", e
 	}
-	return imageBytesFromResponse(ctx, body)
+	return imageFromResponse(ctx, body, downloadResult)
 }
 
 // GenerateVideo drives the upstream Sora-style async video API:
 // POST /v1/videos → poll GET /v1/videos/{id} → GET /v1/videos/{id}/content.
-// When downloadResult is false it returns the upstream content URL instead.
-func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prompt, size string, seconds int, downloadResult bool) ([]byte, string, error) {
+// Reference frames (image-to-video / first-last frames) are sent as multipart
+// input_reference[] files, matching the OpenAI videos API. When downloadResult
+// is false it returns the upstream content URL instead.
+func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prompt, size string, seconds int, frames [][]byte, downloadResult bool) ([]byte, string, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" || apiKey == "" {
 		return nil, "", ErrAuth
 	}
-	payload := map[string]any{"model": model, "prompt": prompt}
-	if size != "" {
-		payload["size"] = size
+	var created map[string]any
+	var err error
+	if len(frames) > 0 {
+		body := &bytes.Buffer{}
+		w := multipart.NewWriter(body)
+		_ = w.WriteField("model", model)
+		_ = w.WriteField("prompt", prompt)
+		if size != "" {
+			_ = w.WriteField("size", size)
+		}
+		if seconds > 0 {
+			_ = w.WriteField("seconds", fmt.Sprintf("%d", seconds))
+		}
+		for i, f := range frames {
+			fw, e := w.CreateFormFile("input_reference[]", fmt.Sprintf("frame_%d.png", i+1))
+			if e != nil {
+				return nil, "", e
+			}
+			_, _ = fw.Write(f)
+		}
+		_ = w.Close()
+		created, err = c.doMultipart(ctx, baseURL+"/v1/videos", apiKey, body, w.FormDataContentType())
+	} else {
+		payload := map[string]any{"model": model, "prompt": prompt}
+		if size != "" {
+			payload["size"] = size
+		}
+		if seconds > 0 {
+			payload["seconds"] = fmt.Sprintf("%d", seconds)
+		}
+		raw, _ := json.Marshal(payload)
+		created, err = c.doJSON(ctx, http.MethodPost, baseURL+"/v1/videos", apiKey, raw)
 	}
-	if seconds > 0 {
-		payload["seconds"] = fmt.Sprintf("%d", seconds)
-	}
-	raw, _ := json.Marshal(payload)
-	created, err := c.doJSON(ctx, http.MethodPost, baseURL+"/v1/videos", apiKey, raw)
 	if err != nil {
 		return nil, "", err
 	}
@@ -215,6 +242,33 @@ func (c *Client) doJSON(ctx context.Context, method, url, apiKey string, body []
 	return out, nil
 }
 
+func (c *Client) doMultipart(ctx context.Context, url, apiKey string, body io.Reader, contentType string) (map[string]any, error) {
+	req, err := http.NewRequest(http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", contentType)
+	resp, err := httpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if e := mapStatus(resp.StatusCode, raw); e != nil {
+		return nil, e
+	}
+	var out map[string]any
+	if len(raw) == 0 {
+		return map[string]any{}, nil
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("%w: non-json: %s", ErrTemporaryUpstream, clip(raw, 120))
+	}
+	return out, nil
+}
+
 func (c *Client) download(ctx context.Context, url, apiKey string) ([]byte, error) {
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req = req.WithContext(ctx)
@@ -239,34 +293,34 @@ func (c *Client) download(ctx context.Context, url, apiKey string) ([]byte, erro
 
 // imageBytesFromResponse extracts image bytes from an OpenAI images response:
 // data[0].b64_json (preferred) or data[0].url (downloaded).
-func imageBytesFromResponse(ctx context.Context, body []byte) ([]byte, error) {
+// imageFromResponse parses an OpenAI image response and returns the upstream URL.
+// We always request response_format=url, so the response must carry a URL — a
+// base64-only response is treated as an error (no base64 pass-through). With
+// downloadResult=false the URL is returned directly (no download).
+func imageFromResponse(ctx context.Context, body []byte, downloadResult bool) ([]byte, string, error) {
 	var out struct {
 		Data []struct {
-			B64JSON string `json:"b64_json"`
-			URL     string `json:"url"`
+			URL string `json:"url"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil || len(out.Data) == 0 {
-		return nil, fmt.Errorf("%w: bad image response: %s", ErrTemporaryUpstream, clip(body, 160))
+		return nil, "", fmt.Errorf("%w: bad image response: %s", ErrTemporaryUpstream, clip(body, 160))
 	}
-	d := out.Data[0]
-	if d.B64JSON != "" {
-		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(d.B64JSON))
-		if err != nil {
-			return nil, fmt.Errorf("%w: bad b64: %v", ErrTemporaryUpstream, err)
-		}
-		return raw, nil
+	url := strings.TrimSpace(out.Data[0].URL)
+	if url == "" {
+		return nil, "", fmt.Errorf("%w: image response had no url (upstream ignored response_format=url)", ErrTemporaryUpstream)
 	}
-	if d.URL != "" {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, d.URL, nil)
-		resp, err := httpClient().Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
-		}
-		defer resp.Body.Close()
-		return io.ReadAll(resp.Body)
+	if !downloadResult {
+		return nil, url, nil
 	}
-	return nil, fmt.Errorf("%w: image response had no b64/url", ErrTemporaryUpstream)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := httpClient().Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	return raw, url, err
 }
 
 func mapStatus(status int, body []byte) error {

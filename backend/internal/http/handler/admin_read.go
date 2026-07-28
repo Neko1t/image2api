@@ -26,14 +26,39 @@ func (h *AdminReadHandler) Users(c *gin.Context) {
 		return
 	}
 
-	out := make([]gin.H, 0, len(users))
+	// Server-side filtering (role / status / 搜索 邮箱·名称·ID) so pagination stays
+	// correct across pages. stats is computed over the full set (KPI strip).
+	role := strings.TrimSpace(c.Query("role"))
+	status := strings.TrimSpace(c.Query("status"))
+	q := strings.ToLower(strings.TrimSpace(c.Query("q")))
+	filtered := make([]model.User, 0, len(users))
 	for _, user := range users {
+		if role != "" && user.Role != role {
+			continue
+		}
+		if status != "" && user.Status != status {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(user.Email), q) &&
+			!strings.Contains(strings.ToLower(user.Name), q) &&
+			!strings.Contains(strings.ToLower(user.ID), q) {
+			continue
+		}
+		filtered = append(filtered, user)
+	}
+
+	total := len(filtered)
+	limit, offset := pageParams(c, 20)
+	page := pageSlice(filtered, limit, offset)
+
+	out := make([]gin.H, 0, len(page))
+	for _, user := range page {
 		row := userPublic(user)
 		row["generation_count"] = user.GenerationCount
 		row["banned_word_hits"] = user.BannedWordHits
 		out = append(out, row)
 	}
-	c.JSON(http.StatusOK, gin.H{"data": out, "stats": stats})
+	c.JSON(http.StatusOK, gin.H{"data": out, "total": total, "limit": limit, "offset": offset, "stats": stats})
 }
 
 func (h *AdminReadHandler) Models(c *gin.Context) {

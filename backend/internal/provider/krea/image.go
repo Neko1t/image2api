@@ -89,7 +89,7 @@ func (c *Client) uploadImage(ctx context.Context, cookie string, img []byte) (st
 // GenerateImage runs the full Krea image pipeline: ensure a project, (for i2i)
 // upload reference images, submit the job, poll until done, then resolve and
 // download the produced image. 402 INSUFFICIENT_BALANCE → ErrQuotaExhausted.
-func (c *Client) GenerateImage(ctx context.Context, cookie, prompt string, width, height int, refImages [][]byte) ([]byte, map[string]any, error) {
+func (c *Client) GenerateImage(ctx context.Context, cookie, prompt string, width, height int, refImages [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
 	// Ensure the daily free balance is granted (load /app) before generating, so a
 	// not-yet-activated account doesn't 402 INSUFFICIENT_BALANCE. Lock-guarded and
 	// once-per-daily-reset — concurrent gens wait for the first activation, already
@@ -169,11 +169,15 @@ func (c *Client) GenerateImage(ctx context.Context, cookie, prompt string, width
 	if err != nil {
 		return nil, nil, err
 	}
+	meta := map[string]any{"job_id": jobID, "image_url": imageURL, "project": projectID}
+	if !downloadResult {
+		return nil, meta, nil
+	}
 	data, err := c.download(ctx, imageURL)
 	if err != nil {
 		return nil, nil, err
 	}
-	return data, map[string]any{"job_id": jobID, "image_url": imageURL, "project": projectID}, nil
+	return data, meta, nil
 }
 
 // pollImage polls job-status until the job leaves the queue, then matches the

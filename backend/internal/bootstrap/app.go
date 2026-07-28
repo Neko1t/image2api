@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"backend/internal/adapter"
@@ -124,6 +125,9 @@ func NewApp(ctx context.Context) (*App, error) {
 	kreaClient := krea.NewClient("")
 	imagineClient := imagine.NewClient("")
 	grokClient := grok.NewClient("")
+	// Seed Grok's anti-bot recipe and refresh it only when a stale recipe causes
+	// an upstream 403.
+	startGrokStatsigRefresh(siteRepo)
 
 	// Build upstream adapter registry for user-configured formats
 	upstreamAdapters := map[string]adapter.UpstreamAdapter{
@@ -136,8 +140,8 @@ func NewApp(ctx context.Context) (*App, error) {
 	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
 	showcaseSvc := service.NewShowcaseService(showcaseRepo)
 	adminReadSvc := service.NewAdminReadService(cfg, userRepo, modelRepo, eventRepo, siteRepo, tokenRepo, cdkRepo, rustfsClient, showcaseRepo)
-	adminWriteSvc := service.NewAdminWriteService(userRepo, showcaseRepo, modelRepo, eventRepo, apiKeyRepo, tokenRepo)
-	cdkSvc := service.NewCDKService(cdkRepo, userRepo, siteRepo)
+	adminWriteSvc := service.NewAdminWriteService(userRepo, showcaseRepo, modelRepo, eventRepo, apiKeyRepo, tokenRepo, orderRepo)
+	cdkSvc := service.NewCDKService(cdkRepo, userRepo, siteRepo, orderRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	tokenSvc := service.NewTokenService(tokenRepo, refreshRepo, eventRepo, siteRepo, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient)
 	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient)
@@ -182,6 +186,33 @@ func NewApp(ctx context.Context) (*App, error) {
 		Engine:            engine,
 		maintenanceCancel: loopCancel,
 	}, nil
+}
+
+// startGrokStatsigRefresh wires grok's headless x-statsig-id refresher to the
+// site-settings store (persisted across restarts) with an app-lifetime context.
+func startGrokStatsigRefresh(siteRepo *repo.SiteSettingRepository) {
+	const kHeader, kSuffix, kTrailer = "grok.statsig.header", "grok.statsig.suffix", "grok.statsig.trailer"
+	grok.StartStatsigAutoRefresh(context.Background(), 0,
+		func(ctx context.Context) (string, string, int, bool) {
+			h, _ := siteRepo.GetValue(ctx, kHeader)
+			s, _ := siteRepo.GetValue(ctx, kSuffix)
+			tv, _ := siteRepo.GetValue(ctx, kTrailer)
+			if h == "" || s == "" {
+				return "", "", 0, false
+			}
+			t, _ := strconv.Atoi(tv)
+			return h, s, t, true
+		},
+		func(ctx context.Context, h, s string, t int) {
+			if err := siteRepo.UpsertValues(ctx, map[string]string{
+				kHeader:  h,
+				kSuffix:  s,
+				kTrailer: strconv.Itoa(t),
+			}); err != nil {
+				log.Printf("grok statsig: persist recipe failed: %v", err)
+			}
+		},
+	)
 }
 
 func (a *App) Close() error {

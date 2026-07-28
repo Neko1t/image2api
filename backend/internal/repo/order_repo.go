@@ -34,7 +34,7 @@ func (r *OrderRepository) Update(ctx context.Context, id string, patch map[strin
 func (r *OrderRepository) ListByUser(ctx context.Context, userID, status, query string, limit, offset int) ([]model.Order, int64, error) {
 	var out []model.Order
 	var total int64
-	q := r.db.WithContext(ctx).Model(&model.Order{}).Where("user_id = ?", userID)
+	q := r.db.WithContext(ctx).Model(&model.Order{}).Where("user_id = ?", userID).Where("source = ?", "epay")
 	if status != "" {
 		q = q.Where("status = ?", status)
 	}
@@ -52,15 +52,19 @@ func (r *OrderRepository) ListByUser(ctx context.Context, userID, status, query 
 	return out, total, err
 }
 
-// List returns all orders (admin) with optional status filter + pagination.
-// query — server-side search over 订单号 / 支付方式 / 金额; userIDs — additionally
-// match orders belonging to these users (resolved from a 用户名 search upstream).
-func (r *OrderRepository) List(ctx context.Context, status, query string, userIDs []string, limit, offset int) ([]model.Order, int64, error) {
+// List returns all orders (admin) with optional status/source filter +
+// pagination. query — server-side search over 订单号 / 支付方式 / 金额; userIDs —
+// additionally match orders belonging to these users (resolved from a 用户名
+// search upstream).
+func (r *OrderRepository) List(ctx context.Context, status, source, query string, userIDs []string, limit, offset int) ([]model.Order, int64, error) {
 	var out []model.Order
 	var total int64
 	q := r.db.WithContext(ctx).Model(&model.Order{})
 	if status != "" {
 		q = q.Where("status = ?", status)
+	}
+	if source != "" {
+		q = q.Where("source = ?", source)
 	}
 	if term := strings.TrimSpace(query); term != "" {
 		like := "%" + term + "%"
