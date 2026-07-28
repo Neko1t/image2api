@@ -36,6 +36,7 @@ var (
 	dataBuildPathRE      = regexp.MustCompile(`c/[^/]*/_`)
 	htmlDataBuildRE      = regexp.MustCompile(`<html[^>]*data-build="([^"]*)"`)
 	sseDebugKeyRE        = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+	sseDebugProtocolRE   = regexp.MustCompile(`^[A-Za-z0-9_.:/~-]{1,48}$`)
 
 	// asyncMarkers signal that ChatGPT accepted the prompt and switched to the
 	// async image pipeline (image is delivered later via conversation polling
@@ -80,17 +81,43 @@ type sseDebugSummary struct {
 }
 
 var sseDebugSignalKeys = map[string]struct{}{
-	"code":         {},
-	"content_type": {},
-	"end_turn":     {},
-	"event":        {},
-	"finish_type":  {},
-	"is_complete":  {},
-	"model_slug":   {},
-	"recipient":    {},
-	"role":         {},
-	"status":       {},
-	"type":         {},
+	"code":                 {},
+	"channel":              {},
+	"content_type":         {},
+	"default_model_slug":   {},
+	"end_turn":             {},
+	"error_code":           {},
+	"event":                {},
+	"finish_type":          {},
+	"is_complete":          {},
+	"kind":                 {},
+	"language":             {},
+	"marker":               {},
+	"message_type":         {},
+	"model_slug":           {},
+	"recipient":            {},
+	"response_format_name": {},
+	"role":                 {},
+	"status":               {},
+	"type":                 {},
+}
+
+// These fields are upstream-controlled protocol enums. Their short identifier
+// values are useful for identifying a newly routed tool while user-controlled
+// content fields remain length-only.
+var sseDebugProtocolEnumKeys = map[string]struct{}{
+	"channel":              {},
+	"default_model_slug":   {},
+	"error_code":           {},
+	"event":                {},
+	"kind":                 {},
+	"language":             {},
+	"marker":               {},
+	"message_type":         {},
+	"model_slug":           {},
+	"recipient":            {},
+	"response_format_name": {},
+	"type":                 {},
 }
 
 var sseDebugSafeEnums = map[string]struct{}{
@@ -182,7 +209,7 @@ func collectSSEDebugShape(value any, path string, depth int, paths, signals map[
 	}
 }
 
-func safeSSEDebugSignal(_ string, value any) (string, bool) {
+func safeSSEDebugSignal(key string, value any) (string, bool) {
 	switch item := value.(type) {
 	case bool:
 		return strconv.FormatBool(item), true
@@ -191,6 +218,9 @@ func safeSSEDebugSignal(_ string, value any) (string, bool) {
 	case string:
 		item = strings.TrimSpace(item)
 		if _, ok := sseDebugSafeEnums[item]; ok {
+			return item, true
+		}
+		if _, ok := sseDebugProtocolEnumKeys[key]; ok && sseDebugProtocolRE.MatchString(item) {
 			return item, true
 		}
 		return fmt.Sprintf("<string:length=%d>", len(item)), true

@@ -64,6 +64,27 @@ func TestSummarizeSSEChunksRedactsFreeTextSignalValues(t *testing.T) {
 	}
 }
 
+func TestSummarizeSSEChunksReportsProtocolEnums(t *testing.T) {
+	got := summarizeSSEChunks([]string{
+		`{"type":"message_stream_event","event":"delta","v":{"error_code":"tool_unavailable","message":{"recipient":"image_gen_tool","metadata":{"model_slug":"gpt-5-2"}}}}`,
+	})
+	var summary sseDebugSummary
+	if err := json.Unmarshal([]byte(got), &summary); err != nil {
+		t.Fatalf("parse summary: %v", err)
+	}
+	for _, expected := range []string{
+		"type=message_stream_event",
+		"event=delta",
+		"v.error_code=tool_unavailable",
+		"v.message.recipient=image_gen_tool",
+		"v.message.metadata.model_slug=gpt-5-2",
+	} {
+		if !sliceContainsExact(summary.Signals, expected) {
+			t.Fatalf("summary missing protocol enum %q: %s", expected, got)
+		}
+	}
+}
+
 func sliceContainsExact(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
