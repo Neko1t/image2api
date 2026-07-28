@@ -1,6 +1,6 @@
 // Package epay implements the 易支付 mapi (API 下单) interface with MD5 signing.
-// POST {api_base}/mapi → JSON {code, msg, trade_no, payurl, qrcode}.
-// Docs: 请求字段 pid/type/out_trade_no/notify_url/name/money/sign/sign_type.
+// POST {api_base}/mapi.php → JSON {code, msg, trade_no, payurl, qrcode}.
+// Docs: 请求字段 pid/type/out_trade_no/notify_url/return_url/name/money/sign/sign_type.
 package epay
 
 import (
@@ -18,7 +18,7 @@ import (
 )
 
 type Config struct {
-	APIBase string // 易支付 API 根地址,如 https://pay.v8jisu.cn/api/pay(自动拼 /mapi)
+	APIBase string // 易支付站点根地址,如 https://www.ezfpy.cn(自动拼 /mapi.php)
 	PID     string // 商户ID
 	Key     string // 商户密钥
 }
@@ -29,7 +29,7 @@ type CreateRequest struct {
 	Name       string
 	Money      string // "10.00"
 	NotifyURL  string
-	ReturnURL  string
+	ReturnURL  string // 页面跳转通知地址(必填)
 	ClientIP   string // unused by mapi; kept for caller convenience
 }
 
@@ -39,7 +39,7 @@ type CreateResult struct {
 	PayInfo string // 二维码内容 或 跳转 url
 }
 
-// mapiResp is the raw mapi response. code: 1 成功, -1 失败.
+// mapiResp is the raw mapi response. code: 1 或 200 为成功,其它为失败.
 type mapiResp struct {
 	Code    int    `json:"code"`
 	Msg     string `json:"msg"`
@@ -85,10 +85,8 @@ func (c *Config) Create(ctx context.Context, req CreateRequest) (*CreateResult, 
 		"notify_url":   req.NotifyURL,
 		"name":         req.Name,
 		"money":        req.Money,
+		"return_url":   req.ReturnURL,
 		"sign_type":    "MD5",
-	}
-	if req.ReturnURL != "" {
-		params["return_url"] = req.ReturnURL
 	}
 	params["sign"] = sign(params, c.Key)
 
@@ -96,7 +94,7 @@ func (c *Config) Create(ctx context.Context, req CreateRequest) (*CreateResult, 
 	for k, v := range params {
 		form.Set(k, v)
 	}
-	endpoint := strings.TrimRight(c.APIBase, "/") + "/mapi"
+	endpoint := strings.TrimRight(c.APIBase, "/") + "/mapi.php"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
@@ -112,7 +110,7 @@ func (c *Config) Create(ctx context.Context, req CreateRequest) (*CreateResult, 
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("epay: bad response: %s", strings.TrimSpace(string(body)))
 	}
-	if out.Code != 1 {
+	if out.Code != 1 && out.Code != 200 {
 		msg := out.Msg
 		if msg == "" {
 			msg = "下单失败"
