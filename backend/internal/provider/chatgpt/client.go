@@ -104,12 +104,24 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if err != nil {
 		return nil, nil, err
 	}
-	// The generation submit is the only request that egresses via the proxy.
-	submitSession, err := c.newSession(accessToken)
-	if err != nil {
-		return nil, nil, err
+	// The generation submit is the only request that egresses via the proxy. A
+	// bare connection error here (EOF / connection reset) is almost always the
+	// proxy hop flaking rather than the account, so retry the submit on a fresh
+	// connection a few times before surfacing it — otherwise a momentary network
+	// blip fails over accounts (burning their quota) or fails the request.
+	var conversationID string
+	var fileIDs, sedimentIDs []string
+	for attempt := 0; ; attempt++ {
+		submitSession, sErr := c.newSession(accessToken)
+		if sErr != nil {
+			return nil, nil, sErr
+		}
+		conversationID, fileIDs, sedimentIDs, err = c.startImageGeneration(ctx, submitSession, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs)
+		if err == nil || attempt >= submitConnectRetries || ctx.Err() != nil || !isConnResetErr(err) {
+			break
+		}
+		time.Sleep(submitRetryBackoff)
 	}
-	conversationID, fileIDs, sedimentIDs, err := c.startImageGeneration(ctx, submitSession, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -809,26 +821,39 @@ func (c *Client) prepareImageConversation(ctx context.Context, session tlsclient
 
 func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.HttpClient, accessToken, prompt string, reqs *chatRequirements, conduitToken, model string, refs []uploadedReference) (string, []string, []string, error) {
 	path := "/backend-api/f/conversation"
-	content := map[string]any{"content_type": "text", "parts": []string{prompt}}
+	// Match the web app: a picture_v2 prompt is sent as the "@创建图片" ecosystem
+	// mention followed by the prompt, with the mention marked via a
+	// custom_symbol_offset so the server routes the turn to image generation.
+	content := map[string]any{"content_type": "text", "parts": []string{pictureV2Command + " " + prompt}}
 	metadata := map[string]any{
-		"selected_github_repos":     []any{},
-		"selected_all_github_repos": false,
-		"system_hints":              []string{"picture_v2"},
-		"serialization_metadata":    map[string]any{"custom_symbol_offsets": []any{}},
+		"system_hints": []string{"picture_v2"},
+		"serialization_metadata": map[string]any{
+			"custom_symbol_offsets": []any{
+				map[string]any{
+					"id":         "picture_v2",
+					"symbol":     "ecosystemMention",
+					"startIndex": 0,
+					"endIndex":   pictureV2MentionEnd,
+				},
+			},
+		},
 	}
 	if len(refs) > 0 {
+		// Reference-image turns carry image parts and no leading mention, so keep
+		// the multimodal shape and drop the ecosystemMention offset.
 		content = map[string]any{
 			"content_type": "multimodal_text",
 			"parts":        buildMultimodalParts(refs, prompt),
 		}
 		metadata["attachments"] = buildAttachmentMetadata(refs)
+		metadata["serialization_metadata"] = map[string]any{"custom_symbol_offsets": []any{}}
 	}
 	payload := map[string]any{
 		"action": "next",
 		"messages": []map[string]any{{
 			"id":          newUUID(),
 			"author":      map[string]any{"role": "user"},
-			"create_time": float64(time.Now().Unix()),
+			"create_time": float64(timeMillis()) / 1000.0,
 			"content":     content,
 			"metadata":    metadata,
 		}},
@@ -842,9 +867,10 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 		"system_hints":                         []string{"picture_v2"},
 		"supports_buffering":                   true,
 		"supported_encodings":                  []string{"v1"},
-		"client_contextual_info":               map[string]any{"is_dark_mode": false, "time_since_loaded": 1200, "page_height": 1072, "page_width": 1724, "pixel_ratio": 1.2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"},
+		"client_contextual_info":               map[string]any{"is_dark_mode": false, "time_since_loaded": 1200, "page_height": 1072, "page_width": 1724, "pixel_ratio": 1.2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com", "has_web_push_capabilities": true, "web_push_notification_permission": "default"},
 		"paragen_cot_summary_display_override": "allow",
 		"force_parallel_switch":                "auto",
+		"local_function_names":                 []string{"local.continue_in_work"},
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, baseURL+path, bytes.NewReader(body))

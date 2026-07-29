@@ -24,6 +24,23 @@ const (
 	// on gpt-5-5-thinking) we must not hold the stream open for the whole ctx
 	// budget, so we break after this grace and fall through to polling.
 	sseAsyncGrace = 10 * time.Second
+
+	// pictureV2Command is the "@创建图片" ecosystem mention the ChatGPT web app
+	// prepends to an image (picture_v2) prompt; the server identifies the image
+	// command from this mention plus its custom_symbol_offset, so we send it to
+	// match the browser exactly.
+	pictureV2Command = "@创建图片"
+	// pictureV2MentionEnd is the UTF-16 length of pictureV2Command — the
+	// ecosystemMention custom_symbol_offset endIndex the web app reports.
+	pictureV2MentionEnd = 5
+
+	// submitConnectRetries / submitRetryBackoff bound how many times the image
+	// submit (the proxied /backend-api/f/conversation POST) is retried on a bare
+	// connection error (EOF / reset) before surfacing it. The proxy hop
+	// occasionally drops the connection; a fresh retry usually succeeds without
+	// failing over to another account.
+	submitConnectRetries = 2
+	submitRetryBackoff   = 500 * time.Millisecond
 )
 
 var (
@@ -189,6 +206,23 @@ func conversationEndedWithoutImage(conversation map[string]any) bool {
 		var sb strings.Builder
 		collectText(message["content"], &sb)
 		if strings.TrimSpace(sb.String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// isConnResetErr reports whether err is a bare connection-level failure (the
+// peer/proxy closed the connection before responding) rather than an HTTP-level
+// error. Such failures are safe to retry: no response was received, so no
+// conversation was created upstream.
+func isConnResetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, m := range []string{"eof", "connection reset", "reset by peer", "broken pipe", "connection refused"} {
+		if strings.Contains(msg, m) {
 			return true
 		}
 	}
