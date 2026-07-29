@@ -99,3 +99,30 @@ func TestGenerateVideoSelectsUpstreamModelByDuration(t *testing.T) {
 		t.Fatalf("submitted ratio = %q, want %q", submittedRatio, "1:1")
 	}
 }
+
+func TestCreateVideoTaskReturnsAfterSubmitWithoutPolling(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/video/generations" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if payload["model"] != "video-v1-15s" || payload["ratio"] != "9:16" {
+			t.Fatalf("payload = %#v", payload)
+		}
+		_, _ = w.Write([]byte(`{"task_id":"task_async"}`))
+	}))
+	defer server.Close()
+
+	taskID, err := NewAdapter().CreateVideoTask(t.Context(), server.URL, "test-key", "move", "1080x1920", 15, nil)
+	if err != nil {
+		t.Fatalf("CreateVideoTask returned error: %v", err)
+	}
+	if taskID != "task_async" || requests != 1 {
+		t.Fatalf("taskID=%q requests=%d, want task_async and one POST", taskID, requests)
+	}
+}

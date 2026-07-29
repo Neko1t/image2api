@@ -27,6 +27,7 @@ func NewUserGenerationService(v1 *V1Service, events *repo.EventRepository, users
 }
 
 type UserGenerateRequest struct {
+	RequestID       string
 	Model           string
 	Prompt          string
 	Ratio           string
@@ -59,6 +60,20 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 
 	switch modelItem.Type {
 	case "video":
+		isYCY, err := s.v1.IsYCYVideoModel(ctx, modelItem.ID)
+		if err != nil {
+			return nil, err
+		}
+		if isYCY {
+			return s.v1.StartSessionYCYVideoJob(ctx, principal, V1VideoRequest{
+				Model:           in.Model,
+				Prompt:          in.Prompt,
+				Duration:        in.Duration,
+				AspectRatio:     in.Ratio,
+				Resolution:      in.Resolution,
+				ReferenceImages: in.ReferenceImages,
+			}, in.RequestID)
+		}
 		resp, err := s.v1.prepareSessionVideo(ctx, principal, V1VideoRequest{
 			Model:           in.Model,
 			Prompt:          in.Prompt,
@@ -85,6 +100,20 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 		}
 		return resp, nil
 	}
+}
+
+func (s *UserGenerationService) Job(ctx context.Context, user *model.User, eventID string) (map[string]any, error) {
+	if user == nil || strings.TrimSpace(user.ID) == "" {
+		return nil, errors.New("not authenticated")
+	}
+	item, err := s.events.GetByIDForUser(ctx, strings.TrimSpace(eventID), user.ID)
+	if err != nil {
+		return nil, err
+	}
+	if item == nil || item.JobType != ycyJobType {
+		return nil, ErrVideoJobNotFound
+	}
+	return ycyUserJobResponse(item, user.Credits, false), nil
 }
 
 func (s *UserGenerationService) AdminTest(ctx context.Context, user *model.User, in UserGenerateRequest) (map[string]any, error) {
@@ -165,6 +194,8 @@ func shapeJobEvent(item *model.EventLog, modelNames map[string]string) map[strin
 	}
 	return map[string]any{
 		"id":             item.ID,
+		"request_id":     emptyOrNil(item.RequestID),
+		"job_stage":      emptyOrNil(item.JobStage),
 		"kind":           item.Kind,
 		"model":          displayModelName(modelNames, item.Model),
 		"prompt":         item.Prompt,

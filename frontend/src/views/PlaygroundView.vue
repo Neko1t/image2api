@@ -395,8 +395,11 @@ async function run() {
 async function fireOne() {
   // Snapshot the form NOW — concurrent tasks keep their own params even if the
   // user edits the form (or fires another batch) while this one runs.
+  const requestId = mode.value === 'video' ? crypto.randomUUID() : ''
   const task = {
-    id: Math.random().toString(36).slice(2, 10),
+    id: requestId || Math.random().toString(36).slice(2, 10),
+    request_id: requestId,
+    event_id: '',
     model: model.value?.alias || modelId.value,
     kind: mode.value,
     prompt: prompt.value,
@@ -425,7 +428,10 @@ async function fireOne() {
   const payload = {
     model: task.model, prompt: task.prompt, ratio: task.ratio, resolution: task.resolution,
   }
-  if (task.kind === 'video') payload.duration = task.duration
+  if (task.kind === 'video') {
+    payload.duration = task.duration
+    payload.request_id = task.request_id
+  }
   if (task.kind === 'image' && task.deai) payload.deai = true
   if (refsSnapshot.length) {
     const refs = await Promise.all(refsSnapshot.map(refToBase64))
@@ -440,6 +446,16 @@ async function fireOne() {
       task.elapsed_ms = r.data.elapsed_ms
       task.charged = r.data.charged ?? chargedPrice
       if (auth.user && r.data.credits != null) auth.user.credits = r.data.credits
+    } else if (r.ok && r.status === 202 && r.data?.event_id) {
+      task.event_id = r.data.event_id
+      task.status = 'running'
+      task.charged = r.data.charged ?? chargedPrice
+      if (auth.user && r.data.credits != null) auth.user.credits = r.data.credits
+    } else if (r.ok && r.data?.status === 'failed') {
+      await refreshMe()
+      task.event_id = r.data.event_id || ''
+      task.status = 'failed'
+      task.error = r.data.error || '生成失败'
     } else if (GATEWAY_TIMEOUT.has(r.status)) {
       // CDN/代理回源超时(如 EdgeOne 524)—— 后端仍在生成。保持 running,
       // loadHistory() 在结果落库后认领它。
@@ -450,9 +466,16 @@ async function fireOne() {
       task.error = r.data?.detail || `失败 (${r.status})`
     }
   } catch (e) {
-    await refreshMe()
-    task.status = 'failed'
-    task.error = String(e)
+    if (task.kind === 'video') {
+      // The POST outcome is unknown. Keep request_id stable while history
+      // reconciles any durable job that the server already admitted.
+      task.status = 'confirming'
+      task.error = ''
+    } else {
+      await refreshMe()
+      task.status = 'failed'
+      task.error = String(e)
+    }
   }
   loadHistory()
 }
@@ -464,12 +487,43 @@ let prevPending = 0
 async function loadHistory() {
   // Server-side filter: status IN (pending, success), newest 12 — exactly the
   // rows the grid shows, in one query (no client over-fetch).
-  const r = await api('/logs?limit=10&statuses=pending,success&source=user&exclude_showcase=1&media=1')
+  const r = await api('/logs?limit=30&statuses=pending,success,failed&source=user&exclude_showcase=1')
   if (!r.ok) return
-  history.value = (r.data?.data || [])
-    .filter((e) => e.status === 'pending' || e.file)
+  const serverRows = r.data?.data || []
+  const byEvent = new Map(serverRows.map((e) => [e.id, e]))
+  const byRequest = new Map(serverRows.filter((e) => e.request_id).map((e) => [e.request_id, e]))
+
+  let sawLiveFailure = false
+  for (const task of tasks.value) {
+    const row = (task.event_id && byEvent.get(task.event_id)) || (task.request_id && byRequest.get(task.request_id))
+    if (!row) {
+      if (task.status === 'confirming' && Date.now() - task.ts > 120000) {
+        task.status = 'failed'
+        task.error = '未确认到生成任务，请重新提交'
+        sawLiveFailure = true
+      }
+      continue
+    }
+    task.event_id = row.id
+    if (row.status === 'failed') {
+      task.status = 'failed'
+      task.error = row.error || '生成失败'
+      sawLiveFailure = true
+    } else if (row.status === 'success' && row.file) {
+      task.status = 'done'
+      task.url = generatedUrl(row.file)
+      task.elapsed_ms = row.elapsed_ms
+    } else {
+      task.status = 'running'
+    }
+  }
+
+  history.value = serverRows
+    .filter((e) => e.status === 'pending' || (e.status === 'success' && e.file))
     .map((e) => ({
       id: 'srv-' + e.id,
+      event_id: e.id,
+      request_id: e.request_id || '',
       prompt: e.prompt, model: e.model, kind: e.kind,
       ratio: e.ratio, resolution: e.resolution, duration: e.duration, deai: !!e.deai,
       status: e.status === 'success' ? 'done' : 'running',
@@ -481,13 +535,17 @@ async function loadHistory() {
   // pending task when a matching server pending row exists, a done task once its
   // file is in the server's rows. A FAILED task is a live error — keep it.
   const serverPending = new Set(history.value.filter((h) => h.status === 'running').map(taskKey))
+  const serverPendingEvents = new Set(history.value.filter((h) => h.status === 'running').map((h) => h.event_id))
+  const serverPendingRequests = new Set(history.value.filter((h) => h.status === 'running').map((h) => h.request_id).filter(Boolean))
   const serverFiles = new Set(history.value.filter((h) => h.url).map((h) => fileKey(h.url)))
   tasks.value = tasks.value.filter((t) => {
     if (t.status === 'failed') return true
     if (t.status === 'done') return !serverFiles.has(fileKey(t.url))
+    if (t.event_id && serverPendingEvents.has(t.event_id)) return false
+    if (t.request_id && serverPendingRequests.has(t.request_id)) return false
     return !serverPending.has(taskKey(t))
   })
-  if (serverPending.size < prevPending) refreshMe()
+  if (serverPending.size < prevPending || sawLiveFailure) refreshMe()
   prevPending = serverPending.size
 }
 
@@ -838,7 +896,7 @@ onUnmounted(() => {
             </div>
           </template>
           <!-- pending / running -->
-          <div v-else-if="item.status === 'pending' || item.status === 'running'"
+          <div v-else-if="item.status === 'pending' || item.status === 'running' || item.status === 'confirming'"
                class="absolute inset-0 grid place-items-center text-slate-400 text-xs px-3 text-center">
             <div class="flex flex-col items-center gap-2">
               <span class="w-10 h-10 rounded-xl bg-white grid place-items-center animate-pulse"><Icon name="spark" class="w-4 h-4" /></span>

@@ -34,6 +34,12 @@ var acquireScript = redis.NewScript(`
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+local existing = redis.call('ZSCORE', KEYS[1], ARGV[3])
+if existing then
+  redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[3])
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+  return 1
+end
 local n = redis.call('ZCARD', KEYS[1])
 local max = tonumber(ARGV[1])
 if max > 0 and n >= max then return 0 end

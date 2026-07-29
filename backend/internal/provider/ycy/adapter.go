@@ -77,6 +77,46 @@ func (a *Adapter) GenerateVideo(ctx context.Context, baseURL, apiKey, upstreamMo
 	return videoBytes, contentURL, nil
 }
 
+// CreateVideoTask exposes YCY's durable submit boundary to the background job
+// worker. Once this returns, callers must persist taskID before doing any poll.
+func (a *Adapter) CreateVideoTask(ctx context.Context, baseURL, apiKey, prompt, size string, duration int, refs [][]byte) (string, error) {
+	resolvedModel, err := videoModelForDuration(duration)
+	if err != nil {
+		return "", err
+	}
+	taskID, err := a.Client.CreateVideo(ctx, baseURL, apiKey, resolvedModel, prompt, sizeToRatio(size), referenceDataURIs(refs))
+	if err != nil {
+		return "", mapAdapterError(err)
+	}
+	return taskID, nil
+}
+
+func (a *Adapter) GetVideoTask(ctx context.Context, baseURL, apiKey, taskID string) (string, string, error) {
+	status, contentURL, err := a.Client.GetVideo(ctx, baseURL, apiKey, taskID)
+	if err != nil {
+		return "", "", mapAdapterError(err)
+	}
+	return status, contentURL, nil
+}
+
+func (a *Adapter) DownloadVideoTask(ctx context.Context, contentURL, apiKey string) ([]byte, string, error) {
+	data, contentType, err := a.Client.Download(ctx, contentURL, apiKey)
+	if err != nil {
+		return nil, "", mapAdapterError(err)
+	}
+	return data, contentType, nil
+}
+
+func referenceDataURIs(refs [][]byte) []string {
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if len(ref) > 0 {
+			out = append(out, bytesToDataURI(ref))
+		}
+	}
+	return out
+}
+
 // bytesToDataURI converts image bytes to a base64 data-URI string.
 // Detects image format from magic bytes and uses appropriate MIME type.
 func bytesToDataURI(data []byte) string {

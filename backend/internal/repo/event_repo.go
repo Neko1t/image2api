@@ -8,6 +8,12 @@ import (
 
 	"backend/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var (
+	ErrIdempotencyConflict = errors.New("idempotency key reused with different parameters")
+	ErrInsufficientCredits = errors.New("insufficient credits")
 )
 
 type EventRepository struct {
@@ -24,8 +30,8 @@ type EventListFilter struct {
 	UserID        string
 	UserIDs       []string // when set, keep ONLY rows whose user_id is in this list (admin 用户搜索)
 	Query         string   // free-text search over prompt / model / error (server-side, 跨页)
-	ExcludeSource string // when set, omit rows with this source (e.g. hide API-key "v1" usage from the customer logs page)
-	Source        string // when set, keep ONLY rows with this source (admin 来源 filter): "v1" (API key) / "user" (前台) / "admin" (测试模型)
+	ExcludeSource string   // when set, omit rows with this source (e.g. hide API-key "v1" usage from the customer logs page)
+	Source        string   // when set, keep ONLY rows with this source (admin 来源 filter): "v1" (API key) / "user" (前台) / "admin" (测试模型)
 	HasFile       bool     // when true, keep ONLY rows with a non-empty file (the 创作记录 gallery — paginates over real media)
 	ExcludeFiles  []string // when set, omit rows whose file is in this list (e.g. hide homepage showcase media from user galleries)
 	MediaOnly     bool     // when true, keep only rows that are pending or have a stored file — the 画图台 grid, so deleted works don't eat a slot
@@ -450,7 +456,7 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration) 
 		// sweep can't double-count (the UPDATE in the same tx removes them from
 		// the pending set).
 		if err := tx.Model(&model.EventLog{}).
-			Where("status = ? AND ts < ?", "pending", cutoff).
+			Where("status = ? AND ts < ? AND COALESCE(job_type, '') <> ?", "pending", cutoff, "ycy_video").
 			Select("id", "user_id", "account_id", "cost").
 			Scan(&stale).Error; err != nil {
 			return err
@@ -459,7 +465,7 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration) 
 			return nil
 		}
 		return tx.Model(&model.EventLog{}).
-			Where("status = ? AND ts < ?", "pending", cutoff).
+			Where("status = ? AND ts < ? AND COALESCE(job_type, '') <> ?", "pending", cutoff, "ycy_video").
 			Updates(map[string]any{
 				"status":     "failed",
 				"error":      gorm.Expr("COALESCE(NULLIF(error, ''), ?)", "abandoned (process restarted or request interrupted)"),
@@ -470,6 +476,225 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration) 
 		return nil, err
 	}
 	return stale, nil
+}
+
+type CreateYCYJobResult struct {
+	Event   *model.EventLog
+	Credits float64
+	Created bool
+}
+
+// CreateYCYJob atomically resolves idempotency, debits the user, and creates
+// the durable pending event. Locking the user serializes concurrent submissions
+// from the same owner; the partial unique index remains the database backstop.
+func (r *EventRepository) CreateYCYJob(ctx context.Context, item *model.EventLog) (*CreateYCYJobResult, error) {
+	if item == nil || strings.TrimSpace(item.UserID) == "" || strings.TrimSpace(item.RequestID) == "" {
+		return nil, errors.New("invalid ycy job")
+	}
+	result := &CreateYCYJobResult{}
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var user model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&user, "id = ?", item.UserID).Error; err != nil {
+			return err
+		}
+
+		var existing model.EventLog
+		err := tx.Where("user_id = ? AND request_id = ? AND job_type = ?", item.UserID, item.RequestID, "ycy_video").First(&existing).Error
+		switch {
+		case err == nil:
+			if existing.PayloadHash != item.PayloadHash {
+				return ErrIdempotencyConflict
+			}
+			result.Event = &existing
+			result.Credits = user.Credits
+			return nil
+		case !errors.Is(err, gorm.ErrRecordNotFound):
+			return err
+		}
+
+		if user.Credits < item.Cost {
+			result.Credits = user.Credits
+			return ErrInsufficientCredits
+		}
+		user.Credits -= item.Cost
+		if err := tx.Model(&model.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+			"credits": user.Credits, "updated_at": time.Now(),
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(item).Error; err != nil {
+			return err
+		}
+		result.Event = item
+		result.Credits = user.Credits
+		result.Created = true
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result.Created {
+		r.incrCounters(ctx, map[string]int64{"total": 1, "video": 1})
+	}
+	return result, nil
+}
+
+func (r *EventRepository) GetYCYJobByRequest(ctx context.Context, userID, requestID string) (*model.EventLog, error) {
+	var item model.EventLog
+	err := r.db.WithContext(ctx).
+		Where("user_id = ? AND request_id = ? AND job_type = ?", userID, requestID, "ycy_video").
+		First(&item).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r *EventRepository) GetByIDForUser(ctx context.Context, id, userID string) (*model.EventLog, error) {
+	var item model.EventLog
+	err := r.db.WithContext(ctx).Where("id = ? AND user_id = ?", id, userID).First(&item).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+// ClaimDueYCYJob grants a short database processing lease. SKIP LOCKED permits
+// multiple backend instances without two workers advancing the same event.
+func (r *EventRepository) ClaimDueYCYJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (*model.EventLog, error) {
+	var claimed *model.EventLog
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var item model.EventLog
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("job_type = ? AND status = ? AND next_poll_at <= ? AND (lease_until IS NULL OR lease_until < ?)", "ycy_video", "pending", now, now).
+			Order("next_poll_at ASC, ts ASC").First(&item).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		until := now.Add(lease)
+		if err := tx.Model(&model.EventLog{}).Where("id = ?", item.ID).Updates(map[string]any{
+			"lease_owner": owner, "lease_until": until, "updated_at": now,
+		}).Error; err != nil {
+			return err
+		}
+		item.LeaseOwner = owner
+		item.LeaseUntil = &until
+		claimed = &item
+		return nil
+	})
+	return claimed, err
+}
+
+func (r *EventRepository) UpdateYCYClaim(ctx context.Context, eventID, owner string, patch map[string]any) (bool, error) {
+	patch["updated_at"] = time.Now()
+	res := r.db.WithContext(ctx).Model(&model.EventLog{}).
+		Where("id = ? AND job_type = ? AND status = ? AND lease_owner = ?", eventID, "ycy_video", "pending", owner).
+		Updates(patch)
+	return res.RowsAffected == 1, res.Error
+}
+
+func (r *EventRepository) ExtendYCYLease(ctx context.Context, eventID, owner string, until time.Time) error {
+	return r.db.WithContext(ctx).Model(&model.EventLog{}).
+		Where("id = ? AND job_type = ? AND status = ? AND lease_owner = ?", eventID, "ycy_video", "pending", owner).
+		Updates(map[string]any{"lease_until": until, "updated_at": time.Now()}).Error
+}
+
+func (r *EventRepository) PendingYCYByAccount(ctx context.Context, accountID, excludeEventID string) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Model(&model.EventLog{}).
+		Where("job_type = ? AND status = ? AND account_id = ? AND id <> ?", "ycy_video", "pending", accountID, excludeEventID).
+		Count(&count).Error
+	return count, err
+}
+
+// FailYCYJobAndRefund makes terminal failure and its credit refund one atomic
+// database transition. Repeated callers observe an already-terminal event and
+// cannot credit the user twice.
+func (r *EventRepository) FailYCYJobAndRefund(ctx context.Context, eventID, errMsg string, elapsedMS int) (bool, error) {
+	transitioned := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var item model.EventLog
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&item, "id = ?", eventID).Error; err != nil {
+			return err
+		}
+		if item.Status != "pending" || item.JobType != "ycy_video" {
+			return nil
+		}
+		refunded := item.Refunded
+		if !refunded && item.UserID != "" && item.Cost > 0 {
+			var user model.User
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&user, "id = ?", item.UserID).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&model.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+				"credits": user.Credits + item.Cost, "updated_at": time.Now(),
+			}).Error; err != nil {
+				return err
+			}
+			refunded = true
+		}
+		if err := tx.Model(&model.EventLog{}).Where("id = ?", eventID).Updates(map[string]any{
+			"status": "failed", "job_stage": "failed", "error": strings.TrimSpace(errMsg),
+			"elapsed_ms": elapsedMS, "refunded": refunded, "file": "", "lease_owner": "",
+			"lease_until": nil, "next_poll_at": nil, "updated_at": time.Now(),
+		}).Error; err != nil {
+			return err
+		}
+		transitioned = true
+		return nil
+	})
+	if err == nil && transitioned {
+		r.incrCounters(ctx, map[string]int64{"failed": 1})
+	}
+	return transitioned, err
+}
+
+// CompleteYCYJob finalizes the event and generation counters once. RustFS work
+// is performed first and may safely be replayed against the fixed object key.
+func (r *EventRepository) CompleteYCYJob(ctx context.Context, eventID string, elapsedMS int) (bool, error) {
+	transitioned := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var item model.EventLog
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&item, "id = ?", eventID).Error; err != nil {
+			return err
+		}
+		if item.Status != "pending" || item.JobType != "ycy_video" {
+			return nil
+		}
+		if err := tx.Model(&model.EventLog{}).Where("id = ?", eventID).Updates(map[string]any{
+			"status": "success", "job_stage": "completed", "error": "", "elapsed_ms": elapsedMS,
+			"lease_owner": "", "lease_until": nil, "next_poll_at": nil, "updated_at": time.Now(),
+		}).Error; err != nil {
+			return err
+		}
+		if item.Model != "" {
+			if err := tx.Model(&model.ModelConfig{}).Where("id = ?", item.Model).
+				Update("generation_count", gorm.Expr("generation_count + 1")).Error; err != nil {
+				return err
+			}
+		}
+		if item.UserID != "" {
+			if err := tx.Model(&model.User{}).Where("id = ?", item.UserID).
+				Update("generation_count", gorm.Expr("generation_count + 1")).Error; err != nil {
+				return err
+			}
+		}
+		transitioned = true
+		return nil
+	})
+	if err == nil && transitioned {
+		r.incrCounters(ctx, map[string]int64{"success": 1})
+	}
+	return transitioned, err
 }
 
 func (r *EventRepository) Create(ctx context.Context, item *model.EventLog) error {

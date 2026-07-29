@@ -62,6 +62,7 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 	}
 
 	var body struct {
+		RequestID       string   `json:"request_id"`
 		Model           string   `json:"model"`
 		Prompt          string   `json:"prompt"`
 		Ratio           string   `json:"ratio"`
@@ -76,6 +77,7 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 	}
 
 	resp, err := h.userGen.Generate(c.Request.Context(), user, service.UserGenerateRequest{
+		RequestID:       body.RequestID,
 		Model:           body.Model,
 		Prompt:          body.Prompt,
 		Ratio:           body.Ratio,
@@ -90,6 +92,12 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
 		case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
 			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		case errors.Is(err, service.ErrRequestIDRequired):
+			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		case errors.Is(err, service.ErrIdempotencyConflict):
+			c.JSON(http.StatusConflict, gin.H{"detail": err.Error(), "code": "idempotency_conflict"})
+		case errors.Is(err, service.ErrYCYBindingAmbiguous):
+			c.JSON(http.StatusConflict, gin.H{"detail": err.Error(), "code": "ambiguous_ycy_binding"})
 		case errors.Is(err, service.ErrInsufficientFunds):
 			c.JSON(http.StatusPaymentRequired, gin.H{"detail": "积分不足"})
 		case errors.Is(err, service.ErrNoProviderAccount):
@@ -111,7 +119,29 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 		}
 		return
 	}
+	if status, _ := resp["status"].(string); status == "queued" {
+		c.JSON(http.StatusAccepted, resp)
+		return
+	}
 	c.JSON(http.StatusOK, resp)
+}
+
+func (h *UserGenerationHandler) Job(c *gin.Context) {
+	user := currentUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "not authenticated"})
+		return
+	}
+	item, err := h.userGen.Job(c.Request.Context(), user, c.Param("id"))
+	if err != nil {
+		if errors.Is(err, service.ErrVideoJobNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load job"})
+		return
+	}
+	c.JSON(http.StatusOK, item)
 }
 
 func (h *UserGenerationHandler) Test(c *gin.Context) {
@@ -300,6 +330,8 @@ func (h *UserGenerationHandler) Logs(c *gin.Context) {
 		}
 		out = append(out, gin.H{
 			"id":         item.ID,
+			"request_id": emptyStringNil(item.RequestID),
+			"job_stage":  emptyStringNil(item.JobStage),
 			"ts":         item.TS.Unix(),
 			"kind":       item.Kind,
 			"status":     item.Status,

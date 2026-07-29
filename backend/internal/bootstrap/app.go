@@ -78,6 +78,14 @@ func NewApp(ctx context.Context) (*App, error) {
 		`ON cdk_codes (batch_id, redeemed_by) WHERE type = 'marketing' AND redeemed_by IS NOT NULL`).Error; err != nil {
 		return nil, fmt.Errorf("cdk marketing index: %w", err)
 	}
+	if err := db.WithContext(ctx).Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_event_ycy_user_request ` +
+		`ON event_logs (user_id, request_id) WHERE job_type = 'ycy_video' AND request_id <> ''`).Error; err != nil {
+		return nil, fmt.Errorf("ycy event idempotency index: %w", err)
+	}
+	if err := db.WithContext(ctx).Exec(`CREATE INDEX IF NOT EXISTS idx_event_ycy_due ` +
+		`ON event_logs (next_poll_at) WHERE job_type = 'ycy_video' AND status = 'pending'`).Error; err != nil {
+		return nil, fmt.Errorf("ycy event due index: %w", err)
+	}
 	if err := seedDefaults(ctx, db); err != nil {
 		return nil, fmt.Errorf("seed defaults: %w", err)
 	}
@@ -178,6 +186,7 @@ func NewApp(ctx context.Context) (*App, error) {
 	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, userRepo, refreshSvc, siteRepo, rustfsClient, v1Svc.Inflight(), showcaseRepo, orderRepo)
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	go maintenanceSvc.Run(loopCtx)
+	go v1Svc.RunYCYVideoWorker(loopCtx)
 
 	return &App{
 		Config:            cfg,

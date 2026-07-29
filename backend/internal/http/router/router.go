@@ -89,6 +89,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	{
 		userAuthed.GET("/logs", handlers.UserGen.Logs)
 		userAuthed.POST("/generate", handlers.UserGen.Generate)
+		userAuthed.GET("/generation-jobs/:id", handlers.UserGen.Job)
 		userAuthed.POST("/test", handlers.UserGen.Test)
 		userAuthed.GET("/jobs/mine", handlers.UserGen.MyJobs)
 		userAuthed.GET("/my-images", handlers.UserGen.MyImages)
