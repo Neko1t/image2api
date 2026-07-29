@@ -12,6 +12,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log"
 	stdhttp "net/http"
 	"net/url"
 	"os"
@@ -953,6 +954,18 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	// so the pool retries the same account a few times and then fails over to
 	// another account (换号重试) instead of failing the request.
 	if !asyncStarted && len(fileIDs) == 0 && len(sedimentIDs) == 0 {
+		// Keep this redacted diagnostic permanently. ChatGPT changes its private
+		// SSE protocol frequently, and the final error alone cannot distinguish a
+		// refusal, protocol drift, or a truncated stream. summarizeSSEChunks never
+		// includes raw payload values such as prompts, tokens, cookies, or emails.
+		log.Printf(
+			"chatgpt sse diagnostic: no async marker http_status=%d content_type=%q elapsed_ms=%d scanner_error=%t summary=%s",
+			resp.StatusCode,
+			resp.Header.Get("Content-Type"),
+			time.Since(sseStart).Milliseconds(),
+			scanner.Err() != nil,
+			summarizeSSEChunks(chunks),
+		)
 		return "", nil, nil, fmt.Errorf("%w: image generation did not start (no async marker)", ErrTemporaryUpstream)
 	}
 	return conversationID, fileIDs, sedimentIDs, nil
