@@ -31,10 +31,25 @@ func (a *Adapter) GenerateImage(ctx context.Context, baseURL, apiKey, upstreamMo
 	return nil, "", adapter.ErrAdapterUnsupported
 }
 
+func videoModelForDuration(duration int) (string, error) {
+	switch duration {
+	case 5, 10, 15:
+		return fmt.Sprintf("video-v1-%ds", duration), nil
+	default:
+		return "", fmt.Errorf("%w: YCY supports 5, 10, or 15 seconds, got %d", adapter.ErrAdapterUnsupported, duration)
+	}
+}
+
 // GenerateVideo implements adapter.VideoAdapter by calling the YCY video API.
 // YCY expects reference images as base64 data-URIs (not URLs), so this adapter
-// converts the byte arrays to data-URI format.
+// converts the byte arrays to data-URI format. The selected duration determines
+// which of YCY's duration-specific upstream models receives the request.
 func (a *Adapter) GenerateVideo(ctx context.Context, baseURL, apiKey, upstreamModel, prompt, size string, duration int, refs [][]byte, downloadResult bool) ([]byte, string, error) {
+	resolvedModel, err := videoModelForDuration(duration)
+	if err != nil {
+		return nil, "", err
+	}
+
 	// YCY uses aspect ratio (e.g., "16:9") rather than size (e.g., "1280x720").
 	// Convert size to ratio for the YCY API.
 	ratio := sizeToRatio(size)
@@ -52,7 +67,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, baseURL, apiKey, upstreamMo
 	}
 
 	// Call the YCY client with data-URI references
-	videoBytes, contentURL, err := a.Client.GenerateVideo(ctx, baseURL, apiKey, upstreamModel, prompt, ratio, refDataURIs, downloadResult)
+	videoBytes, contentURL, err := a.Client.GenerateVideo(ctx, baseURL, apiKey, resolvedModel, prompt, ratio, refDataURIs, downloadResult)
 	if err != nil {
 		return nil, "", mapAdapterError(err)
 	}
