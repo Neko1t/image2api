@@ -82,9 +82,10 @@ func containsAsyncMarker(text string) bool {
 // containsStructuredImageToolCall recognizes the current ChatGPT web protocol,
 // where picture_v2 submissions invoke an obfuscated per-session tool recipient
 // instead of emitting image_gen_async/image_gen_task_id. This helper is only used
-// in the image-generation SSE path, so a JSON code turn addressed to a non-chat
+// in the image-generation SSE path, so a code turn addressed to a non-chat
 // recipient means the server-side image tool has been dispatched and polling can
-// take over.
+// take over. Do not depend on content.language: ChatGPT has used both json and
+// python3 for the same obfuscated image tool recipient.
 func containsStructuredImageToolCall(text string) bool {
 	var payload any
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
@@ -101,8 +102,7 @@ func hasStructuredImageToolMessage(value any) bool {
 		role := strings.ToLower(strings.TrimSpace(stringValue(author["role"])))
 		recipient := strings.TrimSpace(stringValue(item["recipient"]))
 		contentType := strings.ToLower(strings.TrimSpace(stringValue(content["content_type"])))
-		language := strings.ToLower(strings.TrimSpace(stringValue(content["language"])))
-		if role == "assistant" && recipient != "" && recipient != "all" && contentType == "code" && language == "json" {
+		if role == "assistant" && recipient != "" && recipient != "all" && contentType == "code" {
 			return true
 		}
 		for _, child := range item {
