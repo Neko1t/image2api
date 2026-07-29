@@ -41,8 +41,33 @@ func TestVideoModelForDurationRejectsUnsupportedDuration(t *testing.T) {
 	}
 }
 
+func TestSizeToRatio(t *testing.T) {
+	tests := []struct {
+		name string
+		size string
+		want string
+	}{
+		{name: "landscape 1080p", size: "1920x1080", want: "16:9"},
+		{name: "portrait 1080p", size: "1080x1920", want: "9:16"},
+		{name: "square 720p", size: "720x720", want: "1:1"},
+		{name: "square 1080p", size: "1080x1080", want: "1:1"},
+		{name: "arbitrary reducible size", size: "1000x750", want: "4:3"},
+		{name: "existing ratio", size: "16:9", want: "16:9"},
+		{name: "invalid size", size: "auto", want: "auto"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sizeToRatio(tt.size); got != tt.want {
+				t.Fatalf("sizeToRatio(%q) = %q, want %q", tt.size, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGenerateVideoSelectsUpstreamModelByDuration(t *testing.T) {
 	var submittedModel string
+	var submittedRatio string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/video/generations":
@@ -51,6 +76,7 @@ func TestGenerateVideoSelectsUpstreamModelByDuration(t *testing.T) {
 				t.Fatalf("decode request body: %v", err)
 			}
 			submittedModel, _ = payload["model"].(string)
+			submittedRatio, _ = payload["ratio"].(string)
 			_, _ = w.Write([]byte(`{"task_id":"task_10s"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/video/generations/task_10s":
 			_, _ = w.Write([]byte(`{"status":"SUCCESS","result_url":"https://example.com/video.mp4"}`))
@@ -61,12 +87,15 @@ func TestGenerateVideoSelectsUpstreamModelByDuration(t *testing.T) {
 	defer server.Close()
 
 	_, _, err := NewAdapter().GenerateVideo(
-		t.Context(), server.URL, "test-key", "configured-model", "move", "16:9", 10, nil, false,
+		t.Context(), server.URL, "test-key", "configured-model", "move", "1080x1080", 10, nil, false,
 	)
 	if err != nil {
 		t.Fatalf("GenerateVideo returned error: %v", err)
 	}
 	if submittedModel != "video-v1-10s" {
 		t.Fatalf("submitted model = %q, want %q", submittedModel, "video-v1-10s")
+	}
+	if submittedRatio != "1:1" {
+		t.Fatalf("submitted ratio = %q, want %q", submittedRatio, "1:1")
 	}
 }

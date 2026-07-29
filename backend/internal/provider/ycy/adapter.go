@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	nanoid "github.com/matoous/go-nanoid/v2"
 
@@ -101,24 +103,28 @@ func bytesToDataURI(data []byte) string {
 	return fmt.Sprintf("data:%s;base64,%s", mimeType, encoded)
 }
 
-// sizeToRatio converts a size string like "1280x720" to a ratio string like "16:9".
-// Falls back to the original string if it doesn't match the expected format.
+// sizeToRatio converts a size string like "1920x1080" to its reduced ratio.
+// Values already expressed as ratios, or otherwise unparseable, pass through.
 func sizeToRatio(size string) string {
-	// Common mappings
-	switch size {
-	case "1280x720", "1920x1080", "2560x1440", "3840x2160":
-		return "16:9"
-	case "720x1280", "1080x1920", "1440x2560", "2160x3840":
-		return "9:16"
-	case "1024x1024", "512x512", "2048x2048":
-		return "1:1"
-	case "1024x768", "1280x960", "1600x1200":
-		return "4:3"
-	case "768x1024", "960x1280", "1200x1600":
-		return "3:4"
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(size)), "x")
+	if len(parts) != 2 {
+		return size
 	}
-	// If the size is already in ratio format (e.g., "16:9"), return as-is
-	return size
+	width, widthErr := strconv.Atoi(strings.TrimSpace(parts[0]))
+	height, heightErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
+		return size
+	}
+
+	divisor := greatestCommonDivisor(width, height)
+	return fmt.Sprintf("%d:%d", width/divisor, height/divisor)
+}
+
+func greatestCommonDivisor(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 // randomID generates a random alphanumeric string of the given length using nanoid.
