@@ -69,11 +69,10 @@ func (c *Client) SetProxy(proxy string) {
 }
 
 func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
-	// Everything except the generation submit egresses on the local IP. Only
-	// startImageGeneration (the /backend-api/f/conversation POST) goes through
-	// the proxy; the bootstrap / chat-requirements / reference upload / prepare
-	// handshake and the poll / resolve / download run direct.
-	session, err := c.newDirectSession(accessToken)
+	// Keep the anti-bot handshake and generation submit on the same proxied
+	// session. The requirements and conduit tokens may be bound to that session's
+	// fingerprint and egress IP.
+	session, err := c.newSession(accessToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,12 +103,7 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if err != nil {
 		return nil, nil, err
 	}
-	// The generation submit is the only request that egresses via the proxy.
-	submitSession, err := c.newSession(accessToken)
-	if err != nil {
-		return nil, nil, err
-	}
-	conversationID, fileIDs, sedimentIDs, err := c.startImageGeneration(ctx, submitSession, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs)
+	conversationID, fileIDs, sedimentIDs, err := c.startImageGeneration(ctx, session, accessToken, effectivePrompt, reqs, conduitToken, model, uploadedRefs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -119,6 +113,12 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	refIDs := uploadedRefIDSet(uploadedRefs)
 	fileIDs = dropIDs(fileIDs, refIDs)
 	sedimentIDs = dropIDs(sedimentIDs, refIDs)
+	// Poll, resolve and download on the server's direct connection after the
+	// anti-bot-sensitive submit phase has completed.
+	session, err = c.newDirectSession(accessToken)
+	if err != nil {
+		return nil, nil, err
+	}
 	fileIDs, sedimentIDs, err = c.pollForImage(ctx, session, accessToken, conversationID, fileIDs, sedimentIDs, refIDs, pollBudget(ctx))
 	if err != nil {
 		return nil, nil, err
