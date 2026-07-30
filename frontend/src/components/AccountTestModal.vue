@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onUnmounted } from 'vue'
+import { ref, computed, onUnmounted, watch } from 'vue'
 import { api, jsonBody } from '../api'
 import Icon from './Icon.vue'
 import SelectMenu from './SelectMenu.vue'
@@ -12,11 +12,35 @@ const props = defineProps({
 })
 const emit = defineEmits(['close'])
 
-// 该账号所属 provider 的全部模型(图像 + 视频)。
-const models = computed(() =>
-  props.allModels.filter((m) => (m.provider || '') === props.account.pool))
 const selectedModel = ref('')
-if (models.value.length) selectedModel.value = models.value[0].alias || models.value[0].id
+
+const isUpstreamAccount = computed(() =>
+  props.account.pool === 'custom' || props.account.pool === 'ycy' ||
+  props.account.type === 'custom' || props.account.type === 'ycy' ||
+  props.account.adapter_type === 'ycy')
+const isYCYAccount = computed(() =>
+  props.account.pool === 'ycy' || props.account.type === 'ycy' ||
+  props.account.adapter_type === 'ycy')
+const declaredModelIDs = computed(() =>
+  new Set(String(props.account.models || '').split(',').map((id) => id.trim()).filter(Boolean)))
+
+// Native tests use the model's provider. Upstream tests use the account's model
+// declaration because custom/YCY accounts may intentionally override any model.
+const models = computed(() => {
+  if (!isUpstreamAccount.value) {
+    return props.allModels.filter((m) => (m.provider || '') === props.account.pool)
+  }
+  const compatible = isYCYAccount.value
+    ? props.allModels.filter((m) => m.type === 'video')
+    : props.allModels
+  if (!declaredModelIDs.value.size) return compatible
+  return compatible.filter((m) => declaredModelIDs.value.has(m.id))
+})
+
+watch(models, (items) => {
+  if (items.some((m) => (m.alias || m.id) === selectedModel.value)) return
+  selectedModel.value = items.length ? (items[0].alias || items[0].id) : ''
+}, { immediate: true })
 
 const modelOptions = computed(() => models.value.map((m) => ({
   value: m.alias || m.id,

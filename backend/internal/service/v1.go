@@ -560,8 +560,14 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	defer s.inflight.Done(eventID)
 	startedAt := time.Now()
 
+	provider, err := s.requestProvider(genCtx, modelItem, in.AccountID)
+	if err != nil {
+		_ = s.refundIfNeeded(ctx, principal, eventID, price)
+		_ = s.events.UpdateStatus(ctx, eventID, "failed", err.Error(), 0)
+		return nil, err
+	}
 	var imageBytes []byte
-	switch s.effectiveProvider(genCtx, modelItem) {
+	switch provider {
 	case "adobe":
 		b, u, execErr := s.generateAdobeImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
 		if execErr != nil {
@@ -849,7 +855,12 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	// API-key (noStore) requests return the upstream video URL directly.
 	// downloadResult=false skips the download. grok asset URLs are auth-gated
 	// (a plain GET 403s) → gatedVideoURL routes them through the /content proxy.
-	prov := s.effectiveProvider(genCtx, modelItem)
+	prov, err := s.requestProvider(genCtx, modelItem, in.AccountID)
+	if err != nil {
+		_ = s.refundIfNeeded(ctx, principal, eventID, price)
+		_ = s.events.UpdateStatus(ctx, eventID, "failed", err.Error(), 0)
+		return nil, err
+	}
 	urlOnly := noStore
 	gatedVideoURL := prov == "grok"
 	var videoBytes []byte
@@ -1313,7 +1324,11 @@ func (s *V1Service) resolveImage(ctx context.Context, principal *APIPrincipal, i
 	// effective provider: a custom upstream serving this model id routes to
 	// "custom" (effectiveProvider only returns it when such an account exists, so
 	// the precheck is satisfied); otherwise check the native provider pool.
-	if eff := s.effectiveProvider(ctx, modelItem); !providerHasUpstreamAccountPrecheck(eff) {
+	eff, err := s.requestProvider(ctx, modelItem, in.AccountID)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	if strings.TrimSpace(in.AccountID) == "" && !providerHasUpstreamAccountPrecheck(eff) {
 		if ok, err := s.hasActiveProviderToken(ctx, eff, "image"); err != nil {
 			return nil, "", "", 0, err
 		} else if !ok {
@@ -1386,12 +1401,16 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 		return nil, "", "", "", 0, ErrUnknownModel
 	}
 	// Fail fast before charging — effective provider (upstream by id, else native).
-	if eff := s.effectiveProvider(ctx, modelItem); eff == "upstream" {
-		// upstream adapter serves this id (effectiveProvider guaranteed it) — precheck ok
-	} else if ok, err := s.hasActiveProviderToken(ctx, eff, "video"); err != nil {
+	eff, err := s.requestProvider(ctx, modelItem, in.AccountID)
+	if err != nil {
 		return nil, "", "", "", 0, err
-	} else if !ok {
-		return nil, "", "", "", 0, ErrNoProviderAccount
+	}
+	if strings.TrimSpace(in.AccountID) == "" && eff != "upstream" {
+		if ok, err := s.hasActiveProviderToken(ctx, eff, "video"); err != nil {
+			return nil, "", "", "", 0, err
+		} else if !ok {
+			return nil, "", "", "", 0, ErrNoProviderAccount
+		}
 	}
 	refLimit := modelItem.MaxReferenceImages
 	if refLimit <= 0 {
@@ -2034,22 +2053,43 @@ func upstreamAdapterType(acct *model.TokenAccount) string {
 	}
 }
 
+func (s *V1Service) upstreamAccounts(ctx context.Context) ([]model.TokenAccount, error) {
+	var accounts []model.TokenAccount
+	customAccts, err := s.tokens.ListByPool(ctx, "custom")
+	if err != nil {
+		return nil, err
+	}
+	accounts = append(accounts, customAccts...)
+	ycyAccts, err := s.tokens.ListByPool(ctx, "ycy")
+	if err != nil {
+		return nil, err
+	}
+	accounts = append(accounts, ycyAccts...)
+	return accounts, nil
+}
+
 // upstreamActive returns active upstream accounts that serve the given model,
 // regardless of adapter type. Combines the old customActive and ycyActive logic.
 func (s *V1Service) upstreamActive(ctx context.Context, modelID string) ([]model.TokenAccount, error) {
-	// Get all custom and ycy accounts
-	var accounts []model.TokenAccount
-	customAccts, err := s.tokens.ListByPool(ctx, "custom")
-	if err == nil {
-		accounts = append(accounts, customAccts...)
+	accounts, err := s.upstreamAccounts(ctx)
+	if err != nil {
+		return nil, err
 	}
-	ycyAccts, err := s.tokens.ListByPool(ctx, "ycy")
-	if err == nil {
-		accounts = append(accounts, ycyAccts...)
-	}
+	return selectUpstreamCandidates(accounts, modelID, ""), nil
+}
 
+// selectUpstreamCandidates preserves normal scheduling for unpinned requests,
+// while allowing an admin to probe one inactive or limited upstream account.
+func selectUpstreamCandidates(accounts []model.TokenAccount, modelID, accountID string) []model.TokenAccount {
+	id := strings.TrimSpace(accountID)
 	var active []model.TokenAccount
 	for _, acct := range accounts {
+		if id != "" {
+			if acct.ID == id && strings.TrimSpace(acct.Value) != "" && upstreamAccountDeclares(acct, modelID) {
+				return []model.TokenAccount{acct}
+			}
+			continue
+		}
 		if upstreamAccountServes(acct, modelID) {
 			active = append(active, acct)
 		}
@@ -2063,13 +2103,17 @@ func (s *V1Service) upstreamActive(ctx context.Context, modelID string) ([]model
 		return active[i].ID < active[j].ID
 	})
 
-	return active, nil
+	return active
 }
 
 func upstreamAccountServes(acct model.TokenAccount, modelID string) bool {
 	if acct.Status != "active" || acct.Dead || strings.TrimSpace(acct.Value) == "" {
 		return false
 	}
+	return upstreamAccountDeclares(acct, modelID)
+}
+
+func upstreamAccountDeclares(acct model.TokenAccount, modelID string) bool {
 	if acct.Meta == nil || strings.TrimSpace(stringValue(acct.Meta["base_url"])) == "" {
 		return false
 	}
@@ -2100,11 +2144,11 @@ func (s *V1Service) dispatchUpstreamImage(ctx context.Context, eventID string, m
 		return nil, "", err
 	}
 
-	active, err := s.upstreamActive(ctx, modelItem.ID)
+	accounts, err := s.upstreamAccounts(ctx)
 	if err != nil {
 		return nil, "", err
 	}
-	active = pinTestAccount(active, active, in.AccountID)
+	active := selectUpstreamCandidates(accounts, modelItem.ID, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
@@ -2192,11 +2236,11 @@ func (s *V1Service) dispatchUpstreamVideo(ctx context.Context, eventID string, m
 		return nil, "", err
 	}
 
-	active, err := s.upstreamActive(ctx, modelItem.ID)
+	accounts, err := s.upstreamAccounts(ctx)
 	if err != nil {
 		return nil, "", err
 	}
-	active = pinTestAccount(active, active, in.AccountID)
+	active := selectUpstreamCandidates(accounts, modelItem.ID, in.AccountID)
 	if len(active) == 0 {
 		return nil, "", ErrNoProviderAccount
 	}
@@ -2314,6 +2358,36 @@ func stringSliceValue(v interface{}) []string {
 	default:
 		return nil
 	}
+}
+
+// requestProvider keeps automatic upstream overrides for normal traffic, but an
+// admin account test must exercise the selected account. Upstream accounts may
+// test any model they declare; native accounts may only test their model's pool.
+func (s *V1Service) requestProvider(ctx context.Context, modelItem *model.ModelConfig, accountID string) (string, error) {
+	id := strings.TrimSpace(accountID)
+	if id == "" {
+		return s.effectiveProvider(ctx, modelItem), nil
+	}
+
+	accounts, err := s.upstreamAccounts(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(selectUpstreamCandidates(accounts, modelItem.ID, id)) > 0 {
+		return "upstream", nil
+	}
+	if modelItem.Provider == "custom" || modelItem.Provider == "ycy" || modelItem.Provider == "upstream" {
+		return "", ErrNoProviderAccount
+	}
+
+	item, err := s.tokens.Get(ctx, modelItem.Provider, id)
+	if err == nil && strings.TrimSpace(item.Value) != "" {
+		return modelItem.Provider, nil
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", err
+	}
+	return "", ErrNoProviderAccount
 }
 
 // effectiveProvider routes a model to the "custom" upstream whenever a custom
