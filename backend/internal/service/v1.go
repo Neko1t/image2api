@@ -29,6 +29,7 @@ import (
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 	"backend/internal/storage"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -388,18 +389,18 @@ func (s *V1Service) ListModels(ctx context.Context) ([]map[string]any, error) {
 }
 
 func (s *V1Service) PrepareImageRequest(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
-	return s.prepareImageExecution(ctx, principal, in, "v1", true)
+	return s.prepareImageExecution(ctx, principal, in, "v1", true, "")
 }
 
-func (s *V1Service) prepareSessionImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
-	return s.prepareImageExecution(ctx, principal, in, "user", true)
+func (s *V1Service) prepareSessionImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, requestID string) (map[string]any, error) {
+	return s.prepareImageExecution(ctx, principal, in, "user", true, requestID)
 }
 
 func (s *V1Service) prepareAdminTestImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
-	return s.prepareImageExecution(ctx, principal, in, "admin", false)
+	return s.prepareImageExecution(ctx, principal, in, "admin", false, "")
 }
 
-func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool) (map[string]any, error) {
+func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool, requestID string) (map[string]any, error) {
 	// Detach the whole execution from the request lifecycle. The frontend tracks
 	// progress by polling /jobs/mine, so a client disconnect — or an nginx/CDN
 	// gateway timeout on the slow synchronous response — must NOT cancel an
@@ -428,31 +429,122 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	}
 	genCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
+	// API-key (source "v1") requests don't persist the output; user and admin
+	// paths store the generated artifact for the gallery/logs.
+	noStore := source == "v1"
 
-	// Per-user concurrency gate (画图台 + API key combined). Admin model-tests are
-	// exempt. Held for the whole generation; released on return.
-	if source != "admin" && principal != nil && principal.User != nil {
-		slot := randomUpper(12)
-		if !s.userAcquire(ctx, principal.User, slot) {
+	var (
+		modelItem                      *model.ModelConfig
+		resolution, aspectRatio        string
+		priceValue                     float64
+		eventID, relativePath, fileURL string
+		idempotentSession              = source == "user" && charge
+		ownsUserSlot                   bool
+		err                            error
+	)
+	if idempotentSession {
+		if _, err := uuid.Parse(strings.TrimSpace(requestID)); err != nil {
+			return nil, ErrRequestIDRequired
+		}
+		requestID = strings.TrimSpace(requestID)
+		modelItem, resolution, aspectRatio, priceValue, err = s.resolveImage(ctx, principal, in)
+		if err != nil {
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
+			return nil, err
+		}
+		refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
+		if err != nil {
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
+			return nil, err
+		}
+		payloadHash := hashSessionImagePayload(modelItem.ID, in.Prompt, aspectRatio, resolution, in.DeAI, refs)
+		userID := principal.User.ID
+		if existing, lookupErr := s.events.GetSessionImageJobByRequest(ctx, userID, requestID); lookupErr != nil {
+			return nil, lookupErr
+		} else if existing != nil {
+			if existing.PayloadHash != payloadHash {
+				return nil, ErrIdempotencyConflict
+			}
+			return sessionImageResponse(existing, principalCredits(principal), true), nil
+		}
+
+		// Use request_id as the slot token. A concurrent replay refreshes the same
+		// Redis slot and the creator alone releases it after execution.
+		if !s.userAcquire(ctx, principal.User, requestID) {
 			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
 			return nil, ErrUserConcurrencyFull
 		}
-		defer s.userRelease(ctx, principal.User.ID, slot)
-	}
+		ownsUserSlot = true
+		defer func() {
+			if ownsUserSlot {
+				s.userRelease(ctx, principal.User.ID, requestID)
+			}
+		}()
 
-	modelItem, resolution, aspectRatio, price, err := s.prepareImage(ctx, principal, in, charge)
-	if err != nil {
-		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
-		return nil, err
+		fileURL, relativePath = s.allocateOutput(principal, "png", in.BaseURL)
+		now := time.Now()
+		event := &model.EventLog{
+			ID: "evt-" + randomUpper(12), TS: now, Kind: "image", Status: "pending",
+			Model: modelItem.ID, Provider: modelItem.Provider, Prompt: strings.TrimSpace(in.Prompt),
+			Ratio: aspectRatio, Resolution: resolution, Refs: len(refs), DeAI: in.DeAI,
+			Source: source, Cost: priceValue, File: relativePath, UserID: userID,
+			RequestID: requestID, PayloadHash: payloadHash, JobType: sessionImageJobType,
+			JobStage: "running", CreatedAt: now, UpdatedAt: now,
+		}
+		created, createErr := s.events.CreateSessionImageJob(ctx, event)
+		if createErr != nil {
+			// A conflicting replay may be racing the first request and therefore
+			// owns this shared slot token. Do not release it in that case.
+			if !errors.Is(createErr, repo.ErrIdempotencyConflict) {
+				ownsUserSlot = false
+				s.userRelease(ctx, userID, requestID)
+			}
+			switch {
+			case errors.Is(createErr, repo.ErrIdempotencyConflict):
+				return nil, ErrIdempotencyConflict
+			case errors.Is(createErr, repo.ErrInsufficientCredits):
+				return nil, ErrInsufficientFunds
+			default:
+				return nil, createErr
+			}
+		}
+		if !created.Created {
+			ownsUserSlot = false
+			return sessionImageResponse(created.Event, created.Credits, true), nil
+		}
+		principal.User.Credits = created.Credits
+		priceValue = created.Event.Cost
+		eventID = created.Event.ID
+	} else {
+		// Per-user concurrency gate (画图台 + API key combined). Admin model-tests
+		// are exempt. Held for the whole generation; released on return.
+		if source != "admin" && principal != nil && principal.User != nil {
+			slot := randomUpper(12)
+			if !s.userAcquire(ctx, principal.User, slot) {
+				s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
+				return nil, ErrUserConcurrencyFull
+			}
+			defer s.userRelease(ctx, principal.User.ID, slot)
+		}
+		modelItem, resolution, aspectRatio, priceValue, err = s.prepareImage(ctx, principal, in, charge)
+		if err != nil {
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
+			return nil, err
+		}
+		if !noStore {
+			fileURL, relativePath = s.allocateOutput(principal, "png", in.BaseURL)
+		}
+		eventID, err = s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", len(in.ReferenceImages), priceValue, relativePath, source, nil, in.DeAI)
+		if err != nil {
+			return nil, err
+		}
 	}
-	refCount := len(in.ReferenceImages)
+	price := priceValue
 	// API-key (source "v1") requests don't persist the output: we return the image
 	// as base64 inline (OpenAI gpt-image-1 also returns only b64_json) and never
 	// upload to RustFS, so there's no URL. The event is still logged (empty file)
 	// for usage; the customer logs page hides source="v1" rows.
-	noStore := source == "v1"
-	var fileURL, relativePath string
-	if !noStore {
+	if !noStore && relativePath == "" {
 		fileURL, relativePath = s.allocateOutput(principal, "png", in.BaseURL)
 	}
 	// upstreamURL is the provider's original artifact URL. For API-key (source
@@ -462,10 +554,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// ({base}/v1/images/{eventID}/content) that re-fetches with the account token.
 	var upstreamURL string
 	var gatedURL bool
-	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI)
-	if err != nil {
-		return nil, err
-	}
 	// Register so the maintenance sweep can cancel this generation if it abandons
 	// the row; deregister on return.
 	s.inflight.Add(eventID, cancel)
@@ -686,6 +774,8 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	return map[string]any{
 		"created":    time.Now().Unix(),
 		"data":       []map[string]any{{"url": fileURL, "b64_json": nil}},
+		"event_id":   eventID,
+		"request_id": requestID,
 		"model":      modelItem.EffectiveName(),
 		"provider":   modelItem.Provider,
 		"kind":       "image",
@@ -1179,6 +1269,31 @@ func (s *V1Service) hasActiveProviderToken(ctx context.Context, provider, kind s
 }
 
 func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, charge bool) (*model.ModelConfig, string, string, float64, error) {
+	modelItem, resolution, aspectRatio, price, err := s.resolveImage(ctx, principal, in)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	if !charge || principal == nil || principal.User == nil {
+		return modelItem, resolution, aspectRatio, 0, nil
+	}
+	updated, debited, err := s.users.TryDebitCredits(ctx, principal.User.ID, price)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	if !debited {
+		if updated != nil {
+			principal.User = updated
+		}
+		return nil, "", "", 0, ErrInsufficientFunds
+	}
+	principal.User = updated
+	return modelItem, resolution, aspectRatio, price, nil
+}
+
+// resolveImage validates and prices an image request without charging. The
+// idempotent session path uses this result to hash the normalized payload before
+// atomically debiting credits and creating its event row.
+func (s *V1Service) resolveImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (*model.ModelConfig, string, string, float64, error) {
 	modelID := strings.TrimSpace(in.Model)
 	prompt := strings.TrimSpace(in.Prompt)
 	if modelID == "" || prompt == "" {
@@ -1241,10 +1356,12 @@ func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, i
 	if in.DeAI {
 		surcharge = s.deaiSurcharge(ctx, resolution)
 	}
-	price, err := s.chargeForModel(ctx, principal, modelItem, "image", resolution, "", surcharge, charge)
-	if err != nil {
-		return nil, "", "", 0, err
+	agent := principal != nil && principal.User != nil && principal.User.Role == "agent"
+	price, ok := modelPrice(modelItem, "image", resolution, "", agent)
+	if !ok {
+		return nil, "", "", 0, ErrUnsupportedParams
 	}
+	price += surcharge
 	return modelItem, resolution, aspectRatio, price, nil
 }
 

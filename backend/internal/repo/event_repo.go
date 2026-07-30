@@ -488,8 +488,19 @@ type CreateYCYJobResult struct {
 // the durable pending event. Locking the user serializes concurrent submissions
 // from the same owner; the partial unique index remains the database backstop.
 func (r *EventRepository) CreateYCYJob(ctx context.Context, item *model.EventLog) (*CreateYCYJobResult, error) {
+	return r.createIdempotentJob(ctx, item, "ycy_video")
+}
+
+// CreateSessionImageJob applies the same atomic admission to user-side image
+// generations. It is deliberately a separate job type so YCY maintenance never
+// attempts to process image rows.
+func (r *EventRepository) CreateSessionImageJob(ctx context.Context, item *model.EventLog) (*CreateYCYJobResult, error) {
+	return r.createIdempotentJob(ctx, item, "session_image")
+}
+
+func (r *EventRepository) createIdempotentJob(ctx context.Context, item *model.EventLog, jobType string) (*CreateYCYJobResult, error) {
 	if item == nil || strings.TrimSpace(item.UserID) == "" || strings.TrimSpace(item.RequestID) == "" {
-		return nil, errors.New("invalid ycy job")
+		return nil, errors.New("invalid idempotent job")
 	}
 	result := &CreateYCYJobResult{}
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -499,7 +510,7 @@ func (r *EventRepository) CreateYCYJob(ctx context.Context, item *model.EventLog
 		}
 
 		var existing model.EventLog
-		err := tx.Where("user_id = ? AND request_id = ? AND job_type = ?", item.UserID, item.RequestID, "ycy_video").First(&existing).Error
+		err := tx.Where("user_id = ? AND request_id = ? AND job_type = ?", item.UserID, item.RequestID, jobType).First(&existing).Error
 		switch {
 		case err == nil:
 			if existing.PayloadHash != item.PayloadHash {
@@ -534,15 +545,29 @@ func (r *EventRepository) CreateYCYJob(ctx context.Context, item *model.EventLog
 		return nil, err
 	}
 	if result.Created {
-		r.incrCounters(ctx, map[string]int64{"total": 1, "video": 1})
+		deltas := map[string]int64{"total": 1}
+		if item.Kind == "video" {
+			deltas["video"] = 1
+		} else if item.Kind == "image" {
+			deltas["image"] = 1
+		}
+		r.incrCounters(ctx, deltas)
 	}
 	return result, nil
 }
 
 func (r *EventRepository) GetYCYJobByRequest(ctx context.Context, userID, requestID string) (*model.EventLog, error) {
+	return r.GetIdempotentJobByRequest(ctx, userID, requestID, "ycy_video")
+}
+
+func (r *EventRepository) GetSessionImageJobByRequest(ctx context.Context, userID, requestID string) (*model.EventLog, error) {
+	return r.GetIdempotentJobByRequest(ctx, userID, requestID, "session_image")
+}
+
+func (r *EventRepository) GetIdempotentJobByRequest(ctx context.Context, userID, requestID, jobType string) (*model.EventLog, error) {
 	var item model.EventLog
 	err := r.db.WithContext(ctx).
-		Where("user_id = ? AND request_id = ? AND job_type = ?", userID, requestID, "ycy_video").
+		Where("user_id = ? AND request_id = ? AND job_type = ?", userID, requestID, jobType).
 		First(&item).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil

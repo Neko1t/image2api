@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	ErrRequestIDRequired   = errors.New("request_id is required for YCY video generation")
+	ErrRequestIDRequired   = errors.New("request_id is required for user generation")
 	ErrIdempotencyConflict = errors.New("request_id was already used with different parameters")
 	ErrYCYBindingAmbiguous = errors.New("model is bound to both YCY and another upstream adapter")
 )

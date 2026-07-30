@@ -395,7 +395,7 @@ async function run() {
 async function fireOne() {
   // Snapshot the form NOW — concurrent tasks keep their own params even if the
   // user edits the form (or fires another batch) while this one runs.
-  const requestId = mode.value === 'video' ? crypto.randomUUID() : ''
+  const requestId = crypto.randomUUID()
   const task = {
     id: requestId || Math.random().toString(36).slice(2, 10),
     request_id: requestId,
@@ -428,10 +428,8 @@ async function fireOne() {
   const payload = {
     model: task.model, prompt: task.prompt, ratio: task.ratio, resolution: task.resolution,
   }
-  if (task.kind === 'video') {
-    payload.duration = task.duration
-    payload.request_id = task.request_id
-  }
+  payload.request_id = task.request_id
+  if (task.kind === 'video') payload.duration = task.duration
   if (task.kind === 'image' && task.deai) payload.deai = true
   if (refsSnapshot.length) {
     const refs = await Promise.all(refsSnapshot.map(refToBase64))
@@ -465,17 +463,11 @@ async function fireOne() {
       task.status = 'failed'
       task.error = r.data?.detail || `失败 (${r.status})`
     }
-  } catch (e) {
-    if (task.kind === 'video') {
-      // The POST outcome is unknown. Keep request_id stable while history
-      // reconciles any durable job that the server already admitted.
-      task.status = 'confirming'
-      task.error = ''
-    } else {
-      await refreshMe()
-      task.status = 'failed'
-      task.error = String(e)
-    }
+  } catch {
+    // The POST outcome is unknown. Keep request_id stable while history
+    // reconciles any durable job that the server already admitted.
+    task.status = 'confirming'
+    task.error = ''
   }
   loadHistory()
 }

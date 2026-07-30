@@ -114,8 +114,8 @@ type EventLog struct {
 	ElapsedMS int    `gorm:"not null;default:0"`
 	File      string `gorm:"size:500;index"`
 	Error     string `gorm:"type:text"`
-	// Durable user-side YCY video job metadata. Other generation paths leave
-	// these fields empty and continue using the existing synchronous lifecycle.
+	// Durable user-side YCY video and session-image job metadata. Other generation
+	// paths leave these fields empty and continue using the existing lifecycle.
 	RequestID         string     `gorm:"size:64;index"`
 	PayloadHash       string     `gorm:"size:64"`
 	JobType           string     `gorm:"size:32;index"`
