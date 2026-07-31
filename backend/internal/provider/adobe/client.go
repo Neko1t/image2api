@@ -58,9 +58,8 @@ var profileURLs = []string{
 }
 
 type Client struct {
-	apiKey       string
-	proxy        string
-	arpSessionID string // cached per-client, reused across requests (matches adobe2api)
+	apiKey string
+	proxy  string
 }
 
 func NewClient(apiKey, proxy string) *Client {
@@ -70,17 +69,6 @@ func NewClient(apiKey, proxy string) *Client {
 	}
 }
 
-// getARPSessionID returns a cached ARP session id matching adobe2api's format:
-// base64({"sid":"<uuid>","ftr":"<hex16>_<ts_ms>_<pid>_dUAL43-mnts-ants-d4_31ck__tt"})
-// Generated once per client and reused — adobe2api reuses the same session id per
-// token/profile instead of rotating every request.
-func (c *Client) getARPSessionID() string {
-	if c.arpSessionID != "" {
-		return c.arpSessionID
-	}
-	c.arpSessionID = buildARPSessionID()
-	return c.arpSessionID
-}
 
 func (c *Client) SetProxy(proxy string) {
 	c.proxy = strings.TrimSpace(proxy)
@@ -300,6 +288,7 @@ func (c *Client) FetchAccountProfile(ctx context.Context, token string) (map[str
 				"user-agent",
 			},
 		}
+		defer ReleasePID(token)
 
 		resp, err := sess.client.Do(req)
 		if err != nil {
@@ -470,7 +459,7 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {c.getARPSessionID()},
+		"x-arp-session-id":   {buildARPSessionID(token)},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -569,6 +558,7 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 				"user-agent",
 			},
 		}
+		defer ReleasePID(token)
 
 		resp, err := sess.client.Do(req)
 		if err != nil {
@@ -648,7 +638,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {c.getARPSessionID()},
+		"x-arp-session-id":   {buildARPSessionID(token)},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -753,6 +743,7 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 				"user-agent",
 			},
 		}
+		defer ReleasePID(token)
 
 		resp, err := sess.client.Do(req)
 		if err != nil {
