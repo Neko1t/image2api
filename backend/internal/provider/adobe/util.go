@@ -6,12 +6,27 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"math/big"
+	"net/url"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// adobeUserIDPat matches Adobe IMS user IDs embedded in cookies (e.g.
+// "4BDA81F069FC6DA40A495FAB@AdobeID").
+var adobeUserIDPat = regexp.MustCompile(`[A-Fa-f0-9]{20,}@AdobeID`)
+
+func extractUserIDFromCookie(cookie string) string {
+	decoded, err := url.QueryUnescape(cookie)
+	if err != nil {
+		decoded = cookie
+	}
+	return adobeUserIDPat.FindString(decoded)
+}
 
 func stringValue(v any) string {
 	switch x := v.(type) {
@@ -82,12 +97,14 @@ func decodeJWTPayload(token string) map[string]any {
 }
 
 func buildARPSessionID() string {
-	// Every field is randomized per request: no embedded process pid or
-	// hardcoded constant suffix (those would make all requests from this
-	// install share a static feature — a cross-account correlation point).
+	// Matches adobe2api's format exactly:
+	// base64({"sid":"<uuid>","ftr":"<hex16>_<ts_ms>_<pid>_dUAL43-mnts-ants-d4_31ck__tt"})
+	// Two fields only (no "ark") — mirrors what a real browser session sends.
+	pid := os.Getpid()
+	ftr := randomHex(16) + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(pid) + "_dUAL43-mnts-ants-d4_31ck__tt"
 	raw := map[string]any{
 		"sid": uuid.NewString(),
-		"ftr": randomHex(16) + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(randomInt(1000, 999999)) + "_" + randomHex(8),
+		"ftr": ftr,
 	}
 	b, _ := json.Marshal(raw)
 	return base64.StdEncoding.EncodeToString(b)

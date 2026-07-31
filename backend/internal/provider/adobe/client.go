@@ -58,8 +58,9 @@ var profileURLs = []string{
 }
 
 type Client struct {
-	apiKey string
-	proxy  string
+	apiKey       string
+	proxy        string
+	arpSessionID string // cached per-client, reused across requests (matches adobe2api)
 }
 
 func NewClient(apiKey, proxy string) *Client {
@@ -67,6 +68,18 @@ func NewClient(apiKey, proxy string) *Client {
 		apiKey: defaultString(apiKey, clientID),
 		proxy:  strings.TrimSpace(proxy),
 	}
+}
+
+// getARPSessionID returns a cached ARP session id matching adobe2api's format:
+// base64({"sid":"<uuid>","ftr":"<hex16>_<ts_ms>_<pid>_dUAL43-mnts-ants-d4_31ck__tt"})
+// Generated once per client and reused — adobe2api reuses the same session id per
+// token/profile instead of rotating every request.
+func (c *Client) getARPSessionID() string {
+	if c.arpSessionID != "" {
+		return c.arpSessionID
+	}
+	c.arpSessionID = buildARPSessionID()
+	return c.arpSessionID
 }
 
 func (c *Client) SetProxy(proxy string) {
@@ -447,8 +460,8 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		"x-api-key":          {c.apiKey},
 		"content-type":       {"application/json"},
 		"accept":             {"*/*"},
-		"origin":             {"https://firefly.adobe.com"},
-		"referer":            {"https://firefly.adobe.com/"},
+		"origin":             {"https://new.express.adobe.com"},
+		"referer":            {"https://new.express.adobe.com/"},
 		"accept-language":    {"en-US,en;q=0.9"},
 		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
@@ -457,7 +470,7 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {buildARPSessionID()},
+		"x-arp-session-id":   {c.getARPSessionID()},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -516,16 +529,16 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		return respBody, "", err
 	}
 	if override := strings.TrimSpace(resp.Header.Get("x-override-status-link")); override != "" {
-		return respBody, override, nil
+		return respBody, normalizePollURL(override), nil
 	}
 	if links, ok := payloadResp["links"].(map[string]any); ok {
 		if result, ok := links["result"].(map[string]any); ok {
 			if href := strings.TrimSpace(stringValue(result["href"])); href != "" {
-				return respBody, href, nil
+				return respBody, normalizePollURL(href), nil
 			}
 		}
 		if href := strings.TrimSpace(stringValue(links["result"])); href != "" {
-			return respBody, href, nil
+			return respBody, normalizePollURL(href), nil
 		}
 	}
 	return respBody, "", errors.New("submit ok but no poll url")
@@ -545,8 +558,8 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 		req.Header = http.Header{
 			"authorization": {"Bearer " + strings.TrimSpace(token)},
 			"accept":        {"*/*"},
-			"origin":        {"https://firefly.adobe.com"},
-			"referer":       {"https://firefly.adobe.com/"},
+			"origin":        {"https://new.express.adobe.com"},
+			"referer":       {"https://new.express.adobe.com/"},
 			"user-agent":    {sess.fp.userAgent},
 			http.HeaderOrderKey: {
 				"authorization",
@@ -625,8 +638,8 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		"x-api-key":          {c.apiKey},
 		"content-type":       {"application/json"},
 		"accept":             {"*/*"},
-		"origin":             {"https://firefly.adobe.com"},
-		"referer":            {"https://firefly.adobe.com/"},
+		"origin":             {"https://new.express.adobe.com"},
+		"referer":            {"https://new.express.adobe.com/"},
 		"accept-language":    {"en-US,en;q=0.9"},
 		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
@@ -635,7 +648,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {buildARPSessionID()},
+		"x-arp-session-id":   {c.getARPSessionID()},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -700,16 +713,16 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		return respBody, "", err
 	}
 	if override := strings.TrimSpace(resp.Header.Get("x-override-status-link")); override != "" {
-		return respBody, normalizeVideoPollURL(override), nil
+		return respBody, normalizePollURL(override), nil
 	}
 	if links, ok := payloadResp["links"].(map[string]any); ok {
 		if result, ok := links["result"].(map[string]any); ok {
 			if href := strings.TrimSpace(stringValue(result["href"])); href != "" {
-				return respBody, normalizeVideoPollURL(href), nil
+				return respBody, normalizePollURL(href), nil
 			}
 		}
 		if href := strings.TrimSpace(stringValue(links["result"])); href != "" {
-			return respBody, normalizeVideoPollURL(href), nil
+			return respBody, normalizePollURL(href), nil
 		}
 	}
 	return respBody, "", errors.New("video submit ok but no poll url")
@@ -729,8 +742,8 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 		req.Header = http.Header{
 			"authorization": {"Bearer " + strings.TrimSpace(token)},
 			"accept":        {"*/*"},
-			"origin":        {"https://firefly.adobe.com"},
-			"referer":       {"https://firefly.adobe.com/"},
+			"origin":        {"https://new.express.adobe.com"},
+			"referer":       {"https://new.express.adobe.com/"},
 			"user-agent":    {sess.fp.userAgent},
 			http.HeaderOrderKey: {
 				"authorization",
@@ -949,7 +962,14 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 		return nil, ErrAdobeCookieEmpty
 	}
 
-	body := "client_id=" + clientID + "&guest_allowed=true&scope=" + strings.ReplaceAll(scopeValue, ",", "%2C")
+	// Prefer user_id (HAR behavior); fall back to guest_allowed for first-time login.
+	userID := extractUserIDFromCookie(cookie)
+	var body string
+	if userID != "" {
+		body = "client_id=" + clientID + "&scope=" + strings.ReplaceAll(scopeValue, ",", "%2C") + "&user_id=" + url.QueryEscape(userID)
+	} else {
+		body = "client_id=" + clientID + "&guest_allowed=true&scope=" + strings.ReplaceAll(scopeValue, ",", "%2C")
+	}
 	req, err := http.NewRequest(http.MethodPost, refreshURL, strings.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -960,8 +980,8 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 		"accept-language": {"zh-CN,zh;q=0.9"},
 		"content-type":    {"application/x-www-form-urlencoded;charset=UTF-8"},
 		"cookie":          {cookie},
-		"origin":          {"https://firefly.adobe.com"},
-		"referer":         {"https://firefly.adobe.com/"},
+		"origin":          {"https://new.express.adobe.com"},
+		"referer":         {"https://new.express.adobe.com/"},
 		"user-agent":      {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"accept",
@@ -1033,7 +1053,7 @@ func ExtractAccountID(token string) string {
 	return userID
 }
 
-func normalizeVideoPollURL(raw string) string {
+func normalizePollURL(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return raw
 	}
