@@ -1550,6 +1550,10 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			})
 			return data, nil, false, false
 		}
+		if errors.Is(err, adobe.ErrAuthPermanent) {
+			s.markTokenDead(ctx, pool, token, kind)
+			return nil, err, true, false
+		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
 		if isQuota {
 			s.markTokenFailure(ctx, pool, token, kind, false, true)
