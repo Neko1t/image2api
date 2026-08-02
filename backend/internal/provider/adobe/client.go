@@ -38,6 +38,12 @@ var (
 	ErrQuotaExhausted    = errors.New("adobe quota exhausted")
 	ErrTemporaryUpstream = errors.New("adobe upstream temporary error")
 	ErrDeadUpstream      = errors.New("adobe upstream fatal error")
+	// ErrVideoSubmitAmbiguous means the submit outcome is unknown: Adobe may have
+	// accepted the task even though the client could not recover its poll URL.
+	ErrVideoSubmitAmbiguous = errors.New("adobe video submit outcome unknown")
+	// ErrVideoTaskSubmitted means Adobe returned a poll URL and a later stage
+	// failed. Callers must never retry the whole generation on another account.
+	ErrVideoTaskSubmitted = errors.New("adobe video task already submitted")
 	// ErrContentRejected is Adobe's content-safety filter refusing the prompt or
 	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
 	// the account's — every account rejects the same content — so the caller must
@@ -274,7 +280,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspec
 	_ = respBody
 	meta, data, pollErr := c.pollVideo(ctx, pollSess, token, pollURL, downloadResult)
 	if pollErr != nil {
-		return nil, nil, pollErr
+		return nil, nil, fmt.Errorf("%w: %v", ErrVideoTaskSubmitted, pollErr)
 	}
 	return data, meta, nil
 }
@@ -691,13 +697,13 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 
 	resp, err := sess.client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+		return nil, "", fmt.Errorf("%w: %v", ErrVideoSubmitAmbiguous, err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("%w: read response: %v", ErrVideoSubmitAmbiguous, err)
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		if strings.EqualFold(resp.Header.Get("x-access-error"), "taste_exhausted") {
@@ -728,7 +734,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 
 	var payloadResp map[string]any
 	if err := json.Unmarshal(respBody, &payloadResp); err != nil {
-		return respBody, "", err
+		return respBody, "", fmt.Errorf("%w: invalid response", ErrVideoSubmitAmbiguous)
 	}
 	if override := strings.TrimSpace(resp.Header.Get("x-override-status-link")); override != "" {
 		return respBody, normalizePollURL(override), nil
@@ -743,7 +749,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 			return respBody, normalizePollURL(href), nil
 		}
 	}
-	return respBody, "", errors.New("video submit ok but no poll url")
+	return respBody, "", fmt.Errorf("%w: no poll url", ErrVideoSubmitAmbiguous)
 }
 
 func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {

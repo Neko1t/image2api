@@ -81,7 +81,7 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 			AspectRatio:     in.Ratio,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
-		})
+		}, in.RequestID)
 		if err != nil {
 			return nil, err
 		}

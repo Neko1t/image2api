@@ -86,6 +86,10 @@ func NewApp(ctx context.Context) (*App, error) {
 		`ON event_logs (user_id, request_id) WHERE job_type = 'session_image' AND request_id <> ''`).Error; err != nil {
 		return nil, fmt.Errorf("session image idempotency index: %w", err)
 	}
+	if err := db.WithContext(ctx).Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_event_session_video_user_request ` +
+		`ON event_logs (user_id, request_id) WHERE job_type = 'session_video' AND request_id <> ''`).Error; err != nil {
+		return nil, fmt.Errorf("session video idempotency index: %w", err)
+	}
 	if err := db.WithContext(ctx).Exec(`CREATE INDEX IF NOT EXISTS idx_event_ycy_due ` +
 		`ON event_logs (next_poll_at) WHERE job_type = 'ycy_video' AND status = 'pending'`).Error; err != nil {
 		return nil, fmt.Errorf("ycy event due index: %w", err)

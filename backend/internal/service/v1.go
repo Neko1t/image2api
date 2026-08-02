@@ -793,18 +793,18 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 }
 
 func (s *V1Service) PrepareVideoRequest(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
-	return s.prepareVideoExecution(ctx, principal, in, "v1", true)
+	return s.prepareVideoExecution(ctx, principal, in, "v1", true, "")
 }
 
-func (s *V1Service) prepareSessionVideo(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
-	return s.prepareVideoExecution(ctx, principal, in, "user", true)
+func (s *V1Service) prepareSessionVideo(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, requestID string) (map[string]any, error) {
+	return s.prepareVideoExecution(ctx, principal, in, "user", true, requestID)
 }
 
 func (s *V1Service) prepareAdminTestVideo(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
-	return s.prepareVideoExecution(ctx, principal, in, "admin", false)
+	return s.prepareVideoExecution(ctx, principal, in, "admin", false, "")
 }
 
-func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, source string, charge bool) (map[string]any, error) {
+func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, source string, charge bool, requestID string) (map[string]any, error) {
 	// Detach from the request lifecycle — see prepareImageExecution. `ctx`
 	// (WithoutCancel) carries all bookkeeping; `genCtx` is the cancellable work
 	// context (12-min backstop — video polls up to 10 min — and registered so the
@@ -818,34 +818,117 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	}
 	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
 	defer cancel()
-
-	// Per-user concurrency gate (画图台 + API key combined); admin tests exempt.
-	if source != "admin" && principal != nil && principal.User != nil {
-		slot := randomUpper(12)
-		if !s.userAcquire(ctx, principal.User, slot) {
-			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
-			return nil, ErrUserConcurrencyFull
-		}
-		defer s.userRelease(ctx, principal.User.ID, slot)
-	}
-
-	modelItem, resolution, aspectRatio, duration, price, err := s.prepareVideo(ctx, principal, in, charge)
-	if err != nil {
-		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
-		return nil, err
-	}
-	refCount := len(in.ReferenceImages)
 	// API-key (source "v1") requests return base64 inline and never persist a
 	// file — see prepareImageExecution for the rationale.
 	noStore := source == "v1"
-	var fileURL, relativePath string
-	if !noStore {
+
+	var (
+		modelItem                      *model.ModelConfig
+		resolution, aspectRatio        string
+		duration                       string
+		priceValue                     float64
+		eventID, relativePath, fileURL string
+		idempotentSession              = source == "user" && charge
+		ownsUserSlot                   bool
+		err                            error
+	)
+	if idempotentSession {
+		requestID = strings.TrimSpace(requestID)
+		if _, err := uuid.Parse(requestID); err != nil {
+			return nil, ErrRequestIDRequired
+		}
+		modelItem, resolution, aspectRatio, duration, _, err = s.prepareVideo(ctx, principal, in, false)
+		if err != nil {
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
+			return nil, err
+		}
+		refs, decodeErr := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
+		if decodeErr != nil {
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, decodeErr.Error())
+			return nil, decodeErr
+		}
+		agent := principal != nil && principal.User != nil && principal.User.Role == "agent"
+		var ok bool
+		priceValue, ok = modelPrice(modelItem, "video", resolution, duration, agent)
+		if !ok {
+			return nil, ErrUnsupportedParams
+		}
+		payloadHash := hashSessionVideoPayload(modelItem.ID, in.Prompt, aspectRatio, resolution, duration, refs)
+		userID := principal.User.ID
+		if existing, lookupErr := s.events.GetSessionVideoJobByRequest(ctx, userID, requestID); lookupErr != nil {
+			return nil, lookupErr
+		} else if existing != nil {
+			if existing.PayloadHash != payloadHash {
+				return nil, ErrIdempotencyConflict
+			}
+			return sessionVideoResponse(existing, principalCredits(principal), true), nil
+		}
+
+		if !s.userAcquire(ctx, principal.User, requestID) {
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
+			return nil, ErrUserConcurrencyFull
+		}
+		ownsUserSlot = true
+		defer func() {
+			if ownsUserSlot {
+				s.userRelease(ctx, principal.User.ID, requestID)
+			}
+		}()
+
 		fileURL, relativePath = s.allocateOutput(principal, "mp4", in.BaseURL)
+		now := time.Now()
+		event := &model.EventLog{
+			ID: "evt-" + randomUpper(12), TS: now, Kind: "video", Status: "pending",
+			Model: modelItem.ID, Provider: modelItem.Provider, Prompt: strings.TrimSpace(in.Prompt),
+			Ratio: aspectRatio, Resolution: resolution, Duration: duration, Refs: len(refs),
+			Source: source, Cost: priceValue, File: relativePath, UserID: userID,
+			RequestID: requestID, PayloadHash: payloadHash, JobType: sessionVideoJobType,
+			JobStage: "running", CreatedAt: now, UpdatedAt: now,
+		}
+		created, createErr := s.events.CreateSessionVideoJob(ctx, event)
+		if createErr != nil {
+			if errors.Is(createErr, repo.ErrIdempotencyConflict) {
+				ownsUserSlot = false
+				return nil, ErrIdempotencyConflict
+			}
+			ownsUserSlot = false
+			s.userRelease(ctx, userID, requestID)
+			if errors.Is(createErr, repo.ErrInsufficientCredits) {
+				return nil, ErrInsufficientFunds
+			}
+			return nil, createErr
+		}
+		if !created.Created {
+			ownsUserSlot = false
+			return sessionVideoResponse(created.Event, created.Credits, true), nil
+		}
+		principal.User.Credits = created.Credits
+		priceValue = created.Event.Cost
+		eventID = created.Event.ID
+	} else {
+		// Per-user concurrency gate (画图台 + API key combined); admin tests exempt.
+		if source != "admin" && principal != nil && principal.User != nil {
+			slot := randomUpper(12)
+			if !s.userAcquire(ctx, principal.User, slot) {
+				s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
+				return nil, ErrUserConcurrencyFull
+			}
+			defer s.userRelease(ctx, principal.User.ID, slot)
+		}
+		modelItem, resolution, aspectRatio, duration, priceValue, err = s.prepareVideo(ctx, principal, in, charge)
+		if err != nil {
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
+			return nil, err
+		}
+		if !noStore {
+			fileURL, relativePath = s.allocateOutput(principal, "mp4", in.BaseURL)
+		}
+		eventID, err = s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages), priceValue, relativePath, source, nil, false)
+		if err != nil {
+			return nil, err
+		}
 	}
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, refCount, price, relativePath, source, nil, false)
-	if err != nil {
-		return nil, err
-	}
+	price := priceValue
 	// Register so the maintenance sweep can cancel this render if it abandons the
 	// row; deregister on return.
 	s.inflight.Add(eventID, cancel)
@@ -890,7 +973,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 			return nil, ErrProviderAuth
 		case errors.Is(execErr, adobe.ErrQuotaExhausted), errors.Is(execErr, runway.ErrQuotaExhausted), errors.Is(execErr, grok.ErrQuotaExhausted), errors.Is(execErr, adapter.ErrAdapterQuotaExhausted):
 			return nil, ErrProviderQuota
-		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, adapter.ErrAdapterTemporaryUpstream):
+		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, adobe.ErrDeadUpstream), errors.Is(execErr, adobe.ErrVideoSubmitAmbiguous), errors.Is(execErr, adobe.ErrVideoTaskSubmitted), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, adapter.ErrAdapterTemporaryUpstream):
 			return nil, ErrProviderTemporary
 		case errors.Is(execErr, ErrConcurrencyFull):
 			return nil, ErrConcurrencyFull
@@ -966,6 +1049,8 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	return map[string]any{
 		"created":    time.Now().Unix(),
 		"data":       []map[string]any{{"url": fileURL}},
+		"event_id":   eventID,
+		"request_id": requestID,
 		"model":      modelItem.EffectiveName(),
 		"provider":   modelItem.Provider,
 		"kind":       "video",
@@ -1745,6 +1830,13 @@ func adobeErrClass(e error) (bool, bool, bool, bool) {
 	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream), errors.Is(e, adobe.ErrDeadUpstream)
 }
 
+func adobeVideoErrClass(e error) (bool, bool, bool, bool) {
+	if errors.Is(e, adobe.ErrVideoSubmitAmbiguous) || errors.Is(e, adobe.ErrVideoTaskSubmitted) {
+		return false, false, false, false
+	}
+	return adobeErrClass(e)
+}
+
 // noStore url-only mode: adobe returns a presigned image URL (meta["image_url"]);
 // skip the download and return it directly.
 func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
@@ -1870,7 +1962,7 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 			videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
 		}
 		return bytes, genErr
-	}, adobeErrClass, func(id string) (model.TokenAccount, bool) {
+	}, adobeVideoErrClass, func(id string) (model.TokenAccount, bool) {
 		return s.refreshAdobeToken(ctx, id)
 	}, true)
 	return data, videoURL, err

@@ -498,6 +498,12 @@ func (r *EventRepository) CreateSessionImageJob(ctx context.Context, item *model
 	return r.createIdempotentJob(ctx, item, "session_image")
 }
 
+// CreateSessionVideoJob applies atomic admission to synchronous user-side video
+// generations. It is separate from ycy_video so the YCY worker never claims it.
+func (r *EventRepository) CreateSessionVideoJob(ctx context.Context, item *model.EventLog) (*CreateYCYJobResult, error) {
+	return r.createIdempotentJob(ctx, item, "session_video")
+}
+
 func (r *EventRepository) createIdempotentJob(ctx context.Context, item *model.EventLog, jobType string) (*CreateYCYJobResult, error) {
 	if item == nil || strings.TrimSpace(item.UserID) == "" || strings.TrimSpace(item.RequestID) == "" {
 		return nil, errors.New("invalid idempotent job")
@@ -562,6 +568,10 @@ func (r *EventRepository) GetYCYJobByRequest(ctx context.Context, userID, reques
 
 func (r *EventRepository) GetSessionImageJobByRequest(ctx context.Context, userID, requestID string) (*model.EventLog, error) {
 	return r.GetIdempotentJobByRequest(ctx, userID, requestID, "session_image")
+}
+
+func (r *EventRepository) GetSessionVideoJobByRequest(ctx context.Context, userID, requestID string) (*model.EventLog, error) {
+	return r.GetIdempotentJobByRequest(ctx, userID, requestID, "session_video")
 }
 
 func (r *EventRepository) GetIdempotentJobByRequest(ctx context.Context, userID, requestID, jobType string) (*model.EventLog, error) {
