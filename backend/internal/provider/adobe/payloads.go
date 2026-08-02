@@ -52,12 +52,12 @@ func ResolveModelSpec(modelID string) modelSpec {
 		return modelSpec{UpstreamModelID: "gpt-image", UpstreamModelVersion: "2"}
 	case "flux-kontext-max":
 		return modelSpec{UpstreamModelID: "flux", UpstreamModelVersion: "fluxKontextMax"}
-	case "nano-banana-2", "runway-nano-banana-2":
-		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-2"}
-	case "nano-banana-pro", "runway-nano-banana-pro":
-		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-pro"}
-	default:
+	case "nano-banana-2":
 		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-3"}
+	case "nano-banana-pro":
+		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-2"}
+	default:
+		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "gemini-3-pro-image-preview"}
 	}
 }
 
