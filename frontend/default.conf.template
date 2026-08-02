@@ -35,7 +35,14 @@ server {
 
     # ---- API / media / health -> backend ----
     location ^~ /admin/api/ { proxy_pass http://backend:6666; add_header Cache-Control "no-store" always; }
-    location ^~ /images/    { proxy_pass http://backend:6666; }
+    location ^~ /images/ {
+        proxy_pass http://backend:6666;
+        # Generated media URLs are unique. Keep authenticated responses only in
+        # the user's browser briefly so reopening a preview does not download the
+        # same multi-megabyte original again.
+        proxy_hide_header Cache-Control;
+        add_header Cache-Control "private, max-age=300";
+    }
     location = /health      { proxy_pass http://backend:6666; }
     # /v1 is per-API-key authenticated — never cache.
     location ^~ /v1/ {

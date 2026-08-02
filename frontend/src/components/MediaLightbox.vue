@@ -2,7 +2,7 @@
 // Full-screen preview: the enlarged image/video on a dark backdrop, plus a
 // small top-right action row (copy-to-clipboard for images, download for
 // both). Click the dark area (or Esc, handled by the parent) to close.
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 
 const props = defineProps({
@@ -15,16 +15,43 @@ const props = defineProps({
 })
 const emit = defineEmits(['close'])
 
-// Render the image as a CSS background (not <img>) so Edge/Bing shows no
-// "visual search" hover icon. Load it to learn its aspect ratio, then size the
-// div to fit the viewport while preserving ratio — mirrors object-contain.
+// Show the existing lightweight thumbnail immediately, then replace it after
+// the single full-resolution <img> request has downloaded and decoded.
 const imgRatio = ref(1)
-watch(() => props.src, (src) => {
-  if (props.kind !== 'image' || !src) return
-  const im = new Image()
-  im.onload = () => { if (im.naturalHeight) imgRatio.value = im.naturalWidth / im.naturalHeight }
-  im.src = src
+const imageLoaded = ref(false)
+const imageFailed = ref(false)
+const thumbnailSrc = computed(() => {
+  const [path, query] = props.src.split('?', 2)
+  return `${path}.thumb.jpg${query ? `?${query}` : ''}`
+})
+
+watch(() => [props.src, props.kind], () => {
+  imgRatio.value = 1
+  imageLoaded.value = false
+  imageFailed.value = false
 }, { immediate: true })
+
+function onThumbnailLoad(event) {
+  const img = event.currentTarget
+  if (img?.naturalHeight) imgRatio.value = img.naturalWidth / img.naturalHeight
+}
+
+async function onImageLoad(event) {
+  const img = event.currentTarget
+  const loadedSrc = img.getAttribute('src')
+  try {
+    await img.decode?.()
+  } catch {
+    // The load event already confirms usable image data; decoding can reject
+    // when the element is detached while the lightbox is closing.
+  }
+  if (loadedSrc === props.src) imageLoaded.value = true
+}
+
+function onImageError() {
+  imageFailed.value = true
+  flash('原图加载失败')
+}
 
 const toast = ref('')
 let toastTimer = null
@@ -74,8 +101,20 @@ async function copyImage() {
              controlslist="nodownload noremoteplayback noplaybackrate"
              disablepictureinpicture disableremoteplayback></video>
       <div v-else
-           :style="{ width: `min(96vw, calc(94vh * ${imgRatio}))`, aspectRatio: imgRatio, backgroundImage: `url(${src})` }"
-           class="rounded-lg bg-contain bg-center bg-no-repeat"></div>
+           :style="{ width: `min(96vw, calc(94vh * ${imgRatio}))`, aspectRatio: imgRatio }"
+           class="relative overflow-hidden rounded-lg bg-black">
+        <img :src="thumbnailSrc" alt="" aria-hidden="true" draggable="false"
+             @load="onThumbnailLoad"
+             class="absolute inset-0 h-full w-full object-contain transition-opacity duration-200"
+             :class="imageLoaded ? 'opacity-0' : 'opacity-100'" />
+        <img :src="src" :alt="prompt || '生成图片'" draggable="false"
+             decoding="async" fetchpriority="high"
+             @load="onImageLoad" @error="onImageError"
+             class="absolute inset-0 h-full w-full object-contain transition-opacity duration-200"
+             :class="imageLoaded ? 'opacity-100' : 'opacity-0'" />
+        <span v-if="!imageLoaded && !imageFailed"
+              class="absolute left-1/2 top-1/2 h-7 w-7 -translate-x-1/2 -translate-y-1/2 animate-spin rounded-full border-2 border-white/30 border-t-white/90"></span>
+      </div>
 
       <!-- actions: copy (images only) + download -->
       <div class="absolute top-4 right-4 flex gap-2">
