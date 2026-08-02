@@ -1155,14 +1155,7 @@ func (s *V1Service) hasActiveProviderToken(ctx context.Context, provider, kind s
 		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
-		if provider == "adobe" {
-			if kind == "video" && item.VideoLimited {
-				continue
-			}
-			if kind == "image" && item.ImageLimited {
-				continue
-			}
-		}
+		// Adobe accounts are credit-based (积分号) — no per-kind quota locks.
 		return true, nil
 	}
 	return false, nil
@@ -1617,11 +1610,9 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 	}
 	var active []model.TokenAccount
 	for _, item := range items {
-		// Image quota is tracked separately from video — an account whose video
-		// quota is exhausted (VideoLimited) is still usable for image as long as
-		// its image quota remains. status=="quota" means BOTH kinds are limited
-		// (or a legacy/full quota mark), so it's excluded for either kind.
-		if item.Status == "active" && !item.Dead && !item.ImageLimited && strings.TrimSpace(item.Value) != "" {
+		// Adobe accounts are credit-based (积分号) — no per-kind quota locks.
+		// Only skip accounts that are dead or disabled.
+		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
 			active = append(active, item)
 		}
 	}
@@ -1677,12 +1668,9 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	}
 	var active []model.TokenAccount
 	for _, item := range items {
-		// Video quota is tracked separately from image — skip accounts whose
-		// video quota is exhausted (VideoLimited), but an image-only limit
-		// (ImageLimited) leaves the account usable for video. status=="quota"
-		// means BOTH kinds are limited (or a legacy/full quota mark), so it's
-		// excluded for either kind.
-		if item.Status == "active" && !item.Dead && !item.VideoLimited && strings.TrimSpace(item.Value) != "" {
+		// Adobe accounts are credit-based (积分号) — no per-kind quota locks.
+		// Only skip accounts that are dead or disabled.
+		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
 			active = append(active, item)
 		}
 	}
@@ -3211,28 +3199,16 @@ func (s *V1Service) markTokenFailure(ctx context.Context, pool string, token mod
 	}
 	switch {
 	case isQuota:
-		// Adobe quota is per-kind: a video-quota error must not block image
-		// requests (and vice-versa). Flag only the failing kind, and only sink
-		// the account into the shared "quota" waiting status once BOTH kinds are
-		// limited. Other pools (chatgpt) are single-kind, so they go straight to
-		// "quota" as before.
+		// Adobe accounts are credit-based (积分号) — quota exhaustion is
+		// non-locking: track the failure for rotation but don't limit or
+		// sink the account. Other pools go straight to "quota" as before.
 		if pool == "adobe" {
-			imageLimited := token.ImageLimited
-			videoLimited := token.VideoLimited
-			if kind == "video" {
-				videoLimited = true
-				patch["video_limited"] = true
-			} else {
-				imageLimited = true
-				patch["image_limited"] = true
-			}
-			if imageLimited && videoLimited {
-				patch["status"] = "quota"
-			}
+			// No-op: just track fails (already patched above), leave
+			// image_limited/video_limited/status untouched.
 		} else {
 			patch["status"] = "quota"
 		}
-		if strings.TrimSpace(token.CachedQuotaResetAfter) == "" {
+		if pool != "adobe" && strings.TrimSpace(token.CachedQuotaResetAfter) == "" {
 			recoverAt := time.Unix((time.Now().Unix()/86400+1)*86400, 0).UTC()
 			patch["quota_recover_at"] = &recoverAt
 		}
