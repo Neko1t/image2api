@@ -9,8 +9,8 @@ import (
 
 const (
 	refreshURL = "https://adobeid-na1.services.adobe.com/ims/check/v6/token?jslVersion=v2-v0.48.0-1-g1e322cb"
-	clientID   = "clio-playground-web"
-	scopeValue = "AdobeID,firefly_api,openid,pps.read,pps.write,additional_info.projectedProductContext,additional_info.ownerOrg,uds_read,uds_write,ab.manage,read_organizations,additional_info.roles,account_cluster.read,creative_production,profile"
+	clientID   = "projectx_webapp"
+	scopeValue = "AdobeID,firefly_api,openid"
 )
 
 var ErrAdobeCookieEmpty = errors.New("cookie is empty")

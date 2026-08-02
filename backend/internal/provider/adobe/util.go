@@ -6,12 +6,34 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"math/big"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// arpPIDPool binds each Adobe access token to a browser-like process ID for the
+// lifetime of one generation. Adobe correlates x-arp-session-id fields, so using
+// an unrelated random PID on every submit is distinguishable from a browser.
+var (
+	arpPIDMu    sync.Mutex
+	arpTokenPID = map[string]int{}
+	arpPIDToken = map[int]string{}
+)
+
+var adobeUserIDPat = regexp.MustCompile(`[A-Fa-f0-9]{20,}@AdobeID`)
+
+func extractUserIDFromCookie(cookie string) string {
+	decoded, err := url.QueryUnescape(cookie)
+	if err != nil {
+		decoded = cookie
+	}
+	return adobeUserIDPat.FindString(decoded)
+}
 
 func stringValue(v any) string {
 	switch x := v.(type) {
@@ -81,16 +103,45 @@ func decodeJWTPayload(token string) map[string]any {
 	return out
 }
 
-func buildARPSessionID() string {
-	// Every field is randomized per request: no embedded process pid or
-	// hardcoded constant suffix (those would make all requests from this
-	// install share a static feature — a cross-account correlation point).
+func buildARPSessionID(token string) string {
+	// Match the current browser/adobe2api shape exactly. The SID and feature
+	// prefix remain request-specific, while the PID is stable for this token's
+	// generation and distinct across accounts.
+	pid := allocPID(token)
 	raw := map[string]any{
 		"sid": uuid.NewString(),
-		"ftr": randomHex(16) + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(randomInt(1000, 999999)) + "_" + randomHex(8),
+		"ftr": randomHex(16) + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(pid) + "_dUAL43-mnts-ants-d4_31ck__tt",
 	}
 	b, _ := json.Marshal(raw)
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+func allocPID(token string) int {
+	arpPIDMu.Lock()
+	defer arpPIDMu.Unlock()
+
+	if pid, ok := arpTokenPID[token]; ok {
+		return pid
+	}
+	for {
+		pid := randomInt(1000, 99999)
+		if _, used := arpPIDToken[pid]; used {
+			continue
+		}
+		arpPIDToken[pid] = token
+		arpTokenPID[token] = pid
+		return pid
+	}
+}
+
+func releasePID(token string) {
+	arpPIDMu.Lock()
+	defer arpPIDMu.Unlock()
+
+	if pid, ok := arpTokenPID[token]; ok {
+		delete(arpTokenPID, token)
+		delete(arpPIDToken, pid)
+	}
 }
 
 func randomHex(n int) string {

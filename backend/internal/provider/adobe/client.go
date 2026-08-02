@@ -34,6 +34,7 @@ const (
 
 var (
 	ErrAuth              = errors.New("adobe auth failed")
+	ErrAuthPermanent     = errors.New("adobe auth permanently failed")
 	ErrQuotaExhausted    = errors.New("adobe quota exhausted")
 	ErrTemporaryUpstream = errors.New("adobe upstream temporary error")
 	ErrDeadUpstream      = errors.New("adobe upstream fatal error")
@@ -50,6 +51,13 @@ var (
 // prompt or the produced image.
 func isContentRejection(status int, body string) bool {
 	return status == 451 && strings.Contains(body, "unsafe")
+}
+
+func isPermanentAuthError(header string, body []byte) bool {
+	return strings.EqualFold(header, "user_not_entitled") ||
+		strings.EqualFold(header, "access_error") ||
+		strings.Contains(string(body), "user_not_entitled") ||
+		strings.Contains(string(body), "access_error")
 }
 
 var profileURLs = []string{
@@ -84,7 +92,7 @@ func (c *Client) ExchangeCookie(ctx context.Context, cookie string) (*CookieExch
 // uploadMaxRetries is how many extra in-place attempts a transient upload
 // failure (transport error / timeout, 429/451/5xx) gets on a fresh connection
 // before the error is surfaced.
-const uploadMaxRetries = 5
+const uploadMaxRetries = 3
 
 // UploadImage stores a reference image and returns its blob id. Transient
 // failures are retried in place (uploadMaxRetries times); the final error keeps
@@ -94,6 +102,11 @@ func (c *Client) UploadImage(ctx context.Context, token string, content []byte, 
 	// Reference-image upload runs on the local IP (not the proxy).
 	body, err, retryable := c.uploadImageOnce(ctx, token, content, contentType, engine)
 	for attempt := 0; err != nil && retryable && attempt < uploadMaxRetries && ctx.Err() == nil; attempt++ {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * time.Second):
+		}
 		body, err, retryable = c.uploadImageOnce(ctx, token, content, contentType, engine)
 	}
 	if err != nil {
@@ -121,7 +134,7 @@ func (c *Client) UploadImage(ctx context.Context, token string, content []byte, 
 // body plus whether a failure is retryable (transport error / 429/451/5xx).
 // Auth failures (401/403) and other non-200s are not retryable.
 func (c *Client) uploadImageOnce(ctx context.Context, token string, content []byte, contentType, engine string) ([]byte, error, bool) {
-	sess, err := c.newDirectTLSClient()
+	sess, err := c.newUploadTLSClient()
 	if err != nil {
 		return nil, err, false
 	}
@@ -163,6 +176,9 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 		return nil, err, true
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		if isPermanentAuthError(resp.Header.Get("x-access-error"), body) {
+			return nil, fmt.Errorf("%w (upload %d %s: %s)", ErrAuthPermanent, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300)), false
+		}
 		return nil, fmt.Errorf("%w (upload %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300)), false
 	}
 	if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
@@ -175,6 +191,7 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 }
 
 func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
+	defer releasePID(token)
 	// Only the generate submit goes through the proxy; polling + download run on
 	// the local IP.
 	submitSess, err := c.newTLSClient()
@@ -209,7 +226,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 		}
 		lastBody = respBody
 		lastErr = err
-		if errors.Is(err, ErrAuth) || errors.Is(err, ErrQuotaExhausted) || errors.Is(err, ErrContentRejected) {
+		if errors.Is(err, ErrAuth) || errors.Is(err, ErrAuthPermanent) || errors.Is(err, ErrQuotaExhausted) || errors.Is(err, ErrContentRejected) {
 			return nil, nil, err
 		}
 	}
@@ -234,6 +251,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 // in meta["video_url"] — used by the async /v1/videos job, which proxies that URL
 // on /content instead of persisting the file.
 func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
+	defer releasePID(token)
 	// Only the submit goes through the proxy; polling + download run on the local IP.
 	submitSess, err := c.newTLSClient()
 	if err != nil {
@@ -395,6 +413,9 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		return nil, err
 	}
 	if resp.StatusCode == 401 {
+		if isPermanentAuthError(resp.Header.Get("x-access-error"), body) {
+			return nil, ErrAuthPermanent
+		}
 		return nil, ErrAuth
 	}
 	if resp.StatusCode != 200 {
@@ -457,7 +478,7 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {buildARPSessionID()},
+		"x-arp-session-id":   {buildARPSessionID(token)},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -494,6 +515,9 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		if strings.EqualFold(resp.Header.Get("x-access-error"), "taste_exhausted") {
 			return respBody, "", ErrQuotaExhausted
 		}
+		if isPermanentAuthError(resp.Header.Get("x-access-error"), respBody) {
+			return respBody, "", fmt.Errorf("%w (submit %d %s: %s)", ErrAuthPermanent, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
+		}
 		return respBody, "", fmt.Errorf("%w (submit %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
 	}
 	// "system under load" / timeout_error = adobe rate-limit/overload (can come on a
@@ -507,6 +531,9 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 	if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		return respBody, "", ErrDeadUpstream
 	}
+	if strings.Contains(string(respBody), "access_error") {
+		return respBody, "", fmt.Errorf("%w (submit %d: %s)", ErrAuthPermanent, resp.StatusCode, clip(respBody, 300))
+	}
 	if resp.StatusCode != 200 {
 		return respBody, "", errors.New("submit rejected")
 	}
@@ -516,16 +543,16 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		return respBody, "", err
 	}
 	if override := strings.TrimSpace(resp.Header.Get("x-override-status-link")); override != "" {
-		return respBody, override, nil
+		return respBody, normalizePollURL(override), nil
 	}
 	if links, ok := payloadResp["links"].(map[string]any); ok {
 		if result, ok := links["result"].(map[string]any); ok {
 			if href := strings.TrimSpace(stringValue(result["href"])); href != "" {
-				return respBody, href, nil
+				return respBody, normalizePollURL(href), nil
 			}
 		}
 		if href := strings.TrimSpace(stringValue(links["result"])); href != "" {
-			return respBody, href, nil
+			return respBody, normalizePollURL(href), nil
 		}
 	}
 	return respBody, "", errors.New("submit ok but no poll url")
@@ -635,7 +662,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
-		"x-arp-session-id":   {buildARPSessionID()},
+		"x-arp-session-id":   {buildARPSessionID(token)},
 		http.HeaderOrderKey: {
 			"authorization",
 			"x-api-key",
@@ -676,8 +703,9 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		if strings.EqualFold(resp.Header.Get("x-access-error"), "taste_exhausted") {
 			return respBody, "", ErrQuotaExhausted
 		}
-		// Surface Adobe's response body — "adobe auth failed" alone hides whether
-		// it's a bad token, a missing scope, or a WAF/fingerprint block.
+		if isPermanentAuthError(resp.Header.Get("x-access-error"), respBody) {
+			return respBody, "", fmt.Errorf("%w (%d %s: %s)", ErrAuthPermanent, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
+		}
 		return respBody, "", fmt.Errorf("%w (%d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
 	}
 	if isContentRejection(resp.StatusCode, string(respBody)) {
@@ -691,6 +719,9 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 		return respBody, "", ErrTemporaryUpstream
 	}
+	if strings.Contains(string(respBody), "access_error") {
+		return respBody, "", fmt.Errorf("%w (%d: %s)", ErrAuthPermanent, resp.StatusCode, clip(respBody, 300))
+	}
 	if resp.StatusCode != 200 {
 		return respBody, "", fmt.Errorf("video submit rejected: %d %s", resp.StatusCode, clip(respBody, 300))
 	}
@@ -700,16 +731,16 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		return respBody, "", err
 	}
 	if override := strings.TrimSpace(resp.Header.Get("x-override-status-link")); override != "" {
-		return respBody, normalizeVideoPollURL(override), nil
+		return respBody, normalizePollURL(override), nil
 	}
 	if links, ok := payloadResp["links"].(map[string]any); ok {
 		if result, ok := links["result"].(map[string]any); ok {
 			if href := strings.TrimSpace(stringValue(result["href"])); href != "" {
-				return respBody, normalizeVideoPollURL(href), nil
+				return respBody, normalizePollURL(href), nil
 			}
 		}
 		if href := strings.TrimSpace(stringValue(links["result"])); href != "" {
-			return respBody, normalizeVideoPollURL(href), nil
+			return respBody, normalizePollURL(href), nil
 		}
 	}
 	return respBody, "", errors.New("video submit ok but no poll url")
@@ -751,6 +782,9 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 			return nil, nil, readErr
 		}
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			if isPermanentAuthError(resp.Header.Get("x-access-error"), body) {
+				return nil, nil, fmt.Errorf("%w (%d %s: %s)", ErrAuthPermanent, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300))
+			}
 			return nil, nil, fmt.Errorf("%w (%d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300))
 		}
 		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
@@ -919,16 +953,20 @@ type tlsSession struct {
 // image-generation submit goes through the proxy; reference-image upload,
 // polling and result download run on the local IP.
 func (c *Client) newTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), true)
+	return c.newTLSSession(randomFingerprint(), true, 120)
 }
 
 func (c *Client) newDirectTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), false)
+	return c.newTLSSession(randomFingerprint(), false, 60)
 }
 
-func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, error) {
+func (c *Client) newUploadTLSClient() (*tlsSession, error) {
+	return c.newTLSSession(randomFingerprint(), false, 180)
+}
+
+func (c *Client) newTLSSession(fp fingerprint, useProxy bool, timeoutSeconds int) (*tlsSession, error) {
 	options := []tlsclient.HttpClientOption{
-		tlsclient.WithTimeoutSeconds(60),
+		tlsclient.WithTimeoutSeconds(timeoutSeconds),
 		tlsclient.WithClientProfile(fp.profile),
 		tlsclient.WithNotFollowRedirects(),
 		tlsclient.WithRandomTLSExtensionOrder(),
@@ -949,11 +987,12 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 		return nil, ErrAdobeCookieEmpty
 	}
 
-	body := "client_id=" + clientID + "&guest_allowed=true&scope=" + strings.ReplaceAll(scopeValue, ",", "%2C")
+	body := buildCookieExchangeBody(cookie)
 	req, err := http.NewRequest(http.MethodPost, refreshURL, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
+	// The rest of the exchange deliberately mirrors the browser request.
 	req = req.WithContext(ctx)
 	req.Header = http.Header{
 		"accept":          {"*/*"},
@@ -1001,6 +1040,14 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 	}, nil
 }
 
+func buildCookieExchangeBody(cookie string) string {
+	userID := extractUserIDFromCookie(cookie)
+	if userID != "" {
+		return "client_id=" + clientID + "&scope=" + strings.ReplaceAll(scopeValue, ",", "%2C") + "&user_id=" + url.QueryEscape(userID)
+	}
+	return "client_id=" + clientID + "&guest_allowed=true&scope=" + strings.ReplaceAll(scopeValue, ",", "%2C")
+}
+
 func buildSubmitNonce(token, prompt string) string {
 	claims := decodeJWTPayload(token)
 	userID := strings.TrimSpace(stringValue(claims["user_id"]))
@@ -1033,7 +1080,7 @@ func ExtractAccountID(token string) string {
 	return userID
 }
 
-func normalizeVideoPollURL(raw string) string {
+func normalizePollURL(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return raw
 	}
