@@ -130,9 +130,12 @@ func NewApp(ctx context.Context) (*App, error) {
 	emailCodeSvc := service.NewEmailCodeService(rdb)
 	smtpSvc := service.NewSMTPService()
 	rateLimitSvc := service.NewRateLimitService(rdb)
-	rustfsClient := storage.New(cfg.RustFSEndpoint, cfg.RustFSBucket, cfg.RustFSAccessKey, cfg.RustFSSecretKey)
+	storageClient, err := newStorageClient(cfg)
+	if err != nil {
+		return nil, err
+	}
 	authSvc := service.NewAuthService(userRepo, siteRepo, sessionSvc, emailCodeSvc, smtpSvc, cgroupRepo)
-	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
+	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, storageClient)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("projectx_webapp", "")
 	chatGPTClient := chatgpt.NewClient("")
@@ -152,10 +155,10 @@ func NewApp(ctx context.Context) (*App, error) {
 		// Future formats registered here with one line each
 	}
 
-	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, upstreamAdapters, rustfsClient)
+	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, upstreamAdapters, storageClient)
 	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
 	showcaseSvc := service.NewShowcaseService(showcaseRepo)
-	adminReadSvc := service.NewAdminReadService(cfg, userRepo, modelRepo, eventRepo, siteRepo, tokenRepo, cdkRepo, rustfsClient, showcaseRepo)
+	adminReadSvc := service.NewAdminReadService(cfg, userRepo, modelRepo, eventRepo, siteRepo, tokenRepo, cdkRepo, storageClient, showcaseRepo)
 	adminWriteSvc := service.NewAdminWriteService(userRepo, showcaseRepo, modelRepo, eventRepo, apiKeyRepo, tokenRepo, orderRepo)
 	cdkSvc := service.NewCDKService(cdkRepo, userRepo, siteRepo, orderRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
@@ -170,7 +173,7 @@ func NewApp(ctx context.Context) (*App, error) {
 
 	engine := router.New(cfg, authSvc, router.Handlers{
 		Health:        handler.NewHealthHandler(),
-		Images:        handler.NewImageHandler(cfg, imageAccessSvc, rustfsClient),
+		Images:        handler.NewImageHandler(cfg, imageAccessSvc, storageClient),
 		V1:            handler.NewV1Handler(v1Svc),
 		Site:          handler.NewSiteHandler(siteSvc),
 		Showcase:      handler.NewShowcaseHandler(showcaseSvc),
@@ -191,7 +194,7 @@ func NewApp(ctx context.Context) (*App, error) {
 
 	// Background self-healing sweep (quota recovery, cookie refresh, stale-pending
 	// cleanup, log retention) — the Go equivalent of the Python daemon thread.
-	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, userRepo, refreshSvc, siteRepo, rustfsClient, v1Svc.Inflight(), showcaseRepo, orderRepo)
+	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, userRepo, refreshSvc, siteRepo, storageClient, v1Svc.Inflight(), showcaseRepo, orderRepo)
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	go maintenanceSvc.Run(loopCtx)
 	go v1Svc.RunYCYVideoWorker(loopCtx)
@@ -203,6 +206,36 @@ func NewApp(ctx context.Context) (*App, error) {
 		Engine:            engine,
 		maintenanceCancel: loopCancel,
 	}, nil
+}
+
+func newStorageClient(cfg *config.Config) (*storage.Client, error) {
+	switch cfg.StorageDriver {
+	case "", "rustfs":
+		return storage.NewRustFS(
+			cfg.RustFSEndpoint,
+			cfg.RustFSBucket,
+			cfg.RustFSAccessKey,
+			cfg.RustFSSecretKey,
+		), nil
+	case "oss":
+		client, err := storage.NewOSS(storage.OSSConfig{
+			Region:          cfg.OSSRegion,
+			Endpoint:        cfg.OSSEndpoint,
+			Bucket:          cfg.OSSBucket,
+			AccessKeyID:     cfg.OSSAccessKeyID,
+			AccessKeySecret: cfg.OSSAccessKeySecret,
+			SessionToken:    cfg.OSSSessionToken,
+			UseCName:        cfg.OSSUseCName,
+			DirectDelivery:  cfg.OSSDirectDelivery,
+			SignedURLTTL:    cfg.OSSSignedURLTTL,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("configure OSS storage: %w", err)
+		}
+		return client, nil
+	default:
+		return nil, fmt.Errorf("unsupported STORAGE_DRIVER %q (expected rustfs or oss)", cfg.StorageDriver)
+	}
 }
 
 // startGrokStatsigRefresh wires grok's headless x-statsig-id refresher to the

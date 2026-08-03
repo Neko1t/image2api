@@ -1,7 +1,8 @@
 # image2api — one-command stack: PostgreSQL + Redis + RustFS (S3) + backend
 # (built from source) + frontend/nginx (HTTP only on port 2000). Self-contained:
 #   docker compose up -d --build
-# No .env needed — all values are inline below. TLS + domain are handled by YOUR
+# Local defaults are inline below. A root .env can select private OSS and provide
+# its RAM credentials without committing them. TLS + domain are handled by YOUR
 # OWN reverse proxy in front of the web container (host port 2000).
 # ⚠ Before exposing to production, change the passwords/keys (POSTGRES_PASSWORD,
 #   RUSTFS_ACCESS_KEY/SECRET_KEY) and set CORS_ORIGINS to your real site origin.
@@ -78,6 +79,16 @@ services:
       RUSTFS_BUCKET: vivid-ai
       RUSTFS_ACCESS_KEY: vividai
       RUSTFS_SECRET_KEY: vividai-secret-change-me
+      STORAGE_DRIVER: "${STORAGE_DRIVER:-rustfs}"
+      OSS_REGION: "${OSS_REGION:-}"
+      OSS_ENDPOINT: "${OSS_ENDPOINT:-}"
+      OSS_BUCKET: "${OSS_BUCKET:-}"
+      OSS_ACCESS_KEY_ID: "${OSS_ACCESS_KEY_ID:-}"
+      OSS_ACCESS_KEY_SECRET: "${OSS_ACCESS_KEY_SECRET:-}"
+      OSS_SESSION_TOKEN: "${OSS_SESSION_TOKEN:-}"
+      OSS_USE_CNAME: "${OSS_USE_CNAME:-false}"
+      OSS_DIRECT_DELIVERY: "${OSS_DIRECT_DELIVERY:-false}"
+      OSS_SIGNED_URL_TTL_SECONDS: "${OSS_SIGNED_URL_TTL_SECONDS:-3600}"
       # Set to the URL your reverse proxy serves the site on (comma-separated).
       CORS_ORIGINS: http://localhost:2000,chrome-extension://gpokdplmoobjnjfoifaghkhdopdofobe
       # CORS_ORIGINS: https://innovative-prove-colours-tier.trycloudflare.com

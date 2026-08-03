@@ -32,7 +32,7 @@ flowchart TD
   Repos --> Postgres["PostgreSQL"]
 
   Services --> Redis["Redis\nsessions / email codes / rate limits / concurrency slots"]
-  Services --> Storage["RustFS / S3-compatible storage"]
+  Services --> Storage["Selectable RustFS / Alibaba Cloud OSS storage"]
   Services --> Providers["internal/provider clients"]
   Providers --> Upstreams["Adobe / ChatGPT / Runway / Grok / Leonardo / Krea / Imagine / Custom / YCY / epay"]
   Services --> Maintenance["MaintenanceService\nperiodic self-healing loop"]
@@ -46,7 +46,7 @@ Important design choices:
 - Provider-specific code lives under `internal/provider/*`; scheduling and billing stay in service code.
 - PostgreSQL is the source of truth for users, models, logs, accounts, settings, orders, CDK, and counters.
 - Redis is used for ephemeral state: sessions, email codes, login/rate guard, and self-healing concurrency slots.
-- RustFS/S3 stores generated media and uploaded reference images. Media is served through the backend, not directly from the bucket.
+- RustFS or private Alibaba Cloud OSS stores generated media and uploaded reference images. `/images` always authorizes access first; OSS can then redirect authorized reads to a short-lived signed URL.
 
 ## 2. Runtime Entrypoint
 
@@ -80,7 +80,7 @@ File: `backend/internal/bootstrap/app.go`.
 9. Instantiate repositories.
 10. Ensure default concurrency group exists.
 11. Instantiate services.
-12. Instantiate RustFS/S3 storage client.
+12. Instantiate the selected RustFS or OSS storage driver.
 13. Instantiate upstream provider clients.
 14. Create `V1Service` with model/user/event/token/settings/repo/provider/storage dependencies.
 15. Wire Adobe refresh service back into `V1Service` with `SetRefresh`.
@@ -119,10 +119,20 @@ Important config fields:
 | `SessionSlideAfter` | `SESSION_SLIDE_AFTER_HOURS` | Sliding refresh threshold. |
 | `CORSOrigins` | `CORS_ORIGINS` | Allowed frontend origins. |
 | `GeneratedRoot` | `GENERATED_ROOT` | Legacy/generated root; current storage paths are RustFS-backed. |
+| `StorageDriver` | `STORAGE_DRIVER` | `rustfs` (default) or `oss`. |
 | `RustFSEndpoint` | `RUSTFS_ENDPOINT` | S3-compatible endpoint. |
 | `RustFSBucket` | `RUSTFS_BUCKET` | Bucket name. |
 | `RustFSAccessKey` | `RUSTFS_ACCESS_KEY` | S3 access key. |
 | `RustFSSecretKey` | `RUSTFS_SECRET_KEY` | S3 secret key. |
+| `OSSRegion` | `OSS_REGION` | OSS region, such as `cn-hongkong`. |
+| `OSSEndpoint` | `OSS_ENDPOINT` | Optional official endpoint or HTTPS custom media domain. |
+| `OSSBucket` | `OSS_BUCKET` | Private OSS bucket name. |
+| `OSSAccessKeyID` | `OSS_ACCESS_KEY_ID` | Dedicated RAM identity access key ID. |
+| `OSSAccessKeySecret` | `OSS_ACCESS_KEY_SECRET` | Dedicated RAM identity secret. |
+| `OSSSessionToken` | `OSS_SESSION_TOKEN` | Optional STS session token. |
+| `OSSUseCName` | `OSS_USE_CNAME` | Use the endpoint as an OSS-bound custom CNAME. |
+| `OSSDirectDelivery` | `OSS_DIRECT_DELIVERY` | Return authorized HTTP 307 redirects to private signed OSS URLs. |
+| `OSSSignedURLTTL` | `OSS_SIGNED_URL_TTL_SECONDS` | Signed GET lifetime; defaults to one hour and cannot exceed seven days. |
 | `YCYBaseURL` | `YCY_BASE_URL` | YCY integration base URL. |
 | `YCYAPIKey` | `YCY_API_KEY` | YCY integration API key. |
 
@@ -154,7 +164,7 @@ backend/
     provider/            upstream API clients
     repo/                database access layer
     service/             business orchestration and domain services
-    storage/             RustFS/S3-compatible object client
+    storage/             RustFS and Alibaba Cloud OSS object drivers
   Dockerfile             backend image build
   go.mod / go.sum        Go module and dependencies
 ```
@@ -176,7 +186,7 @@ All routes use:
 | Method | Path | Handler | Purpose |
 |---|---|---|---|
 | `GET` | `/health` | `Health.Handle` | Health check. |
-| `GET` | `/images/:user/:name` | `Images.Serve` | Cookie-authenticated generated media proxy. |
+| `GET` | `/images/:user/:name` | `Images.Serve` | Authorized media proxy or short-lived signed OSS redirect. |
 | `GET` | `/v1/models` | `V1.Models` | OpenAI-compatible model list. |
 | `POST` | `/v1/images/generations` | `V1.ImageGenerations` | OpenAI-compatible text-to-image. |
 | `POST` | `/v1/images/edits` | `V1.ImageEdits` | OpenAI-compatible image edit / references. |
@@ -653,28 +663,38 @@ Provider errors are normalized into provider package sentinel errors such as:
 
 ## 15. Storage and Media Access
 
-File: `backend/internal/storage/rustfs.go`.
+Files: `backend/internal/storage/client.go`, `rustfs.go`, and `oss.go`.
 
-The storage client implements S3 Signature V4 manually against RustFS/S3-compatible object storage:
+`storage.Client` delegates the shared media operations to either the existing
+RustFS/S3-compatible driver or the official Alibaba Cloud OSS Go SDK v2 driver:
 
 - `Put`
 - `Get`
 - `Delete`
 - `List`
+- `Exists`
 - `PublicURL` helper
+- private `PresignGet` capability for OSS
 
 Generated media behavior:
 
-- UI-generated images/videos are uploaded to RustFS.
+- UI-generated images/videos are uploaded to the selected storage driver.
 - `/v1` image calls return base64 and do not persist output files.
 - Async `/v1/videos` stores upstream URL in `EventLog.File`, not the bytes.
 - Uploaded reference images are stored transiently and deleted after generation.
-- `/images/:user/:name` proxies stored media through backend authorization.
+- `/images/:user/:name` always performs backend authorization first.
+- RustFS and OSS proxy mode stream bytes through the backend.
+- OSS direct mode returns a non-cacheable HTTP 307 to a short-lived signed GET
+  URL after checking object existence. The redirect preserves browser `Range`
+  requests so video seeking goes directly to OSS.
+- Missing thumbnail and last-frame objects still fall back to the original key.
 
 Access model:
 
 - Regular user can view only their own media directory.
 - Admin can view all media.
+- The bucket remains private and browsers never receive write credentials.
+- `STORAGE_DRIVER` and `OSS_DIRECT_DELIVERY` are independent rollback switches.
 - Access is based on UI session cookie, not API key.
 - Media owner directory is derived from sanitized username, email local-part, or user ID.
 
@@ -823,7 +843,7 @@ Current project builds through Docker.
 
 - `postgres`: PostgreSQL 16.
 - `redis`: Redis 7 with appendonly.
-- `rustfs`: S3-compatible object storage.
+- `rustfs`: default local/rollback S3-compatible object storage.
 - `createbucket`: one-shot MinIO client bucket creation.
 - `backend`: Go service, listens at `0.0.0.0:6666`.
 - `web`: frontend nginx, host port `2000`.
@@ -836,7 +856,7 @@ Browser / API client
   -> frontend nginx container on host:2000
   -> static Vue assets OR proxy to backend:6666
   -> backend
-  -> Postgres / Redis / RustFS / upstream providers
+  -> Postgres / Redis / selected RustFS or OSS storage / upstream providers
 ```
 
 TLS is intentionally handled by the user's own reverse proxy, not by this project.
@@ -932,7 +952,7 @@ Note: provider quota maps to `401` for compatibility with the older contract.
 - Do not bypass `V1Service.chargeForModel`; it centralizes pricing and debit.
 - Always create an `EventLog` for generation attempts after successful validation/charging.
 - Always refund through `refundIfNeeded` or equivalent exactly-once logic.
-- Do not serve RustFS objects directly if they are user-generated private media.
+- Do not expose private storage objects without first passing `/images` authorization; OSS direct delivery must use expiring signed GET URLs.
 - Do not store plaintext API keys; store only hash and preview.
 - New user-facing generation paths should use the same user concurrency gate.
 - New provider paths should use account concurrency and failover helpers.
@@ -959,7 +979,7 @@ Start here for future investigation:
 | Concurrency limiter | `backend/internal/service/concurrency.go` |
 | Payment/recharge | `backend/internal/service/payment.go`, `backend/internal/provider/epay/client.go` |
 | Data model | `backend/internal/model/models.go` |
-| Storage client | `backend/internal/storage/rustfs.go` |
+| Storage client | `backend/internal/storage/client.go`, `rustfs.go`, `oss.go` |
 | Provider clients | `backend/internal/provider/*` |
 | Docker runtime | `docker-compose.yml` |
 

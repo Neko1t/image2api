@@ -27,7 +27,7 @@ const (
 	service = "s3"
 )
 
-type Client struct {
+type rustFSDriver struct {
 	endpoint string // e.g. http://154.9.26.140:9000 (no trailing slash)
 	host     string // e.g. 154.9.26.140:9000
 	bucket   string
@@ -35,21 +35,14 @@ type Client struct {
 	http     *http.Client
 }
 
-// Object is one entry returned by List.
-type Object struct {
-	Key          string
-	Size         int64
-	LastModified time.Time
-}
-
-// New builds a client. endpoint must include the scheme (http:// or https://).
-func New(endpoint, bucket, accessKey, secretKey string) *Client {
+// newRustFSDriver builds a client. endpoint must include the scheme.
+func newRustFSDriver(endpoint, bucket, accessKey, secretKey string) *rustFSDriver {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	host := endpoint
 	if i := strings.Index(host, "://"); i >= 0 {
 		host = host[i+3:]
 	}
-	return &Client{
+	return &rustFSDriver{
 		endpoint: endpoint,
 		host:     host,
 		bucket:   strings.TrimSpace(bucket),
@@ -60,18 +53,18 @@ func New(endpoint, bucket, accessKey, secretKey string) *Client {
 }
 
 // Configured reports whether the client has the minimum config to be usable.
-func (c *Client) Configured() bool {
+func (c *rustFSDriver) Configured() bool {
 	return c != nil && c.endpoint != "" && c.bucket != "" && c.ak != "" && c.sk != ""
 }
 
 // PublicURL is the direct object URL (used only for reference/debugging — the app
 // serves through the authenticated /images proxy, not this).
-func (c *Client) PublicURL(key string) string {
+func (c *rustFSDriver) PublicURL(key string) string {
 	return c.endpoint + "/" + c.bucket + "/" + strings.TrimPrefix(key, "/")
 }
 
 // Put uploads body under key with the given content type.
-func (c *Client) Put(ctx context.Context, key string, body []byte, contentType string) error {
+func (c *rustFSDriver) Put(ctx context.Context, key string, body []byte, contentType string) error {
 	resp, err := c.do(ctx, http.MethodPut, c.bucket+"/"+key, nil, body, contentType, nil)
 	if err != nil {
 		return err
@@ -86,7 +79,7 @@ func (c *Client) Put(ctx context.Context, key string, body []byte, contentType s
 // Get fetches key. The caller owns resp.Body (must Close it) and streams it. A
 // non-empty rangeHeader is forwarded verbatim (for video seeking). Returns the
 // raw *http.Response so headers/status can be passed through by the proxy.
-func (c *Client) Get(ctx context.Context, key, rangeHeader string) (*http.Response, error) {
+func (c *rustFSDriver) Get(ctx context.Context, key, rangeHeader string) (*http.Response, error) {
 	extra := map[string]string{}
 	if strings.TrimSpace(rangeHeader) != "" {
 		extra["Range"] = rangeHeader
@@ -95,7 +88,7 @@ func (c *Client) Get(ctx context.Context, key, rangeHeader string) (*http.Respon
 }
 
 // Delete removes key. A missing object is not an error.
-func (c *Client) Delete(ctx context.Context, key string) error {
+func (c *rustFSDriver) Delete(ctx context.Context, key string) error {
 	resp, err := c.do(ctx, http.MethodDelete, c.bucket+"/"+key, nil, nil, "", nil)
 	if err != nil {
 		return err
@@ -108,7 +101,7 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 }
 
 // List returns every object whose key starts with prefix (paginated internally).
-func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
+func (c *rustFSDriver) List(ctx context.Context, prefix string) ([]Object, error) {
 	var out []Object
 	token := ""
 	for {
@@ -151,7 +144,22 @@ func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 	return out, nil
 }
 
-func (c *Client) statusErr(op, key string, resp *http.Response) error {
+func (c *rustFSDriver) Exists(ctx context.Context, key string) (bool, error) {
+	resp, err := c.do(ctx, http.MethodHead, c.bucket+"/"+key, nil, nil, "", nil)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode/100 != 2 {
+		return false, c.statusErr("head", key, resp)
+	}
+	return true, nil
+}
+
+func (c *rustFSDriver) statusErr(op, key string, resp *http.Response) error {
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	return fmt.Errorf("rustfs %s %q: status %d: %s", op, key, resp.StatusCode, truncate(data))
 }
@@ -166,7 +174,7 @@ func truncate(b []byte) string {
 
 // do builds, signs (SigV4) and sends a request. resourcePath is the path after
 // the host WITHOUT a leading slash (e.g. "bucket/dir/file.png" or "bucket").
-func (c *Client) do(ctx context.Context, method, resourcePath string, query map[string]string, body []byte, contentType string, extraHeaders map[string]string) (*http.Response, error) {
+func (c *rustFSDriver) do(ctx context.Context, method, resourcePath string, query map[string]string, body []byte, contentType string, extraHeaders map[string]string) (*http.Response, error) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")

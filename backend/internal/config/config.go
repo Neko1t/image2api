@@ -9,23 +9,33 @@ import (
 )
 
 type Config struct {
-	AppEnv            string
-	HTTPAddr          string
-	AppTitle          string
-	PostgresDSN       string
-	RedisAddr         string
-	RedisPassword     string
-	RedisDB           int
-	SessionCookieName string
-	CookieSecure      bool
-	SessionTTL        time.Duration
-	SessionSlideAfter time.Duration
-	CORSOrigins       []string
-	GeneratedRoot     string
-	RustFSEndpoint    string
-	RustFSBucket      string
-	RustFSAccessKey   string
-	RustFSSecretKey   string
+	AppEnv             string
+	HTTPAddr           string
+	AppTitle           string
+	PostgresDSN        string
+	RedisAddr          string
+	RedisPassword      string
+	RedisDB            int
+	SessionCookieName  string
+	CookieSecure       bool
+	SessionTTL         time.Duration
+	SessionSlideAfter  time.Duration
+	CORSOrigins        []string
+	GeneratedRoot      string
+	StorageDriver      string
+	RustFSEndpoint     string
+	RustFSBucket       string
+	RustFSAccessKey    string
+	RustFSSecretKey    string
+	OSSRegion          string
+	OSSEndpoint        string
+	OSSBucket          string
+	OSSAccessKeyID     string
+	OSSAccessKeySecret string
+	OSSSessionToken    string
+	OSSUseCName        bool
+	OSSDirectDelivery  bool
+	OSSSignedURLTTL    time.Duration
 }
 
 func Load() (*Config, error) {
@@ -56,10 +66,20 @@ func Load() (*Config, error) {
 			// images both live here and are served (cookie-authed) via /images.
 			filepath.Join(wd, "data", "generated"),
 		)),
-		RustFSEndpoint:  envString("RUSTFS_ENDPOINT", ""),
-		RustFSBucket:    envString("RUSTFS_BUCKET", ""),
-		RustFSAccessKey: envString("RUSTFS_ACCESS_KEY", ""),
-		RustFSSecretKey: envString("RUSTFS_SECRET_KEY", ""),
+		StorageDriver:      strings.ToLower(envString("STORAGE_DRIVER", "rustfs")),
+		RustFSEndpoint:     envString("RUSTFS_ENDPOINT", ""),
+		RustFSBucket:       envString("RUSTFS_BUCKET", ""),
+		RustFSAccessKey:    envString("RUSTFS_ACCESS_KEY", ""),
+		RustFSSecretKey:    envString("RUSTFS_SECRET_KEY", ""),
+		OSSRegion:          envString("OSS_REGION", ""),
+		OSSEndpoint:        envString("OSS_ENDPOINT", ""),
+		OSSBucket:          envString("OSS_BUCKET", ""),
+		OSSAccessKeyID:     envString("OSS_ACCESS_KEY_ID", ""),
+		OSSAccessKeySecret: envString("OSS_ACCESS_KEY_SECRET", ""),
+		OSSSessionToken:    envString("OSS_SESSION_TOKEN", ""),
+		OSSUseCName:        envBool("OSS_USE_CNAME", false),
+		OSSDirectDelivery:  envBool("OSS_DIRECT_DELIVERY", false),
+		OSSSignedURLTTL:    time.Duration(envInt("OSS_SIGNED_URL_TTL_SECONDS", 3600)) * time.Second,
 	}
 
 	return cfg, nil

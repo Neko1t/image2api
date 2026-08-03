@@ -1,22 +1,35 @@
 package handler
 
 import (
+	"context"
 	"io"
 	"net/http"
 
 	"backend/internal/config"
 	"backend/internal/service"
-	"backend/internal/storage"
 	"github.com/gin-gonic/gin"
 )
 
 type ImageHandler struct {
 	cfg         *config.Config
-	imageAccess *service.ImageAccessService
-	store       *storage.Client
+	imageAccess imageAccess
+	store       imageStore
 }
 
-func NewImageHandler(cfg *config.Config, imageAccess *service.ImageAccessService, store *storage.Client) *ImageHandler {
+type imageAccess interface {
+	Resolve(user, name string) (string, error)
+	IsPublic(ctx context.Context, rel string) (bool, error)
+	IsAuthorized(ctx context.Context, sessionCookie, owner string) (bool, error)
+}
+
+type imageStore interface {
+	Get(ctx context.Context, key, rangeHeader string) (*http.Response, error)
+	Exists(ctx context.Context, key string) (bool, error)
+	DirectDeliveryEnabled() bool
+	PresignGet(ctx context.Context, key string) (string, error)
+}
+
+func NewImageHandler(cfg *config.Config, imageAccess imageAccess, store imageStore) *ImageHandler {
 	return &ImageHandler{
 		cfg:         cfg,
 		imageAccess: imageAccess,
@@ -24,10 +37,9 @@ func NewImageHandler(cfg *config.Config, imageAccess *service.ImageAccessService
 	}
 }
 
-// Serve gates access (public showcase images, or a logged-in cookie — a regular
-// user only their own images, an admin anyone's) and then PROXIES the object
-// from RustFS. Nothing is read from local disk; the RustFS endpoint is never
-// exposed to the client.
+// Serve gates access (public showcase images, or a logged-in cookie). It then
+// either proxies bytes from storage or redirects to a short-lived private OSS
+// URL when direct delivery is enabled.
 func (h *ImageHandler) Serve(c *gin.Context) {
 	user := c.Param("user")
 	name := c.Param("name")
@@ -66,6 +78,35 @@ func (h *ImageHandler) Serve(c *gin.Context) {
 			c.JSON(http.StatusUnauthorized, gin.H{"detail": "需要登录后访问"})
 			return
 		}
+	}
+
+	if h.store.DirectDeliveryEnabled() {
+		deliveryKey := rel
+		exists, err := h.store.Exists(c.Request.Context(), deliveryKey)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"detail": "failed to check object"})
+			return
+		}
+		if !exists && origRel != rel {
+			deliveryKey = origRel
+			exists, err = h.store.Exists(c.Request.Context(), deliveryKey)
+			if err != nil {
+				c.JSON(http.StatusBadGateway, gin.H{"detail": "failed to check object"})
+				return
+			}
+		}
+		if !exists {
+			c.JSON(http.StatusNotFound, gin.H{"detail": "not found"})
+			return
+		}
+		signedURL, err := h.store.PresignGet(c.Request.Context(), deliveryKey)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"detail": "failed to authorize object delivery"})
+			return
+		}
+		c.Header("Cache-Control", "private, no-store")
+		c.Redirect(http.StatusTemporaryRedirect, signedURL)
+		return
 	}
 
 	// Forward Range so the browser can seek within videos.
