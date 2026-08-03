@@ -1588,7 +1588,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 }
 
 func adobeErrClass(e error) (bool, bool, bool, bool) {
-	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream), errors.Is(e, adobe.ErrDeadUpstream)
+	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream) || errors.Is(e, adobe.ErrRateLimited), errors.Is(e, adobe.ErrDeadUpstream)
 }
 
 // noStore url-only mode: adobe returns a presigned image URL (meta["image_url"]);
@@ -1668,11 +1668,13 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	}
 	var active []model.TokenAccount
 	for _, item := range items {
-		// Adobe accounts are credit-based (积分号) — no per-kind quota locks.
-		// Only skip accounts that are dead or disabled.
-		if item.Status == "active" && !item.Dead && strings.TrimSpace(item.Value) != "" {
-			active = append(active, item)
+		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
+			continue
 		}
+		if isSeedanceModel(modelItem.ID) && isSubAccount(item.Meta) {
+			continue
+		}
+		active = append(active, item)
 	}
 	active = pinTestAccount(items, active, in.AccountID)
 	if len(active) == 0 {
@@ -3070,7 +3072,20 @@ func modelPrice(item *model.ModelConfig, kind, resolution, duration string, agen
 	}
 	if kind == "video" {
 		rv, rok := tierPrice(item.Prices, item.PricesAgent, resolution)
-		dv, dok := tierPrice(item.DurationPrices, item.DurationPricesAgent, duration)
+		var dv float64
+		var dok bool
+		if pps, hasPerSec := jsonMapFloat(item.DurationPrices, "per_second"); hasPerSec {
+			secs := parseDurationSeconds(duration)
+			dv = pps * float64(secs)
+			dok = true
+			if agent {
+				if av, aok := jsonMapFloat(item.DurationPricesAgent, "per_second"); aok {
+					dv = av * float64(secs)
+				}
+			}
+		} else {
+			dv, dok = tierPrice(item.DurationPrices, item.DurationPricesAgent, duration)
+		}
 		if !rok || !dok {
 			return 0, false
 		}
@@ -3143,12 +3158,14 @@ func parseDurationSeconds(raw string) int {
 
 func resolveAdobeVideoEngine(modelID string) (string, string) {
 	switch strings.ToLower(strings.TrimSpace(modelID)) {
-	case "gemini-veo31", "firefly-veo31":
-		// Use the fast tier — it's the only Veo 3.1 version this account is
-		// entitled to (standard "3.1-generate" returns 403 user_not_entitled).
-		// "firefly-veo31" is the legacy id, kept for back-compat with historical
-		// rows/logs; the model is branded "gemini-veo31" now.
+	case "gemini-veo3.1-fast", "gemini-veo31", "firefly-veo31":
 		return "veo31-fast", ""
+	case "gemini-veo3.1":
+		return "veo31-standard", ""
+	case "seedance-fast":
+		return "seedance-fast", ""
+	case "seedance-2.0":
+		return "seedance-2.0", ""
 	case "firefly-ray":
 		return "luma", ""
 	case "firefly-video":
@@ -3310,4 +3327,20 @@ func (s *V1Service) rotateRoundRobin(pool string, items []model.TokenAccount) {
 		}
 		i = j
 	}
+}
+
+func isSeedanceModel(modelID string) bool {
+	return modelID == "seedance-fast" || modelID == "seedance-2.0"
+}
+
+func isSubAccount(meta map[string]interface{}) bool {
+	if meta == nil {
+		return false
+	}
+	v, ok := meta["is_sub_account"]
+	if !ok {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
 }

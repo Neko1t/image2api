@@ -37,6 +37,7 @@ var (
 	ErrQuotaExhausted    = errors.New("adobe quota exhausted")
 	ErrTemporaryUpstream = errors.New("adobe upstream temporary error")
 	ErrDeadUpstream      = errors.New("adobe upstream fatal error")
+	ErrRateLimited       = errors.New("adobe rate limited")
 	// ErrContentRejected is Adobe's content-safety filter refusing the prompt or
 	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
 	// the account's — every account rejects the same content — so the caller must
@@ -178,7 +179,10 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		return nil, fmt.Errorf("%w (upload %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300)), false
 	}
-	if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
+	if resp.StatusCode == 429 {
+		return nil, fmt.Errorf("%w (upload %d): %s", ErrRateLimited, resp.StatusCode, clip(body, 300)), false
+	}
+	if resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		return nil, fmt.Errorf("adobe upload failed: %d %s", resp.StatusCode, clip(body, 300)), true
 	}
 	if resp.StatusCode != 200 {

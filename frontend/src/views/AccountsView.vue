@@ -453,6 +453,9 @@ onMounted(() => { loadAccounts(); loadModelList() })
                    case. -->
               <div class="flex items-center gap-2 min-w-0">
                 <span class="text-sm text-white/90 truncate" :title="a.email || '-'">{{ a.email || '-' }}</span>
+                <span v-if="a.sub_account"
+                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-sky-500/15 text-sky-300 ring-1 ring-sky-400/20"
+                      :title="'子号 (剩余 ' + (a.remaining ?? '—') + ' 积分)'">子号</span>
                 <span v-if="a.image_limited && a.status !== 'quota'"
                       class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/20"
                       title="图片额度耗尽，仅视频可用">图片限额</span>
