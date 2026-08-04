@@ -116,6 +116,10 @@ func BuildImagePayloadCandidates(modelID, prompt, aspectRatio, outputResolution 
 
 func buildGPTImagePayloads(spec modelSpec, prompt, ratio, resolution string, blobIDs []string) []map[string]any {
 	size := getSize(gptImageSize, resolution, ratio, "1:1")
+	// Mirrors the captured working gpt-image request shape: modelSpecificPayload.size,
+	// generationSettings.detailLevel 3, and NO top-level size / outputResolution
+	// (sending those got 403). Keeps the chosen size via modelSpecificPayload.size
+	// ("WxH") rather than "auto".
 	base := map[string]any{
 		"modelId":              spec.UpstreamModelID,
 		"modelVersion":         spec.UpstreamModelVersion,
@@ -124,9 +128,8 @@ func buildGPTImagePayloads(spec modelSpec, prompt, ratio, resolution string, blo
 		"seeds":                []int{rand.Intn(999999)},
 		"output":               map[string]any{"storeInputs": true},
 		"referenceBlobs":       []any{},
-		"size":                 map[string]any{"width": size[0], "height": size[1]},
 		"generationMetadata":   map[string]any{"module": "text2image", "submodule": "ff-image-generate"},
-		"modelSpecificPayload": map[string]any{},
+		"modelSpecificPayload": map[string]any{"size": sizeString(size)},
 		"generationSettings":   map[string]any{"detailLevel": 3},
 	}
 	if len(blobIDs) == 0 {
@@ -210,6 +213,10 @@ func getSize(table map[string]map[string][2]int, resolution, ratio, fallbackRati
 		size = levelTable[fallbackRatio]
 	}
 	return size
+}
+
+func sizeString(size [2]int) string {
+	return itoa(size[0]) + "x" + itoa(size[1])
 }
 
 func blobRefs(ids []string, usage string) []any {
@@ -329,18 +336,18 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			modelVersion = "seedance_2.0_fast"
 		}
 		payload := map[string]any{
-			"modelId":              "seedance",
-			"modelVersion":         modelVersion,
-			"size":                 videoSize(aspectRatio, resolution),
-			"seeds":                []int{seedVal},
-			"prompt":               prompt,
-			"negativePrompt":       "",
-			"duration":             durationSeconds,
-			"generateAudio":        true,
-			"generationSettings":   map[string]any{"aspectRatio": aspectRatio},
-			"generationMetadata":   map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
-			"output":               map[string]any{"storeInputs": true},
-			"referenceBlobs":       []any{},
+			"modelId":            "seedance",
+			"modelVersion":       modelVersion,
+			"size":               videoSize(aspectRatio, resolution),
+			"seeds":              []int{seedVal},
+			"prompt":             prompt,
+			"negativePrompt":     "",
+			"duration":           durationSeconds,
+			"generateAudio":      true,
+			"generationSettings": map[string]any{"aspectRatio": aspectRatio},
+			"generationMetadata": map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
+			"output":             map[string]any{"storeInputs": true},
+			"referenceBlobs":     []any{},
 		}
 		if len(blobIDs) > 0 {
 			payload["generationMetadata"] = map[string]any{"module": "image2video", "submodule": "ff-video-generate"}

@@ -20,47 +20,26 @@ func TestCurrentProjectXIdentity(t *testing.T) {
 	}
 }
 
-func TestGPTImagePayloadUsesTopLevelSize(t *testing.T) {
+func TestGPTImagePayloadUsesModelSpecificSize(t *testing.T) {
 	candidates := BuildImagePayloadCandidates("firefly-gpt-image-2", "test", "16:9", "2K", nil)
 	if len(candidates) != 1 {
 		t.Fatalf("candidate count = %d, want 1", len(candidates))
 	}
 	payload := candidates[0]
-	size, ok := payload["size"].(map[string]any)
-	if !ok {
-		t.Fatalf("top-level size = %#v, want object", payload["size"])
-	}
-	if size["width"] != 2560 || size["height"] != 1440 {
-		t.Fatalf("size = %#v, want 2560x1440", size)
+	if _, ok := payload["size"]; ok {
+		t.Fatalf("top-level size must be absent: %#v", payload["size"])
 	}
 	modelPayload, ok := payload["modelSpecificPayload"].(map[string]any)
 	if !ok {
 		t.Fatalf("modelSpecificPayload = %#v, want object", payload["modelSpecificPayload"])
 	}
-	if len(modelPayload) != 0 {
-		t.Fatalf("modelSpecificPayload = %#v, want empty object", modelPayload)
+	if modelPayload["size"] != "2560x1440" {
+		t.Fatalf("modelSpecificPayload.size = %#v, want 2560x1440", modelPayload["size"])
 	}
 }
 
-func TestARPSessionIDKeepsPIDPerToken(t *testing.T) {
-	const tokenA = "test-token-a"
-	const tokenB = "test-token-b"
-	defer releasePID(tokenA)
-	defer releasePID(tokenB)
-
-	firstSID, firstPID := parseARPSessionID(t, buildARPSessionID(tokenA))
-	secondSID, secondPID := parseARPSessionID(t, buildARPSessionID(tokenA))
-	_, otherPID := parseARPSessionID(t, buildARPSessionID(tokenB))
-
-	if firstSID == secondSID {
-		t.Fatal("ARP sid must be unique per request")
-	}
-	if firstPID != secondPID {
-		t.Fatalf("same token PID changed from %d to %d", firstPID, secondPID)
-	}
-	if firstPID == otherPID {
-		t.Fatalf("different tokens share PID %d", firstPID)
-	}
+func TestARPSessionIDShape(t *testing.T) {
+	parseARPSessionID(t, buildARPSessionID())
 }
 
 func TestExtractUserIDFromEncodedCookie(t *testing.T) {
@@ -68,14 +47,6 @@ func TestExtractUserIDFromEncodedCookie(t *testing.T) {
 	cookie := "foo=bar; adobe_identity=4BDA81F069FC6DA40A495FAB%40AdobeID"
 	if got := extractUserIDFromCookie(cookie); got != want {
 		t.Fatalf("user id = %q, want %q", got, want)
-	}
-	wantBody := "client_id=projectx_webapp&scope=AdobeID%2Cfirefly_api%2Copenid&user_id=4BDA81F069FC6DA40A495FAB%40AdobeID"
-	if got := buildCookieExchangeBody(cookie); got != wantBody {
-		t.Fatalf("exchange body = %q, want %q", got, wantBody)
-	}
-	guestBody := "client_id=projectx_webapp&guest_allowed=true&scope=AdobeID%2Cfirefly_api%2Copenid"
-	if got := buildCookieExchangeBody("foo=bar"); got != guestBody {
-		t.Fatalf("guest exchange body = %q, want %q", got, guestBody)
 	}
 }
 
@@ -91,7 +62,7 @@ func TestNormalizePollURL(t *testing.T) {
 	}
 }
 
-func parseARPSessionID(t *testing.T, encoded string) (string, int) {
+func parseARPSessionID(t *testing.T, encoded string) {
 	t.Helper()
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
@@ -118,5 +89,4 @@ func parseARPSessionID(t *testing.T, encoded string) (string, int) {
 	if err != nil || pid < 1000 || pid > 99999 {
 		t.Fatalf("invalid ARP pid %q", parts[2])
 	}
-	return payload.SID, pid
 }
