@@ -406,7 +406,8 @@ func (s *V1Service) submitYCYJob(ctx context.Context, item *model.EventLog, owne
 		upstreamVideoSize(item.Ratio, item.Resolution), parseDurationSeconds(item.Duration), refs)
 	cancel()
 	if err != nil {
-		s.failYCYJob(ctx, item, "YCY submit failed: "+err.Error())
+		log.Printf("ycy worker: submit diagnostic event=%s account=%s error=%v", item.ID, selected.ID, err)
+		s.failYCYJob(ctx, item, ycy.UserErrorMessage(err))
 		return
 	}
 	next := time.Now().Add(ycyPollInterval)

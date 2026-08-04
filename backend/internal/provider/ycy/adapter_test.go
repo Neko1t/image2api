@@ -126,3 +126,14 @@ func TestCreateVideoTaskReturnsAfterSubmitWithoutPolling(t *testing.T) {
 		t.Fatalf("taskID=%q requests=%d, want task_async and one POST", taskID, requests)
 	}
 }
+
+func TestMapAdapterErrorPreservesUserMessage(t *testing.T) {
+	upstreamErr := mapStatus(http.StatusBadRequest, []byte(`{"code":"rejected","message":"{\"error\":{\"message\":\"请求被拒绝\"}}"}`))
+	err := mapAdapterError(upstreamErr)
+	if !errors.Is(err, adapter.ErrAdapterTemporaryUpstream) {
+		t.Fatalf("mapAdapterError error = %v, want ErrAdapterTemporaryUpstream", err)
+	}
+	if got, want := UserErrorMessage(err), "请求被拒绝"; got != want {
+		t.Fatalf("UserErrorMessage() = %q, want %q", got, want)
+	}
+}

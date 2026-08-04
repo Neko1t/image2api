@@ -2,8 +2,10 @@ package ycy
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -39,5 +41,42 @@ func TestCreateVideoSendsReferenceImages(t *testing.T) {
 	}
 	if _, ok := payload["image"]; ok {
 		t.Fatalf("payload should use images for multiple references: %#v", payload)
+	}
+}
+
+func TestMapStatusExtractsNestedUnicodeMessage(t *testing.T) {
+	body := []byte(`{"code":"fail_to_fetch_task","message":"{\"error\":{\"message\":\"\\u8bf7\\u6c42\\u88ab\\u4e0a\\u6e38\\u62d2\\u7edd\"}}"}`)
+	err := mapStatus(http.StatusBadRequest, body)
+	if !errors.Is(err, ErrTemporaryUpstream) {
+		t.Fatalf("mapStatus error = %v, want ErrTemporaryUpstream", err)
+	}
+	if got, want := UserErrorMessage(err), "请求被上游拒绝"; got != want {
+		t.Fatalf("UserErrorMessage() = %q, want %q", got, want)
+	}
+	if strings.Contains(UserErrorMessage(err), `\u`) {
+		t.Fatalf("user message still contains a unicode escape: %q", UserErrorMessage(err))
+	}
+	if !strings.Contains(err.Error(), "400: fail_to_fetch_task") {
+		t.Fatalf("diagnostic error lost status/code: %v", err)
+	}
+}
+
+func TestMapStatusExtractsPlainMessage(t *testing.T) {
+	err := mapStatus(http.StatusTooManyRequests, []byte(`{"code":"rate_limit","message":"请求过于频繁"}`))
+	if !errors.Is(err, ErrQuotaExhausted) {
+		t.Fatalf("mapStatus error = %v, want ErrQuotaExhausted", err)
+	}
+	if got, want := UserErrorMessage(err), "请求过于频繁"; got != want {
+		t.Fatalf("UserErrorMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestMapStatusHidesMalformedBodyFromUser(t *testing.T) {
+	err := mapStatus(http.StatusBadGateway, []byte(`<html>internal upstream details</html>`))
+	if got := UserErrorMessage(err); got != defaultUserErrorMessage {
+		t.Fatalf("UserErrorMessage() = %q, want generic fallback", got)
+	}
+	if !strings.Contains(err.Error(), "internal upstream details") {
+		t.Fatalf("diagnostic error should retain a bounded fallback: %v", err)
 	}
 }

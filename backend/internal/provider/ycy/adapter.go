@@ -189,12 +189,12 @@ func mapAdapterError(err error) error {
 	}
 	switch {
 	case errors.Is(err, ErrAuth):
-		return fmt.Errorf("%w: %v", adapter.ErrAdapterAuth, err)
+		return fmt.Errorf("%w: %w", adapter.ErrAdapterAuth, err)
 	case errors.Is(err, ErrQuotaExhausted):
-		return fmt.Errorf("%w: %v", adapter.ErrAdapterQuotaExhausted, err)
+		return fmt.Errorf("%w: %w", adapter.ErrAdapterQuotaExhausted, err)
 	case errors.Is(err, ErrTemporaryUpstream):
-		return fmt.Errorf("%w: %v", adapter.ErrAdapterTemporaryUpstream, err)
+		return fmt.Errorf("%w: %w", adapter.ErrAdapterTemporaryUpstream, err)
 	default:
-		return fmt.Errorf("%w: %v", adapter.ErrAdapterTemporaryUpstream, err)
+		return fmt.Errorf("%w: %w", adapter.ErrAdapterTemporaryUpstream, err)
 	}
 }

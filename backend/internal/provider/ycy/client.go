@@ -22,6 +22,50 @@ type Client struct {
 	httpClient *http.Client
 }
 
+const defaultUserErrorMessage = "YCY 上游请求失败，请稍后重试"
+
+type responseError struct {
+	kind       error
+	status     int
+	code       string
+	message    string
+	diagnostic string
+}
+
+func (e *responseError) Error() string {
+	parts := []string{e.kind.Error(), fmt.Sprintf("%d", e.status)}
+	if e.code != "" {
+		parts = append(parts, e.code)
+	}
+	if e.diagnostic != "" {
+		parts = append(parts, e.diagnostic)
+	}
+	return strings.Join(parts, ": ")
+}
+
+func (e *responseError) Unwrap() error {
+	return e.kind
+}
+
+func (e *responseError) UserMessage() string {
+	if message := strings.TrimSpace(e.message); message != "" {
+		return message
+	}
+	return defaultUserErrorMessage
+}
+
+// UserErrorMessage returns the provider's user-facing message without exposing
+// HTTP payloads or internal adapter prefixes.
+func UserErrorMessage(err error) string {
+	var publicErr interface{ UserMessage() string }
+	if errors.As(err, &publicErr) {
+		if message := strings.TrimSpace(publicErr.UserMessage()); message != "" {
+			return message
+		}
+	}
+	return defaultUserErrorMessage
+}
+
 func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: 10 * time.Minute},
@@ -227,24 +271,101 @@ func sanitizeErr(err error) string {
 }
 
 func mapStatus(status int, body []byte) error {
-	switch {
-	case status >= 200 && status < 300:
+	if status >= 200 && status < 300 {
 		return nil
+	}
+
+	kind := ErrTemporaryUpstream
+	switch {
 	case status == 401 || status == 403:
-		return fmt.Errorf("%w: %d %s", ErrAuth, status, clip(body, 160))
+		kind = ErrAuth
 	case status == 429:
-		return fmt.Errorf("%w: %d %s", ErrQuotaExhausted, status, clip(body, 160))
-	default:
-		return fmt.Errorf("%w: %d %s", ErrTemporaryUpstream, status, clip(body, 160))
+		kind = ErrQuotaExhausted
+	}
+
+	code, message := parseErrorResponse(body)
+	diagnostic := message
+	if diagnostic == "" {
+		diagnostic = clipText(strings.TrimSpace(string(body)), 500)
+	}
+	return &responseError{
+		kind: kind, status: status, code: code, message: message, diagnostic: diagnostic,
 	}
 }
 
-func clip(b []byte, n int) string {
-	s := strings.TrimSpace(string(b))
-	if len(s) <= n {
-		return s
+func parseErrorResponse(body []byte) (string, string) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", ""
 	}
-	return s[:n]
+	code := ""
+	if object, ok := payload.(map[string]any); ok {
+		code = strings.TrimSpace(stringValue(object["code"]))
+	}
+	return code, nestedMessage(payload)
+}
+
+func nestedMessage(value any) string {
+	switch current := value.(type) {
+	case map[string]any:
+		if message, ok := current["message"]; ok {
+			if result := nestedMessage(message); result != "" {
+				return result
+			}
+		}
+		if nested, ok := current["error"]; ok {
+			return nestedMessage(nested)
+		}
+	case string:
+		text := strings.TrimSpace(current)
+		if text == "" {
+			return ""
+		}
+		var nested any
+		if json.Unmarshal([]byte(text), &nested) == nil {
+			if result := nestedMessage(nested); result != "" {
+				return result
+			}
+		}
+		return decodeUnicodeEscapes(text)
+	}
+	return ""
+}
+
+func decodeUnicodeEscapes(value string) string {
+	if !strings.Contains(value, `\u`) {
+		return value
+	}
+	var quoted strings.Builder
+	quoted.WriteByte('"')
+	for _, char := range value {
+		switch char {
+		case '"':
+			quoted.WriteString(`\"`)
+		case '\n':
+			quoted.WriteString(`\n`)
+		case '\r':
+			quoted.WriteString(`\r`)
+		case '\t':
+			quoted.WriteString(`\t`)
+		default:
+			quoted.WriteRune(char)
+		}
+	}
+	quoted.WriteByte('"')
+	var decoded string
+	if json.Unmarshal([]byte(quoted.String()), &decoded) == nil {
+		return decoded
+	}
+	return value
+}
+
+func clipText(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
 }
 
 func stringValue(v any) string {
