@@ -810,26 +810,39 @@ func (c *Client) prepareImageConversation(ctx context.Context, session tlsclient
 
 func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.HttpClient, accessToken, prompt string, reqs *chatRequirements, conduitToken, model string, refs []uploadedReference) (string, []string, []string, error) {
 	path := "/backend-api/f/conversation"
-	content := map[string]any{"content_type": "text", "parts": []string{prompt}}
+	// Match the web app: a picture_v2 prompt is sent as the "@创建图片" ecosystem
+	// mention followed by the prompt, with the mention marked via a
+	// custom_symbol_offset so the server routes the turn to image generation.
+	content := map[string]any{"content_type": "text", "parts": []string{pictureV2Command + " " + prompt}}
 	metadata := map[string]any{
-		"selected_github_repos":     []any{},
-		"selected_all_github_repos": false,
-		"system_hints":              []string{"picture_v2"},
-		"serialization_metadata":    map[string]any{"custom_symbol_offsets": []any{}},
+		"system_hints": []string{"picture_v2"},
+		"serialization_metadata": map[string]any{
+			"custom_symbol_offsets": []any{
+				map[string]any{
+					"id":         "picture_v2",
+					"symbol":     "ecosystemMention",
+					"startIndex": 0,
+					"endIndex":   pictureV2MentionEnd,
+				},
+			},
+		},
 	}
 	if len(refs) > 0 {
+		// Reference-image turns carry image parts and no leading mention, so keep
+		// the multimodal shape and drop the ecosystemMention offset.
 		content = map[string]any{
 			"content_type": "multimodal_text",
 			"parts":        buildMultimodalParts(refs, prompt),
 		}
 		metadata["attachments"] = buildAttachmentMetadata(refs)
+		metadata["serialization_metadata"] = map[string]any{"custom_symbol_offsets": []any{}}
 	}
 	payload := map[string]any{
 		"action": "next",
 		"messages": []map[string]any{{
 			"id":          newUUID(),
 			"author":      map[string]any{"role": "user"},
-			"create_time": float64(time.Now().Unix()),
+			"create_time": float64(timeMillis()) / 1000.0,
 			"content":     content,
 			"metadata":    metadata,
 		}},
@@ -843,9 +856,10 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 		"system_hints":                         []string{"picture_v2"},
 		"supports_buffering":                   true,
 		"supported_encodings":                  []string{"v1"},
-		"client_contextual_info":               map[string]any{"is_dark_mode": false, "time_since_loaded": 1200, "page_height": 1072, "page_width": 1724, "pixel_ratio": 1.2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"},
+		"client_contextual_info":               map[string]any{"is_dark_mode": false, "time_since_loaded": 1200, "page_height": 1072, "page_width": 1724, "pixel_ratio": 1.2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com", "has_web_push_capabilities": true, "web_push_notification_permission": "default"},
 		"paragen_cot_summary_display_override": "allow",
 		"force_parallel_switch":                "auto",
+		"local_function_names":                 []string{"local.continue_in_work"},
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, baseURL+path, bytes.NewReader(body))
@@ -867,35 +881,48 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	}
 	defer resp.Body.Close()
 
+	sseStart := time.Now()
 	conversationID := ""
 	asyncStarted := false
 	var fileIDs, sedimentIDs []string
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
 	var chunks []string
-	sseStart := time.Now()
-	// Watchdog: once the conversation id is known, the stream may go silent
-	// without ever emitting the async marker, leaving scanner.Scan() blocked on
-	// a read for the whole ctx budget. Closing the body unblocks the read so the
-	// loop exits and we fall through to polling.
-	convFound := make(chan struct{})
+	refIDs := uploadedRefIDSet(refs)
+	// Watchdog: scanner.Scan() blocks on a read while the SSE is silent, which
+	// would hold the whole ctx budget. ChatGPT's inline image pipeline keeps the
+	// connection open with periodic ": ping" keepalives (~15s apart) while the
+	// image renders, then streams the asset (a role:"tool" multimodal_text turn
+	// carrying image_asset_pointer / sediment://) in the same SSE. So this is an
+	// *idle* timeout reset on every received line — a fixed grace from the
+	// conversation id would abort mid-render before the asset arrives. It only
+	// closes the body (unblocking the read) once the stream is genuinely silent.
+	activity := make(chan struct{}, 1)
 	watchdogDone := make(chan struct{})
 	defer close(watchdogDone)
 	go func() {
-		select {
-		case <-convFound:
-		case <-watchdogDone:
-			return
-		}
-		timer := time.NewTimer(sseAsyncGrace)
+		timer := time.NewTimer(sseIdleGrace)
 		defer timer.Stop()
-		select {
-		case <-timer.C:
-			resp.Body.Close()
-		case <-watchdogDone:
+		for {
+			select {
+			case <-activity:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(sseIdleGrace)
+			case <-timer.C:
+				resp.Body.Close()
+				return
+			case <-watchdogDone:
+				return
+			}
 		}
 	}()
 	for scanner.Scan() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data:") {
 			continue
@@ -911,7 +938,6 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 		if conversationID == "" {
 			if match := conversationIDRE.FindStringSubmatch(payload); len(match) >= 2 {
 				conversationID = match[1]
-				close(convFound)
 			}
 		}
 		newFiles, newSeds := scanForIDs(payload)
@@ -920,18 +946,15 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 		if !asyncStarted && containsAsyncMarker(payload) {
 			asyncStarted = true
 		}
-		// Async pipeline: ChatGPT no longer streams the image inline — it returns
-		// a placeholder tool turn (image_gen_async / image_gen_task_id) and
-		// delivers the asset later via conversation polling. Once we have the
-		// conversation id there is nothing more to read here, so stop instead of
-		// holding the SSE open until [DONE] (a stalled stream would otherwise burn
-		// the whole generation budget and surface as "context deadline exceeded").
-		//
-		// The async marker normally arrives within ~1s of the conversation id. We
-		// still only wait a short grace for it (the watchdog above unblocks a
-		// silent stream) so a request that never engages the async pipeline is
-		// detected quickly instead of burning the whole budget.
-		if conversationID != "" && (asyncStarted || time.Since(sseStart) >= sseAsyncGrace) {
+		// Stop once the image pipeline is confirmed engaged (async/tool marker) or
+		// the generated asset id has streamed inline. The stream echoes back the
+		// user's uploaded reference images too, so exclude those ids before deciding
+		// — otherwise an edit request would stop on its own upload. The idle watchdog
+		// above bounds a silent stream; pollForImage backstops asset retrieval when
+		// nothing streamed inline.
+		haveAsset := len(dropIDs(append([]string(nil), fileIDs...), refIDs)) > 0 ||
+			len(dropIDs(append([]string(nil), sedimentIDs...), refIDs)) > 0
+		if conversationID != "" && (asyncStarted || haveAsset) {
 			break
 		}
 	}
@@ -944,15 +967,13 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	if conversationID == "" {
 		return "", nil, nil, errors.New("chatgpt SSE closed without conversation_id")
 	}
-	// Intermittently (~10% on gpt-5-5-thinking) the stream returns a conversation
-	// id but never emits the async pipeline marker and no image is ever produced —
-	// polling such a conversation only burns the whole budget and surfaces as the
-	// non-retryable "image poll timeout". The async marker is the reliable "the
-	// image generation task actually started" signal, so when it is absent (and
-	// nothing was streamed inline) treat the attempt as a transient upstream
-	// failure. That is retryable: a fresh submission reliably engages the pipeline,
-	// so the pool retries the same account a few times and then fails over to
-	// another account (换号重试) instead of failing the request.
+	// The stream closed with a conversation id but no sign the image pipeline
+	// engaged — no async/tool marker and no asset streamed inline. Polling such a
+	// conversation only burns the whole budget and surfaces as the non-retryable
+	// "image poll timeout", so treat the attempt as a transient upstream failure.
+	// That is retryable: a fresh submission reliably engages the pipeline, so the
+	// pool retries the same account a few times and then fails over to another
+	// account (换号重试) instead of failing the request.
 	if !asyncStarted && len(fileIDs) == 0 && len(sedimentIDs) == 0 {
 		// Keep this redacted diagnostic permanently. ChatGPT changes its private
 		// SSE protocol frequently, and the final error alone cannot distinguish a

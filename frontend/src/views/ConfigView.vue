@@ -534,8 +534,8 @@ onMounted(() => { loadSite(); loadReg(); loadSmtp(); loadCredits(); loadAnnounce
           <input type="checkbox" v-model="pay.enabled" class="sw" />
         </label>
         <label class="row">
-          <span><span class="lbl">支付地址</span><span class="hint">易支付 API 根地址,自动拼 /mapi。</span></span>
-          <input v-model="pay.api_base" placeholder="https://pay.v8jisu.cn/api/pay" class="field !w-64" />
+          <span><span class="lbl">支付地址</span><span class="hint">易支付站点根地址,自动拼 /mapi.php。</span></span>
+          <input v-model="pay.api_base" placeholder="https://www.ezfpy.cn" class="field !w-64" />
         </label>
         <label class="row">
           <span><span class="lbl">商户ID (PID)</span></span>

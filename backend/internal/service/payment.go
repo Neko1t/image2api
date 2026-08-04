@@ -42,7 +42,7 @@ type PaySettings struct {
 	Enabled     bool     `json:"enabled"`
 	PID         string   `json:"pid"`
 	Key         string   `json:"key"`
-	APIBase     string   `json:"api_base"`     // 易支付站点根地址,代码自动拼 /api/pay/create
+	APIBase     string   `json:"api_base"`     // 易支付站点根地址,代码自动拼 /mapi.php
 	Methods     []string `json:"methods"`      // wxpay, alipay
 	MinAmount   float64  `json:"min_amount"`
 	PointsRatio int      `json:"points_ratio"` // 积分 per 元
@@ -56,7 +56,7 @@ func (s *PaymentService) get(ctx context.Context, key string) string {
 func (s *PaymentService) Settings(ctx context.Context) PaySettings {
 	api := strings.TrimRight(strings.TrimSpace(s.get(ctx, "pay.api_base")), "/")
 	if api == "" {
-		api = "https://pay.v8jisu.cn/api/pay"
+		api = "https://www.ezfpy.cn"
 	}
 	ratio, _ := strconv.Atoi(s.get(ctx, "pay.points_ratio"))
 	if ratio <= 0 {
@@ -174,6 +174,7 @@ func (s *PaymentService) CreateOrder(ctx context.Context, user *model.User, amou
 		Name:       fmt.Sprintf("积分充值 %d", points),
 		Money:      strconv.FormatFloat(amount, 'f', 2, 64),
 		NotifyURL:  strings.TrimRight(notifyBase, "/") + "/admin/api/pay/notify",
+		ReturnURL:  strings.TrimRight(notifyBase, "/") + "/settings",
 		ClientIP:   clientIP,
 	})
 	if err != nil {

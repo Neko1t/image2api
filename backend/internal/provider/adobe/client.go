@@ -44,6 +44,7 @@ var (
 	// ErrVideoTaskSubmitted means Adobe returned a poll URL and a later stage
 	// failed. Callers must never retry the whole generation on another account.
 	ErrVideoTaskSubmitted = errors.New("adobe video task already submitted")
+	ErrRateLimited        = errors.New("adobe rate limited")
 	// ErrContentRejected is Adobe's content-safety filter refusing the prompt or
 	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
 	// the account's — every account rejects the same content — so the caller must
@@ -187,7 +188,10 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 		}
 		return nil, fmt.Errorf("%w (upload %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300)), false
 	}
-	if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
+	if resp.StatusCode == 429 {
+		return nil, fmt.Errorf("%w (upload %d): %s", ErrRateLimited, resp.StatusCode, clip(body, 300)), false
+	}
+	if resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		return nil, fmt.Errorf("adobe upload failed: %d %s", resp.StatusCode, clip(body, 300)), true
 	}
 	if resp.StatusCode != 200 {
@@ -474,13 +478,13 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		"x-api-key":          {c.apiKey},
 		"content-type":       {"application/json"},
 		"accept":             {"*/*"},
-		"origin":             {"https://firefly.adobe.com"},
-		"referer":            {"https://firefly.adobe.com/"},
+		"origin":             {"https://new.express.adobe.com"},
+		"referer":            {"https://new.express.adobe.com/"},
 		"accept-language":    {"en-US,en;q=0.9"},
 		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
 		"sec-ch-ua-platform": {sess.fp.platform},
-		"sec-fetch-site":     {"same-site"},
+		"sec-fetch-site":     {"cross-site"},
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
@@ -501,7 +505,6 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 			"sec-fetch-dest",
 			"user-agent",
 			"x-nonce",
-			"x-arp-session-id",
 		},
 	}
 	if nonce := buildSubmitNonce(token, prompt); nonce != "" {
@@ -578,8 +581,8 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 		req.Header = http.Header{
 			"authorization": {"Bearer " + strings.TrimSpace(token)},
 			"accept":        {"*/*"},
-			"origin":        {"https://firefly.adobe.com"},
-			"referer":       {"https://firefly.adobe.com/"},
+			"origin":        {"https://new.express.adobe.com"},
+			"referer":       {"https://new.express.adobe.com/"},
 			"user-agent":    {sess.fp.userAgent},
 			http.HeaderOrderKey: {
 				"authorization",
@@ -658,13 +661,13 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		"x-api-key":          {c.apiKey},
 		"content-type":       {"application/json"},
 		"accept":             {"*/*"},
-		"origin":             {"https://firefly.adobe.com"},
-		"referer":            {"https://firefly.adobe.com/"},
+		"origin":             {"https://new.express.adobe.com"},
+		"referer":            {"https://new.express.adobe.com/"},
 		"accept-language":    {"en-US,en;q=0.9"},
 		"sec-ch-ua":          {sess.fp.secCHUA},
 		"sec-ch-ua-mobile":   {"?0"},
 		"sec-ch-ua-platform": {sess.fp.platform},
-		"sec-fetch-site":     {"same-site"},
+		"sec-fetch-site":     {"cross-site"},
 		"sec-fetch-mode":     {"cors"},
 		"sec-fetch-dest":     {"empty"},
 		"user-agent":         {sess.fp.userAgent},
@@ -685,7 +688,6 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 			"sec-fetch-dest",
 			"user-agent",
 			"x-nonce",
-			"x-arp-session-id",
 		},
 	}
 	// The working video submit (HAR) carries x-nonce just like the image submit.
@@ -766,8 +768,8 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 		req.Header = http.Header{
 			"authorization": {"Bearer " + strings.TrimSpace(token)},
 			"accept":        {"*/*"},
-			"origin":        {"https://firefly.adobe.com"},
-			"referer":       {"https://firefly.adobe.com/"},
+			"origin":        {"https://new.express.adobe.com"},
+			"referer":       {"https://new.express.adobe.com/"},
 			"user-agent":    {sess.fp.userAgent},
 			http.HeaderOrderKey: {
 				"authorization",
@@ -1005,8 +1007,8 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 		"accept-language": {"zh-CN,zh;q=0.9"},
 		"content-type":    {"application/x-www-form-urlencoded;charset=UTF-8"},
 		"cookie":          {cookie},
-		"origin":          {"https://firefly.adobe.com"},
-		"referer":         {"https://firefly.adobe.com/"},
+		"origin":          {"https://new.express.adobe.com"},
+		"referer":         {"https://new.express.adobe.com/"},
 		"user-agent":      {sess.fp.userAgent},
 		http.HeaderOrderKey: {
 			"accept",

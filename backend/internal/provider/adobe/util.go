@@ -25,6 +25,8 @@ var (
 	arpPIDToken = map[int]string{}
 )
 
+// adobeUserIDPat matches Adobe IMS user IDs embedded in cookies (e.g.
+// "4BDA81F069FC6DA40A495FAB@AdobeID").
 var adobeUserIDPat = regexp.MustCompile(`[A-Fa-f0-9]{20,}@AdobeID`)
 
 func extractUserIDFromCookie(cookie string) string {

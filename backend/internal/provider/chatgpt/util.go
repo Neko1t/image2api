@@ -18,12 +18,30 @@ const (
 	defaultClientVersion     = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
 	defaultClientBuildNumber = "7904904"
 	defaultPOWScript         = "https://chatgpt.com/backend-api/sentinel/sdk.js"
-	// sseAsyncGrace bounds how long startImageGeneration keeps reading the SSE
-	// waiting for the image_gen_async marker after the conversation id is known.
-	// The marker normally arrives within ~1s; when it never streams (intermittent
-	// on gpt-5-5-thinking) we must not hold the stream open for the whole ctx
-	// budget, so we break after this grace and fall through to polling.
-	sseAsyncGrace = 10 * time.Second
+	// sseIdleGrace bounds how long startImageGeneration keeps reading the image
+	// SSE with no activity at all before giving up. ChatGPT's inline image pipeline
+	// holds the stream open with periodic ": ping" keepalives (~15s apart) while
+	// the image renders, so this is an *idle* timeout reset on every received line
+	// (see the watchdog in startImageGeneration): it only fires when the stream is
+	// genuinely silent, not on the normal render wait.
+	sseIdleGrace = 45 * time.Second
+
+	// pictureV2Command is the "@创建图片" ecosystem mention the ChatGPT web app
+	// prepends to an image (picture_v2) prompt; the server identifies the image
+	// command from this mention plus its custom_symbol_offset, so we send it to
+	// match the browser exactly.
+	pictureV2Command = "@创建图片"
+	// pictureV2MentionEnd is the UTF-16 length of pictureV2Command — the
+	// ecosystemMention custom_symbol_offset endIndex the web app reports.
+	pictureV2MentionEnd = 5
+
+	// submitConnectRetries / submitRetryBackoff bound how many times the image
+	// submit (the proxied /backend-api/f/conversation POST) is retried on a bare
+	// connection error (EOF / reset) before surfacing it. The proxy hop
+	// occasionally drops the connection; a fresh retry usually succeeds without
+	// failing over to another account.
+	submitConnectRetries = 2
+	submitRetryBackoff   = 500 * time.Millisecond
 )
 
 var (
@@ -39,7 +57,7 @@ var (
 	// async image pipeline (image is delivered later via conversation polling
 	// rather than inline in the SSE stream). Their presence means "generating —
 	// keep polling", NOT failure.
-	asyncMarkers = []string{"image_gen_async", "image_gen_task_id", "trigger_async_ux"}
+	asyncMarkers = []string{"image_gen_async", "image_gen_task_id", "trigger_async_ux", "ImageGenToolTemporal", "image_gen_title"}
 
 	// contentPolicyMarkers are stable substrings of ChatGPT's content-audit
 	// refusal message. When one appears in an assistant turn the prompt was
@@ -230,6 +248,23 @@ func conversationEndedWithoutImage(conversation map[string]any) bool {
 		var sb strings.Builder
 		collectText(message["content"], &sb)
 		if strings.TrimSpace(sb.String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// isConnResetErr reports whether err is a bare connection-level failure (the
+// peer/proxy closed the connection before responding) rather than an HTTP-level
+// error. Such failures are safe to retry: no response was received, so no
+// conversation was created upstream.
+func isConnResetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, m := range []string{"eof", "connection reset", "reset by peer", "broken pipe", "connection refused"} {
+		if strings.Contains(msg, m) {
 			return true
 		}
 	}
