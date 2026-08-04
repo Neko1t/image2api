@@ -168,7 +168,7 @@ func (s *V1Service) openProviderArtifact(ctx context.Context, ev *model.EventLog
 		if account == nil || strings.TrimSpace(account.Value) == "" || s.chatgpt == nil {
 			return nil, fmt.Errorf("%w: chatgpt account no longer available", ErrProviderTemporary)
 		}
-		if !hostHasSuffix(rawURL, "oaiusercontent.com") {
+		if !trustedHTTPSArtifactHost(rawURL, "oaiusercontent.com", "chatgpt.com") {
 			return nil, fmt.Errorf("%w: invalid chatgpt asset host", ErrProviderTemporary)
 		}
 		body, contentType, err := s.chatgpt.OpenAsset(ctx, account.Value, rawURL)
@@ -180,7 +180,7 @@ func (s *V1Service) openProviderArtifact(ctx context.Context, ev *model.EventLog
 		if account == nil || strings.TrimSpace(account.Value) == "" || s.grok == nil {
 			return nil, fmt.Errorf("%w: grok account no longer available", ErrProviderTemporary)
 		}
-		if !hostHasSuffix(rawURL, "grok.com") {
+		if !trustedHTTPSArtifactHost(rawURL, "grok.com") {
 			return nil, fmt.Errorf("%w: invalid grok asset host", ErrProviderTemporary)
 		}
 		body, contentType, err := s.grok.OpenAsset(ctx, account.Value, rawURL)
@@ -378,14 +378,22 @@ func restrictedArtifactIP(ip net.IP) bool {
 		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
 }
 
-func hostHasSuffix(rawURL, suffix string) bool {
+func trustedHTTPSArtifactHost(rawURL string, suffixes ...string) bool {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
+	if err != nil || !u.IsAbs() || !strings.EqualFold(u.Scheme, "https") || u.User != nil || u.Hostname() == "" {
+		return false
+	}
+	if port := u.Port(); port != "" && port != "443" {
 		return false
 	}
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
-	suffix = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(suffix), "."))
-	return host == suffix || strings.HasSuffix(host, "."+suffix)
+	for _, suffix := range suffixes {
+		suffix = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(suffix), "."))
+		if suffix != "" && (host == suffix || strings.HasSuffix(host, "."+suffix)) {
+			return true
+		}
+	}
+	return false
 }
 
 type spooledAPIArtifact struct {

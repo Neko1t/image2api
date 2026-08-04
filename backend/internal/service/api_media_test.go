@@ -97,6 +97,34 @@ func TestArtifactURLRejectsUntrustedPrivateTargets(t *testing.T) {
 	}
 }
 
+func TestTrustedChatGPTArtifactHosts(t *testing.T) {
+	allowed := []string{
+		"https://chatgpt.com/backend-api/files/example",
+		"https://cdn.chatgpt.com/assets/example",
+		"https://files.oaiusercontent.com/file/example",
+		"https://FILES.OAIUSERCONTENT.COM./file/example",
+	}
+	for _, rawURL := range allowed {
+		if !trustedHTTPSArtifactHost(rawURL, "oaiusercontent.com", "chatgpt.com") {
+			t.Fatalf("rejected trusted ChatGPT artifact URL %q", rawURL)
+		}
+	}
+
+	rejected := []string{
+		"http://chatgpt.com/backend-api/files/example",
+		"https://user@chatgpt.com/backend-api/files/example",
+		"https://chatgpt.com:8443/backend-api/files/example",
+		"https://chatgpt.com.evil.example/file",
+		"https://evilchatgpt.com/file",
+		"https://oaiusercontent.com.evil.example/file",
+	}
+	for _, rawURL := range rejected {
+		if trustedHTTPSArtifactHost(rawURL, "oaiusercontent.com", "chatgpt.com") {
+			t.Fatalf("accepted untrusted ChatGPT artifact URL %q", rawURL)
+		}
+	}
+}
+
 func TestValidatedArtifactDialerRejectsRestrictedResolvedAddresses(t *testing.T) {
 	for _, restricted := range []string{"127.0.0.1", "169.254.169.254", "10.0.0.1"} {
 		t.Run(restricted, func(t *testing.T) {
