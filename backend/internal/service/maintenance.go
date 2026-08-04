@@ -19,37 +19,39 @@ import (
 // quota reset, cookies never auto-renew, stale pending events permanently block
 // a user's generation gate, and old media/logs accumulate unbounded.
 type MaintenanceService struct {
-	tokens          *repo.TokenRepository
-	tokenSvc        *TokenService
-	events          *repo.EventRepository
-	users           *repo.UserRepository
-	refresh         *RefreshProfileService
-	settings        *repo.SiteSettingRepository
-	store           *storage.Client
-	inflight        *InflightRegistry
-	showcase        *repo.ShowcaseRepository
-	orders          *repo.OrderRepository
-	interval        time.Duration
-	stalePending    time.Duration
-	mediaPruneEvery time.Duration
-	lastMediaPrune  time.Time
+	tokens                *repo.TokenRepository
+	tokenSvc              *TokenService
+	events                *repo.EventRepository
+	users                 *repo.UserRepository
+	refresh               *RefreshProfileService
+	settings              *repo.SiteSettingRepository
+	store                 *storage.Client
+	inflight              *InflightRegistry
+	showcase              *repo.ShowcaseRepository
+	orders                *repo.OrderRepository
+	interval              time.Duration
+	stalePending          time.Duration
+	mediaPruneEvery       time.Duration
+	lastMediaPrune        time.Time
+	apiMediaRetentionDays int
 }
 
-func NewMaintenanceService(tokens *repo.TokenRepository, tokenSvc *TokenService, events *repo.EventRepository, users *repo.UserRepository, refresh *RefreshProfileService, settings *repo.SiteSettingRepository, store *storage.Client, inflight *InflightRegistry, showcase *repo.ShowcaseRepository, orders *repo.OrderRepository) *MaintenanceService {
+func NewMaintenanceService(tokens *repo.TokenRepository, tokenSvc *TokenService, events *repo.EventRepository, users *repo.UserRepository, refresh *RefreshProfileService, settings *repo.SiteSettingRepository, store *storage.Client, inflight *InflightRegistry, showcase *repo.ShowcaseRepository, orders *repo.OrderRepository, apiMediaRetentionDays int) *MaintenanceService {
 	return &MaintenanceService{
-		tokens:          tokens,
-		tokenSvc:        tokenSvc,
-		events:          events,
-		users:           users,
-		refresh:         refresh,
-		settings:        settings,
-		store:           store,
-		inflight:        inflight,
-		showcase:        showcase,
-		orders:          orders,
-		interval:        60 * time.Second,
-		stalePending:    600 * time.Second,
-		mediaPruneEvery: 60 * time.Second,
+		tokens:                tokens,
+		tokenSvc:              tokenSvc,
+		events:                events,
+		users:                 users,
+		refresh:               refresh,
+		settings:              settings,
+		store:                 store,
+		inflight:              inflight,
+		showcase:              showcase,
+		orders:                orders,
+		interval:              60 * time.Second,
+		stalePending:          600 * time.Second,
+		mediaPruneEvery:       60 * time.Second,
+		apiMediaRetentionDays: apiMediaRetentionDays,
 	}
 }
 
@@ -175,7 +177,7 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	// 3. Fail long-pending events so they stop blocking the per-user gate, and
 	//    refund the credits debited up-front for each abandoned generation (the
 	//    normal failure-refund path never ran for a process-restart orphan).
-	if purged, err := m.events.PurgeStale(ctx, m.stalePending); err != nil {
+	if purged, err := m.events.PurgeStale(ctx, m.stalePending, 25*time.Minute); err != nil {
 		log.Printf("maintenance: purge_stale: %v", err)
 	} else if len(purged) > 0 {
 		refunded := 0
@@ -232,7 +234,7 @@ func (m *MaintenanceService) pruneLogs(ctx context.Context) {
 	if days <= 0 {
 		return
 	}
-	if _, err := m.events.PurgeOlderThan(ctx, time.Duration(days)*24*time.Hour); err != nil {
+	if _, err := m.events.PurgeOlderThan(ctx, time.Duration(days)*24*time.Hour, time.Duration(m.apiMediaRetentionDays)*24*time.Hour); err != nil {
 		log.Printf("maintenance: purge_older_than: %v", err)
 	}
 }
@@ -241,11 +243,13 @@ func (m *MaintenanceService) pruneMedia(ctx context.Context) {
 	if m.store == nil || !m.store.Configured() {
 		return
 	}
-	days := m.retentionDays(ctx, "media.retention_days")
-	if days <= 0 {
+	websiteDays := m.retentionDays(ctx, "media.retention_days")
+	if websiteDays <= 0 && m.apiMediaRetentionDays <= 0 {
 		return
 	}
-	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	now := time.Now()
+	websiteCutoff := now.Add(-time.Duration(websiteDays) * 24 * time.Hour)
+	apiCutoff := now.Add(-time.Duration(m.apiMediaRetentionDays) * 24 * time.Hour)
 	objs, err := m.store.List(ctx, "")
 	if err != nil {
 		log.Printf("maintenance: list media: %v", err)
@@ -271,7 +275,12 @@ func (m *MaintenanceService) pruneMedia(ctx context.Context) {
 	removed, skipped := 0, 0
 	var clearedKeys []string
 	for _, o := range objs {
-		if !o.LastModified.Before(cutoff) {
+		isAPIObject := strings.HasPrefix(strings.TrimLeft(o.Key, "/"), "api/")
+		if isAPIObject {
+			if m.apiMediaRetentionDays <= 0 || !o.LastModified.Before(apiCutoff) {
+				continue
+			}
+		} else if websiteDays <= 0 || !o.LastModified.Before(websiteCutoff) {
 			continue
 		}
 		if _, ok := pinned[strings.TrimLeft(o.Key, "/")]; ok {

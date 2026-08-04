@@ -89,6 +89,13 @@ services:
       OSS_USE_CNAME: "${OSS_USE_CNAME:-false}"
       OSS_DIRECT_DELIVERY: "${OSS_DIRECT_DELIVERY:-false}"
       OSS_SIGNED_URL_TTL_SECONDS: "${OSS_SIGNED_URL_TTL_SECONDS:-3600}"
+      API_VIDEO_PERSISTENCE: "${API_VIDEO_PERSISTENCE:-false}"
+      API_IMAGE_PERSISTENCE: "${API_IMAGE_PERSISTENCE:-off}"
+      API_MEDIA_DIRECT_DELIVERY: "${API_MEDIA_DIRECT_DELIVERY:-false}"
+      API_MEDIA_RETENTION_DAYS: "${API_MEDIA_RETENTION_DAYS:-30}"
+      API_MEDIA_MAX_BYTES: "${API_MEDIA_MAX_BYTES:-1073741824}"
+      API_MEDIA_INGEST_CONCURRENCY: "${API_MEDIA_INGEST_CONCURRENCY:-2}"
+      API_MEDIA_SPOOL_DIR: "${API_MEDIA_SPOOL_DIR:-}"
       # Set to the URL your reverse proxy serves the site on (comma-separated).
       CORS_ORIGINS: http://localhost:2000,chrome-extension://gpokdplmoobjnjfoifaghkhdopdofobe
       # CORS_ORIGINS: https://innovative-prove-colours-tier.trycloudflare.com

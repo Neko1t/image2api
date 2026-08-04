@@ -52,6 +52,20 @@ func (r *TokenRepository) Get(ctx context.Context, pool, id string) (*model.Toke
 	return &item, nil
 }
 
+// GetByID finds an account regardless of pool. Token IDs are globally unique
+// primary keys, and API media events only persist the winning account ID.
+func (r *TokenRepository) GetByID(ctx context.Context, id string) (*model.TokenAccount, error) {
+	var item model.TokenAccount
+	err := r.db.WithContext(ctx).First(&item, "id = ?", strings.TrimSpace(id)).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
 // GetByPoolEmail finds an account in a pool by its account_email (the logical
 // identity for import dedup). Returns (nil, nil) when none / email is blank.
 func (r *TokenRepository) GetByPoolEmail(ctx context.Context, pool, email string) (*model.TokenAccount, error) {
@@ -94,6 +108,7 @@ func (r *TokenRepository) Update(ctx context.Context, pool, id string, patch map
 //   - allowed=true, deducted=false: balance unknown → allowed without a hold
 //     (benefit of the doubt; a post-render reconcile writes the real value).
 //   - allowed=false: balance known and < amount → caller should fail over.
+//
 // RefundQuota releases a hold made with deducted=true when the render fails.
 func (r *TokenRepository) ReserveQuota(ctx context.Context, pool, id string, amount int) (allowed, deducted bool, err error) {
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

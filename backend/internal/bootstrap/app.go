@@ -135,7 +135,7 @@ func NewApp(ctx context.Context) (*App, error) {
 		return nil, err
 	}
 	authSvc := service.NewAuthService(userRepo, siteRepo, sessionSvc, emailCodeSvc, smtpSvc, cgroupRepo)
-	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, storageClient)
+	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, storageClient, cfg.APIMediaRetentionDays)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("projectx_webapp", "")
 	chatGPTClient := chatgpt.NewClient("")
@@ -194,7 +194,7 @@ func NewApp(ctx context.Context) (*App, error) {
 
 	// Background self-healing sweep (quota recovery, cookie refresh, stale-pending
 	// cleanup, log retention) — the Go equivalent of the Python daemon thread.
-	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, userRepo, refreshSvc, siteRepo, storageClient, v1Svc.Inflight(), showcaseRepo, orderRepo)
+	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, userRepo, refreshSvc, siteRepo, storageClient, v1Svc.Inflight(), showcaseRepo, orderRepo, cfg.APIMediaRetentionDays)
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	go maintenanceSvc.Run(loopCtx)
 	go v1Svc.RunYCYVideoWorker(loopCtx)

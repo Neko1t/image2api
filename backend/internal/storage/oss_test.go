@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -10,6 +11,14 @@ import (
 
 	alioss "github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 )
+
+type fakeOSSUploader struct {
+	upload func(context.Context, *alioss.PutObjectRequest, io.Reader, ...func(*alioss.UploaderOptions)) (*alioss.UploadResult, error)
+}
+
+func (f *fakeOSSUploader) UploadFrom(ctx context.Context, req *alioss.PutObjectRequest, body io.Reader, opts ...func(*alioss.UploaderOptions)) (*alioss.UploadResult, error) {
+	return f.upload(ctx, req, body, opts...)
+}
 
 type fakeOSSAPI struct {
 	put     func(context.Context, *alioss.PutObjectRequest, ...func(*alioss.Options)) (*alioss.PutObjectResult, error)
@@ -173,5 +182,34 @@ func TestOSSClientDirectDeliveryUsesConfiguredTTL(t *testing.T) {
 	}
 	if got != signedURL {
 		t.Fatalf("url=%q", got)
+	}
+}
+
+func TestOSSDriverPutStreamUsesSeekableUploader(t *testing.T) {
+	const payload = "streamed-video-bytes"
+	uploader := &fakeOSSUploader{}
+	uploader.upload = func(_ context.Context, req *alioss.PutObjectRequest, body io.Reader, _ ...func(*alioss.UploaderOptions)) (*alioss.UploadResult, error) {
+		if alioss.ToString(req.Key) != "api/u/videos/evt.mp4" {
+			t.Fatalf("key=%q", alioss.ToString(req.Key))
+		}
+		if req.ContentLength == nil || *req.ContentLength != int64(len(payload)) {
+			t.Fatalf("content length=%v", req.ContentLength)
+		}
+		if alioss.ToString(req.ContentType) != "video/mp4" {
+			t.Fatalf("content type=%q", alioss.ToString(req.ContentType))
+		}
+		got, err := io.ReadAll(body)
+		if err != nil {
+			t.Fatalf("read upload body: %v", err)
+		}
+		if string(got) != payload {
+			t.Fatalf("body=%q", got)
+		}
+		return &alioss.UploadResult{}, nil
+	}
+	driver := &ossDriver{client: &fakeOSSAPI{}, uploader: uploader, region: "cn-hongkong", bucket: "bucket"}
+
+	if err := driver.PutStream(context.Background(), "/api/u/videos/evt.mp4", bytes.NewReader([]byte(payload)), int64(len(payload)), "video/mp4"); err != nil {
+		t.Fatalf("put stream: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"time"
 )
@@ -20,6 +21,7 @@ type driver interface {
 	Configured() bool
 	PublicURL(key string) string
 	Put(ctx context.Context, key string, body []byte, contentType string) error
+	PutStream(ctx context.Context, key string, body io.ReadSeeker, size int64, contentType string) error
 	Get(ctx context.Context, key, rangeHeader string) (*http.Response, error)
 	Delete(ctx context.Context, key string) error
 	List(ctx context.Context, prefix string) ([]Object, error)
@@ -60,6 +62,12 @@ func (c *Client) PublicURL(key string) string {
 
 func (c *Client) Put(ctx context.Context, key string, body []byte, contentType string) error {
 	return c.driver.Put(ctx, key, body, contentType)
+}
+
+// PutStream uploads a bounded seekable source without loading it into memory.
+// Seekability lets storage drivers retry or multipart-upload the same bytes.
+func (c *Client) PutStream(ctx context.Context, key string, body io.ReadSeeker, size int64, contentType string) error {
+	return c.driver.PutStream(ctx, key, body, size, contentType)
 }
 
 func (c *Client) Get(ctx context.Context, key, rangeHeader string) (*http.Response, error) {

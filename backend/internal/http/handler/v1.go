@@ -68,11 +68,13 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	}
 
 	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
-		Model:   body.Model,
-		Prompt:  body.Prompt,
-		N:       body.N,
-		Size:    body.Size,
-		BaseURL: requestBaseURL(c),
+		Model:          body.Model,
+		Prompt:         body.Prompt,
+		N:              body.N,
+		Size:           body.Size,
+		Quality:        body.Quality,
+		ResponseFormat: body.ResponseFormat,
+		BaseURL:        requestBaseURL(c),
 	})
 	if err != nil {
 		h.writeV1Error(c, err, resp)
@@ -109,6 +111,8 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		Prompt:          c.PostForm("prompt"),
 		N:               n,
 		Size:            c.PostForm("size"),
+		Quality:         c.PostForm("quality"),
+		ResponseFormat:  c.PostForm("response_format"),
 		ReferenceImages: refs,
 		BaseURL:         requestBaseURL(c),
 	})
@@ -196,42 +200,71 @@ func (h *V1Handler) GetVideo(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// GetVideoContent — OpenAI GET /v1/videos/{id}/content. Streams the rendered mp4
-// by proxying the stored upstream URL (downloaded on demand, never persisted).
+// GetVideoContent — OpenAI GET /v1/videos/{id}/content. Delivers an owner-scoped
+// OSS object by signed redirect/proxy, with legacy upstream URL compatibility.
 func (h *V1Handler) GetVideoContent(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
 		h.writeAuthError(c, err)
 		return
 	}
-	body, contentType, err := h.v1.OpenVideoContent(c.Request.Context(), principal, c.Param("id"))
+	delivery, err := h.v1.OpenAPIVideoContent(c.Request.Context(), principal, c.Param("id"), c.GetHeader("Range"))
 	if err != nil {
 		h.writeV1Error(c, err, nil)
 		return
 	}
-	defer body.Close()
-	c.Header("Content-Type", contentType)
-	c.Status(http.StatusOK)
-	_, _ = io.Copy(c.Writer, body)
+	h.writeMediaDelivery(c, delivery)
 }
 
-// GetImageContent — GET /v1/images/{id}/content. Streams a no-store image by
-// proxying its stored (possibly auth-gated) upstream URL. Never persisted.
+// GetImageContent — GET /v1/images/{id}/content. Delivers an owner-scoped OSS
+// image or proxies a legacy auth-gated upstream URL.
 func (h *V1Handler) GetImageContent(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
 		h.writeAuthError(c, err)
 		return
 	}
-	body, contentType, err := h.v1.OpenImageContent(c.Request.Context(), principal, c.Param("id"))
+	delivery, err := h.v1.OpenAPIImageContent(c.Request.Context(), principal, c.Param("id"), c.GetHeader("Range"))
 	if err != nil {
 		h.writeV1Error(c, err, nil)
 		return
 	}
-	defer body.Close()
-	c.Header("Content-Type", contentType)
-	c.Status(http.StatusOK)
-	_, _ = io.Copy(c.Writer, body)
+	h.writeMediaDelivery(c, delivery)
+}
+
+func (h *V1Handler) writeMediaDelivery(c *gin.Context, delivery *service.MediaDelivery) {
+	if delivery == nil {
+		c.JSON(http.StatusBadGateway, gin.H{"detail": "empty media response"})
+		return
+	}
+	if strings.TrimSpace(delivery.RedirectURL) != "" {
+		c.Header("Cache-Control", "private, no-store")
+		c.Redirect(http.StatusTemporaryRedirect, delivery.RedirectURL)
+		return
+	}
+	resp := delivery.Response
+	if resp == nil || resp.Body == nil {
+		c.JSON(http.StatusBadGateway, gin.H{"detail": "empty media response"})
+		return
+	}
+	defer resp.Body.Close()
+	for _, header := range []string{
+		"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges",
+		"ETag", "Last-Modified", "Content-Disposition",
+	} {
+		if value := resp.Header.Get(header); value != "" {
+			c.Header(header, value)
+		}
+	}
+	// This route is authenticated and owner-scoped. Never let an upstream or
+	// object-store cache policy make its response reusable by a shared cache.
+	c.Header("Cache-Control", "private, no-store")
+	status := resp.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	c.Status(status)
+	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
 // readMultipartImages reads the given file fields and returns each as base64.
@@ -362,6 +395,8 @@ func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]a
 		c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
 	case errors.Is(err, service.ErrVideoNotReady):
 		c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
+	case errors.Is(err, service.ErrAPIMediaGone):
+		c.JSON(http.StatusGone, gin.H{"detail": err.Error()})
 	case errors.Is(err, service.ErrProviderUnsupported):
 		c.JSON(http.StatusNotImplemented, gin.H{"detail": err.Error()})
 	case errors.Is(err, service.ErrProviderExecution):

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,33 +10,40 @@ import (
 )
 
 type Config struct {
-	AppEnv             string
-	HTTPAddr           string
-	AppTitle           string
-	PostgresDSN        string
-	RedisAddr          string
-	RedisPassword      string
-	RedisDB            int
-	SessionCookieName  string
-	CookieSecure       bool
-	SessionTTL         time.Duration
-	SessionSlideAfter  time.Duration
-	CORSOrigins        []string
-	GeneratedRoot      string
-	StorageDriver      string
-	RustFSEndpoint     string
-	RustFSBucket       string
-	RustFSAccessKey    string
-	RustFSSecretKey    string
-	OSSRegion          string
-	OSSEndpoint        string
-	OSSBucket          string
-	OSSAccessKeyID     string
-	OSSAccessKeySecret string
-	OSSSessionToken    string
-	OSSUseCName        bool
-	OSSDirectDelivery  bool
-	OSSSignedURLTTL    time.Duration
+	AppEnv                    string
+	HTTPAddr                  string
+	AppTitle                  string
+	PostgresDSN               string
+	RedisAddr                 string
+	RedisPassword             string
+	RedisDB                   int
+	SessionCookieName         string
+	CookieSecure              bool
+	SessionTTL                time.Duration
+	SessionSlideAfter         time.Duration
+	CORSOrigins               []string
+	GeneratedRoot             string
+	StorageDriver             string
+	RustFSEndpoint            string
+	RustFSBucket              string
+	RustFSAccessKey           string
+	RustFSSecretKey           string
+	OSSRegion                 string
+	OSSEndpoint               string
+	OSSBucket                 string
+	OSSAccessKeyID            string
+	OSSAccessKeySecret        string
+	OSSSessionToken           string
+	OSSUseCName               bool
+	OSSDirectDelivery         bool
+	OSSSignedURLTTL           time.Duration
+	APIVideoPersistence       bool
+	APIImagePersistence       string
+	APIMediaDirectDelivery    bool
+	APIMediaRetentionDays     int
+	APIMediaMaxBytes          int64
+	APIMediaIngestConcurrency int
+	APIMediaSpoolDir          string
 }
 
 func Load() (*Config, error) {
@@ -66,23 +74,51 @@ func Load() (*Config, error) {
 			// images both live here and are served (cookie-authed) via /images.
 			filepath.Join(wd, "data", "generated"),
 		)),
-		StorageDriver:      strings.ToLower(envString("STORAGE_DRIVER", "rustfs")),
-		RustFSEndpoint:     envString("RUSTFS_ENDPOINT", ""),
-		RustFSBucket:       envString("RUSTFS_BUCKET", ""),
-		RustFSAccessKey:    envString("RUSTFS_ACCESS_KEY", ""),
-		RustFSSecretKey:    envString("RUSTFS_SECRET_KEY", ""),
-		OSSRegion:          envString("OSS_REGION", ""),
-		OSSEndpoint:        envString("OSS_ENDPOINT", ""),
-		OSSBucket:          envString("OSS_BUCKET", ""),
-		OSSAccessKeyID:     envString("OSS_ACCESS_KEY_ID", ""),
-		OSSAccessKeySecret: envString("OSS_ACCESS_KEY_SECRET", ""),
-		OSSSessionToken:    envString("OSS_SESSION_TOKEN", ""),
-		OSSUseCName:        envBool("OSS_USE_CNAME", false),
-		OSSDirectDelivery:  envBool("OSS_DIRECT_DELIVERY", false),
-		OSSSignedURLTTL:    time.Duration(envInt("OSS_SIGNED_URL_TTL_SECONDS", 3600)) * time.Second,
+		StorageDriver:             strings.ToLower(envString("STORAGE_DRIVER", "rustfs")),
+		RustFSEndpoint:            envString("RUSTFS_ENDPOINT", ""),
+		RustFSBucket:              envString("RUSTFS_BUCKET", ""),
+		RustFSAccessKey:           envString("RUSTFS_ACCESS_KEY", ""),
+		RustFSSecretKey:           envString("RUSTFS_SECRET_KEY", ""),
+		OSSRegion:                 envString("OSS_REGION", ""),
+		OSSEndpoint:               envString("OSS_ENDPOINT", ""),
+		OSSBucket:                 envString("OSS_BUCKET", ""),
+		OSSAccessKeyID:            envString("OSS_ACCESS_KEY_ID", ""),
+		OSSAccessKeySecret:        envString("OSS_ACCESS_KEY_SECRET", ""),
+		OSSSessionToken:           envString("OSS_SESSION_TOKEN", ""),
+		OSSUseCName:               envBool("OSS_USE_CNAME", false),
+		OSSDirectDelivery:         envBool("OSS_DIRECT_DELIVERY", false),
+		OSSSignedURLTTL:           time.Duration(envInt("OSS_SIGNED_URL_TTL_SECONDS", 3600)) * time.Second,
+		APIVideoPersistence:       envBool("API_VIDEO_PERSISTENCE", false),
+		APIImagePersistence:       strings.ToLower(strings.TrimSpace(envString("API_IMAGE_PERSISTENCE", "off"))),
+		APIMediaDirectDelivery:    envBool("API_MEDIA_DIRECT_DELIVERY", false),
+		APIMediaRetentionDays:     envInt("API_MEDIA_RETENTION_DAYS", 30),
+		APIMediaMaxBytes:          int64(envInt("API_MEDIA_MAX_BYTES", 1024*1024*1024)),
+		APIMediaIngestConcurrency: envInt("API_MEDIA_INGEST_CONCURRENCY", 2),
+		APIMediaSpoolDir:          strings.TrimSpace(envString("API_MEDIA_SPOOL_DIR", "")),
+	}
+	if err := validateAPIMediaConfig(cfg); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
+}
+
+func validateAPIMediaConfig(cfg *Config) error {
+	switch cfg.APIImagePersistence {
+	case "off", "gated", "all":
+	default:
+		return fmt.Errorf("unsupported API_IMAGE_PERSISTENCE %q (expected off, gated, or all)", cfg.APIImagePersistence)
+	}
+	if cfg.APIMediaRetentionDays < 1 || cfg.APIMediaRetentionDays > 3650 {
+		return fmt.Errorf("API_MEDIA_RETENTION_DAYS must be between 1 and 3650")
+	}
+	if cfg.APIMediaMaxBytes < 1024*1024 || cfg.APIMediaMaxBytes > 5*1024*1024*1024 {
+		return fmt.Errorf("API_MEDIA_MAX_BYTES must be between 1 MiB and 5 GiB")
+	}
+	if cfg.APIMediaIngestConcurrency < 1 || cfg.APIMediaIngestConcurrency > 16 {
+		return fmt.Errorf("API_MEDIA_INGEST_CONCURRENCY must be between 1 and 16")
+	}
+	return nil
 }
 
 // loadDotEnv loads a .env file (KEY=VALUE per line) into the process environment

@@ -6,8 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"log"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -109,6 +108,10 @@ type V1Service struct {
 	// upstream gate (1+ jobs per account) and the per-user gate (画图台 + API key,
 	// capped by the user's concurrency group). Self-healing + fail-open.
 	conc *ConcurrencyService
+
+	// mediaIngest bounds concurrent provider-download + storage-upload work so
+	// large API videos cannot consume unbounded temporary disk or connections.
+	mediaIngest chan struct{}
 }
 
 // acctAcquire takes one per-account upstream slot (capped at max; 0/1 = single),
@@ -193,6 +196,9 @@ type V1ImageRequest struct {
 	Model  string
 	Prompt string
 	Size   string
+	// ResponseFormat controls the strict /v1 response (`url` or `b64_json`).
+	// Empty defaults to `url`; non-v1 callers leave it unused.
+	ResponseFormat string
 	// Quality is OpenAI's image quality (low|medium|high|auto). For our tiered
 	// models it selects the resolution (low→1K, medium→2K, high→4K, auto→default),
 	// clamped to whatever tiers the model actually prices. Only used when
@@ -230,6 +236,10 @@ type V1VideoRequest struct {
 }
 
 func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, upstreamAdapters map[string]adapter.UpstreamAdapter, store *storage.Client) *V1Service {
+	ingestConcurrency := 1
+	if cfg != nil && cfg.APIMediaIngestConcurrency > 0 {
+		ingestConcurrency = cfg.APIMediaIngestConcurrency
+	}
 	return &V1Service{
 		cfg:              cfg,
 		models:           models,
@@ -249,6 +259,7 @@ func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.
 		upstreamAdapters: upstreamAdapters,
 		store:            store,
 		inflight:         &InflightRegistry{},
+		mediaIngest:      make(chan struct{}, ingestConcurrency),
 	}
 }
 
@@ -429,9 +440,17 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	}
 	genCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
-	// API-key (source "v1") requests don't persist the output; user and admin
-	// paths store the generated artifact for the gallery/logs.
+	// API-key (source "v1") requests skip gallery storage. API media policy may
+	// persist selected results under the separate owner-scoped `api/` prefix.
 	noStore := source == "v1"
+	if noStore {
+		responseFormat, formatErr := normalizeV1ImageResponseFormat(in.ResponseFormat)
+		if formatErr != nil {
+			return nil, formatErr
+		}
+		in.ResponseFormat = responseFormat
+	}
+	providerURLOnly := noStore && in.ResponseFormat != "b64_json"
 
 	var (
 		modelItem                      *model.ModelConfig
@@ -540,10 +559,8 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		}
 	}
 	price := priceValue
-	// API-key (source "v1") requests don't persist the output: we return the image
-	// as base64 inline (OpenAI gpt-image-1 also returns only b64_json) and never
-	// upload to RustFS, so there's no URL. The event is still logged (empty file)
-	// for usage; the customer logs page hides source="v1" rows.
+	// API-key events remain hidden from the customer gallery. Their response and
+	// optional API-only persistence are resolved after provider completion.
 	if !noStore && relativePath == "" {
 		fileURL, relativePath = s.allocateOutput(principal, "png", in.BaseURL)
 	}
@@ -569,7 +586,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	var imageBytes []byte
 	switch provider {
 	case "adobe":
-		b, u, execErr := s.generateAdobeImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateAdobeImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, providerURLOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -587,7 +604,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		imageBytes = b
 		upstreamURL = u
 	case "chatgpt":
-		b, u, execErr := s.generateChatGPTImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateChatGPTImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, providerURLOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -606,7 +623,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		upstreamURL = u
 		gatedURL = true // chatgpt URL needs the account token → proxy it
 	case "leonardo":
-		b, u, execErr := s.generateLeonardoImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateLeonardoImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, providerURLOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -624,7 +641,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		imageBytes = b
 		upstreamURL = u
 	case "krea":
-		b, u, execErr := s.generateKreaImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateKreaImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, providerURLOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -642,7 +659,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		imageBytes = b
 		upstreamURL = u
 	case "imagine":
-		b, u, execErr := s.generateImagineImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateImagineImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, providerURLOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -660,7 +677,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		imageBytes = b
 		upstreamURL = u
 	case "runway":
-		b, u, execErr := s.generateRunwayImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateRunwayImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, providerURLOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -679,7 +696,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		upstreamURL = u
 	case "upstream":
 		// Unified dispatch for all user-configured upstream adapters (OpenAI, YCY, etc)
-		b, u, execErr := s.dispatchUpstreamImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.dispatchUpstreamImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, providerURLOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -712,6 +729,59 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			imageBytes = processed
 		}
 	}
+	var (
+		apiFileRef         string
+		apiPersistenceErr  error
+		allowGatedFallback = true
+	)
+	if noStore {
+		if strings.TrimSpace(upstreamURL) != "" {
+			_ = s.events.SetUpstreamResultURL(ctx, eventID, upstreamURL)
+		}
+		persistenceMode := "off"
+		if s.cfg != nil {
+			persistenceMode = s.cfg.APIImagePersistence
+		}
+		shouldPersistURL := in.ResponseFormat == "url" && strings.TrimSpace(upstreamURL) != "" &&
+			(persistenceMode == "all" || (persistenceMode == "gated" && gatedURL))
+		shouldPersistBytes := in.ResponseFormat == "url" && strings.TrimSpace(upstreamURL) == "" &&
+			persistenceMode == "all" && len(imageBytes) > 0
+		if shouldPersistURL {
+			if ev, eventErr := s.events.GetByID(ctx, eventID); eventErr != nil {
+				log.Printf("api media ingest: stage=event_load_failed event_id=%s kind=image error=%v", eventID, eventErr)
+				apiPersistenceErr = eventErr
+				allowGatedFallback = false
+			} else if persisted, storeErr := s.persistAPIArtifact(genCtx, ev, upstreamURL, "image"); storeErr != nil {
+				log.Printf("api media ingest: stage=legacy_fallback event_id=%s kind=image error=%v", eventID, storeErr)
+				if persisted.SourceValidated {
+					apiFileRef = upstreamURL
+				} else if !persisted.SourceValidated {
+					apiPersistenceErr = storeErr
+					allowGatedFallback = false
+				}
+			} else {
+				apiFileRef = persisted.ObjectKey
+			}
+		} else if shouldPersistBytes {
+			if ev, eventErr := s.events.GetByID(ctx, eventID); eventErr != nil {
+				log.Printf("api media ingest: stage=event_load_failed event_id=%s kind=image error=%v", eventID, eventErr)
+			} else if objectKey, storeErr := s.persistAPIBytes(genCtx, ev, imageBytes, "image"); storeErr != nil {
+				log.Printf("api media ingest: stage=inline_fallback event_id=%s kind=image error=%v", eventID, storeErr)
+			} else {
+				apiFileRef = objectKey
+			}
+		}
+		// Gated URLs always keep the stable authenticated content route. When
+		// persistence is off or unavailable, File retains the legacy upstream URL.
+		if gatedURL && allowGatedFallback && strings.TrimSpace(upstreamURL) != "" && apiFileRef == "" {
+			apiFileRef = upstreamURL
+		}
+	}
+	if apiPersistenceErr != nil {
+		_ = s.refundIfNeeded(ctx, principal, eventID, price)
+		_ = s.events.UpdateStatus(ctx, eventID, "failed", "API media source could not be validated", int(time.Since(startedAt).Milliseconds()))
+		return nil, fmt.Errorf("%w: API media source could not be validated", ErrProviderExecution)
+	}
 	if !noStore {
 		// Upload to RustFS. On failure the generation fails and credits are
 		// refunded — we never fall back to local disk.
@@ -727,8 +797,18 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		}
 	}
 	elapsedMS := int(time.Since(startedAt).Milliseconds())
-	if err := s.events.UpdateStatus(ctx, eventID, "success", "", elapsedMS); err != nil {
-		return nil, err
+	var completeErr error
+	if noStore {
+		var transitioned bool
+		transitioned, completeErr = s.events.MarkAPIMediaReady(ctx, eventID, apiFileRef, upstreamURL, elapsedMS)
+		if completeErr == nil && !transitioned {
+			completeErr = fmt.Errorf("%w: API media event is no longer pending", ErrProviderExecution)
+		}
+	} else {
+		completeErr = s.events.UpdateStatus(ctx, eventID, "success", "", elapsedMS)
+	}
+	if completeErr != nil {
+		return nil, completeErr
 	}
 	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
 	if principal != nil && principal.User != nil {
@@ -738,17 +818,32 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		_ = s.maybeGrantInviteReward(ctx, principal)
 	}
 	if noStore {
+		if in.ResponseFormat == "b64_json" {
+			b64 := base64.StdEncoding.EncodeToString(imageBytes)
+			return map[string]any{
+				"created":    time.Now().Unix(),
+				"data":       []map[string]any{{"b64_json": b64}},
+				"model":      modelItem.EffectiveName(),
+				"provider":   modelItem.Provider,
+				"kind":       "image",
+				"b64_json":   b64,
+				"elapsed_ms": elapsedMS,
+				"charged":    price,
+				"credits":    principalCredits(principal),
+			}, nil
+		}
 		// Prefer the provider's original URL — return it directly, no base64.
 		// (API-key requests don't support DeAI, so there's no post-processing that
 		// would invalidate the upstream URL.)
-		if strings.TrimSpace(upstreamURL) != "" {
+		if strings.TrimSpace(upstreamURL) != "" || apiFileRef != "" {
 			outURL := upstreamURL
-			if gatedURL {
+			if apiFileRef != "" {
 				// Auth-gated URL (chatgpt): store it on the event and return a proxy
-				// URL that re-fetches with the account token (see OpenImageContent).
-				_ = s.events.SetFile(ctx, eventID, upstreamURL)
+				// URL. OSS-backed results use the same stable authenticated route.
 				if base := strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"); base != "" {
 					outURL = base + "/v1/images/" + eventID + "/content"
+				} else {
+					outURL = "/v1/images/" + eventID + "/content"
 				}
 			}
 			return map[string]any{
@@ -763,7 +858,8 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				"credits":    principalCredits(principal),
 			}, nil
 		}
-		// Fallback: providers without an upstream URL still return base64.
+		// Compatibility fallback: byte-only providers still return base64 when
+		// persistence is off or unavailable.
 		b64 := base64.StdEncoding.EncodeToString(imageBytes)
 		return map[string]any{
 			"created":    time.Now().Unix(),
@@ -1063,8 +1159,8 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 
 // ===== /v1/videos — OpenAI Sora-style async jobs =====
 // POST /v1/videos charges + creates a pending event and renders in the
-// background; the render captures only the UPSTREAM video URL (no download, no
-// RustFS). GET /v1/videos/{id} polls status; /content proxies the upstream URL.
+// background. Configured deployments persist the provider result into the
+// selected storage driver before completion; legacy mode retains the URL.
 
 // StartVideoJob validates+charges, creates the job event, kicks the render off in
 // the background, and returns the OpenAI video object (status "queued").
@@ -1079,8 +1175,8 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
 		return nil, err
 	}
-	// Source "v1": no output file is allocated — the result is the upstream URL,
-	// stored on the event when the render completes.
+	// Source "v1" allocates its owner-scoped object key only after the artifact's
+	// validated content type is known. Until then the event has no file reference.
 	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages), price, "", "v1", nil, false)
 	if err != nil {
 		return nil, err
@@ -1089,10 +1185,14 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 	return videoJobObject(eventID, modelItem.EffectiveName(), "queued", 0, duration, sizeFromRatioRes(aspectRatio, resolution), time.Now().Unix(), 0, ""), nil
 }
 
-// runVideoJob renders the clip in the background, capturing the upstream URL
-// (downloadResult=false → no bytes, no RustFS) and storing it on the event.
+// runVideoJob renders the clip in the background, records the provider URL, and
+// optionally persists it without ever resubmitting provider generation.
 func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, modelItem *model.ModelConfig, eventID, aspectRatio, resolution, duration string, price float64) {
-	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
+	jobTimeout := 12 * time.Minute
+	if s.cfg != nil && s.cfg.APIVideoPersistence {
+		jobTimeout = 20 * time.Minute
+	}
+	genCtx, cancel := context.WithTimeout(ctx, jobTimeout)
 	defer cancel()
 	s.inflight.Add(eventID, cancel)
 	defer s.inflight.Done(eventID)
@@ -1126,8 +1226,30 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		_ = s.events.UpdateStatus(ctx, eventID, "failed", "upstream returned no video url", 0)
 		return
 	}
-	// Store the upstream URL as the event's "file"; /content fetches it on demand.
-	if err := s.events.MarkVideoReady(ctx, eventID, videoURL, int(time.Since(startedAt).Milliseconds())); err != nil {
+	_ = s.events.SetUpstreamResultURL(ctx, eventID, videoURL)
+	fileRef := videoURL
+	if s.cfg != nil && s.cfg.APIVideoPersistence {
+		if ev, eventErr := s.events.GetByID(ctx, eventID); eventErr != nil {
+			log.Printf("api media ingest: stage=event_load_failed event_id=%s kind=video error=%v", eventID, eventErr)
+			_ = s.refundIfNeeded(ctx, principal, eventID, price)
+			_ = s.events.UpdateStatus(ctx, eventID, "failed", "API media event could not be loaded", int(time.Since(startedAt).Milliseconds()))
+			return
+		} else if persisted, storeErr := s.persistAPIArtifact(genCtx, ev, videoURL, "video"); storeErr != nil {
+			if !persisted.SourceValidated {
+				log.Printf("api media ingest: stage=source_unavailable event_id=%s kind=video error=%v", eventID, storeErr)
+				_ = s.refundIfNeeded(ctx, principal, eventID, price)
+				_ = s.events.UpdateStatus(ctx, eventID, "failed", "API media source could not be validated", int(time.Since(startedAt).Milliseconds()))
+				return
+			}
+			// Preserve the already-completed provider result through the legacy
+			// content path. Storage errors never re-enter provider failover.
+			log.Printf("api media ingest: stage=legacy_fallback event_id=%s kind=video error=%v", eventID, storeErr)
+		} else {
+			fileRef = persisted.ObjectKey
+		}
+	}
+	transitioned, err := s.events.MarkAPIMediaReady(ctx, eventID, fileRef, videoURL, int(time.Since(startedAt).Milliseconds()))
+	if err != nil || !transitioned {
 		return
 	}
 	_ = s.models.IncrementGenerationCount(ctx, modelItem.ID)
@@ -1159,100 +1281,6 @@ func (s *V1Service) VideoJob(ctx context.Context, principal *APIPrincipal, id st
 		}
 	}
 	return videoJobObject(ev.ID, modelName, status, progress, ev.Duration, sizeFromRatioRes(ev.Ratio, ev.Resolution), ev.TS.Unix(), completedAt, errMsg), nil
-}
-
-// OpenVideoContent streams a completed job's video by proxying the stored
-// upstream URL (downloaded on demand — never persisted).
-func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
-	ev, err := s.videoEventForUser(ctx, principal, id)
-	if err != nil {
-		return nil, "", err
-	}
-	if ev.Status != "success" || strings.TrimSpace(ev.File) == "" {
-		return nil, "", ErrVideoNotReady
-	}
-	// grok asset URLs (assets.grok.com) are auth-gated — a plain GET 403s. Stream
-	// them through the SAME account that generated the clip, using its token. If
-	// that account is gone (grok pools churn often), the clip is unrecoverable.
-	if ev.Provider == "grok" && s.grok != nil {
-		if s.settings != nil {
-			if proxy, perr := s.settings.GetValue(ctx, "proxy.url"); perr == nil {
-				s.grok.SetProxy(proxy)
-			}
-		}
-		acct, _ := s.tokens.Get(ctx, "grok", ev.AccountID)
-		if acct == nil || strings.TrimSpace(acct.Value) == "" {
-			return nil, "", fmt.Errorf("%w: grok account no longer available for this video", ErrProviderTemporary)
-		}
-		return s.grok.OpenAsset(ctx, acct.Value, ev.File)
-	}
-	// Other providers return publicly-fetchable URLs — proxy directly.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ev.File, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("%w: fetch upstream video: %v", ErrProviderTemporary, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, "", fmt.Errorf("%w: upstream video status %d", ErrProviderTemporary, resp.StatusCode)
-	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		ct = "video/mp4"
-	}
-	return resp.Body, ct, nil
-}
-
-// OpenImageContent streams a no-store image by proxying the stored upstream URL.
-// chatgpt URLs are auth-gated (files.oaiusercontent.com — a plain GET 403s), so
-// they're fetched through the generating account's token; other providers'
-// URLs are public and proxied directly. Never persisted.
-func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
-	ev, err := s.events.GetByID(ctx, strings.TrimSpace(id))
-	if err != nil {
-		return nil, "", err
-	}
-	if ev == nil || ev.Kind != "image" {
-		return nil, "", ErrVideoJobNotFound
-	}
-	if principal != nil && principal.User != nil && ev.UserID != principal.User.ID {
-		return nil, "", ErrVideoJobNotFound
-	}
-	if ev.Status != "success" || strings.TrimSpace(ev.File) == "" {
-		return nil, "", ErrVideoNotReady
-	}
-	if ev.Provider == "chatgpt" && s.chatgpt != nil {
-		if s.settings != nil {
-			if proxy, perr := s.settings.GetValue(ctx, "proxy.url"); perr == nil {
-				s.chatgpt.SetProxy(proxy)
-			}
-		}
-		acct, _ := s.tokens.Get(ctx, "chatgpt", ev.AccountID)
-		if acct == nil || strings.TrimSpace(acct.Value) == "" {
-			return nil, "", fmt.Errorf("%w: chatgpt account no longer available for this image", ErrProviderTemporary)
-		}
-		return s.chatgpt.OpenAsset(ctx, acct.Value, ev.File)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ev.File, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("%w: fetch upstream image: %v", ErrProviderTemporary, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, "", fmt.Errorf("%w: upstream image status %d", ErrProviderTemporary, resp.StatusCode)
-	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		ct = "image/png"
-	}
-	return resp.Body, ct, nil
 }
 
 func (s *V1Service) videoEventForUser(ctx context.Context, principal *APIPrincipal, id string) (*model.EventLog, error) {
@@ -2806,7 +2834,7 @@ func (s *V1Service) reconcileChatGPTQuota(ctx context.Context, tokenID, accessTo
 
 // chatgpt image URLs are auth-gated (files.oaiusercontent.com — a plain GET
 // 403s), so url-only mode returns the URL for the caller to proxy via
-// OpenImageContent using the generating account's token.
+// API media ingestion can reopen the URL using the generating account's token.
 func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
 	urlOnly := noStore
 	if s.chatgpt == nil {

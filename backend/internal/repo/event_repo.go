@@ -390,12 +390,23 @@ func (r *EventRepository) TopUserSpend(ctx context.Context, since time.Time, lim
 	return out, nil
 }
 
-func (r *EventRepository) PurgeOlderThan(ctx context.Context, maxAge time.Duration) (int64, error) {
+func (r *EventRepository) PurgeOlderThan(ctx context.Context, maxAge time.Duration, apiMediaMaxAge ...time.Duration) (int64, error) {
 	if maxAge <= 0 {
 		return 0, nil
 	}
-	cutoff := time.Now().Add(-maxAge)
-	result := r.db.WithContext(ctx).Where("ts < ?", cutoff).Delete(&model.EventLog{})
+	now := time.Now()
+	cutoff := now.Add(-maxAge)
+	query := r.db.WithContext(ctx).Where("ts < ?", cutoff)
+	if len(apiMediaMaxAge) > 0 && apiMediaMaxAge[0] > 0 {
+		apiCutoff := now.Add(-apiMediaMaxAge[0])
+		// API object delivery authenticates through this row. Preserve the
+		// ownership record until the independent API media window expires even
+		// when the administrator configures a shorter general log window.
+		query = query.Where(`NOT (
+			COALESCE(source, '') = ? AND COALESCE(file, '') LIKE ? AND ts >= ?
+		)`, "v1", "api/%", apiCutoff)
+	}
+	result := query.Delete(&model.EventLog{})
 	if result.Error != nil {
 		return 0, result.Error
 	}
@@ -445,18 +456,29 @@ type StaleEvent struct {
 // blocks the per-user generation gate (PendingByUser) forever AND silently eats
 // the user's credits (the charge happens at submit; the normal failure-refund
 // path never runs for a process-restart orphan). Mirrors Python purge_stale.
-func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration) ([]StaleEvent, error) {
+func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration, apiVideoMaxAge ...time.Duration) ([]StaleEvent, error) {
 	if maxAge <= 0 {
 		maxAge = 600 * time.Second
 	}
-	cutoff := time.Now().Add(-maxAge)
+	apiMaxAge := 25 * time.Minute
+	if len(apiVideoMaxAge) > 0 && apiVideoMaxAge[0] > 0 {
+		apiMaxAge = apiVideoMaxAge[0]
+	}
+	now := time.Now()
+	cutoff := now.Add(-maxAge)
+	apiVideoCutoff := now.Add(-apiMaxAge)
+	where := `status = ? AND COALESCE(job_type, '') <> ? AND (
+		(source = ? AND kind = ? AND ts < ?) OR
+		(NOT (COALESCE(source, '') = ? AND kind = ?) AND ts < ?)
+	)`
+	args := []any{"pending", "ycy_video", "v1", "video", apiVideoCutoff, "v1", "video", cutoff}
 	var stale []StaleEvent
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Snapshot who/what to refund BEFORE flipping status, so a concurrent
 		// sweep can't double-count (the UPDATE in the same tx removes them from
 		// the pending set).
 		if err := tx.Model(&model.EventLog{}).
-			Where("status = ? AND ts < ? AND COALESCE(job_type, '') <> ?", "pending", cutoff, "ycy_video").
+			Where(where, args...).
 			Select("id", "user_id", "account_id", "cost").
 			Scan(&stale).Error; err != nil {
 			return err
@@ -465,7 +487,7 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration) 
 			return nil
 		}
 		return tx.Model(&model.EventLog{}).
-			Where("status = ? AND ts < ? AND COALESCE(job_type, '') <> ?", "pending", cutoff, "ycy_video").
+			Where(where, args...).
 			Updates(map[string]any{
 				"status":     "failed",
 				"error":      gorm.Expr("COALESCE(NULLIF(error, ''), ?)", "abandoned (process restarted or request interrupted)"),
@@ -791,25 +813,39 @@ func (r *EventRepository) GetByID(ctx context.Context, id string) (*model.EventL
 	return &e, nil
 }
 
-// MarkVideoReady completes an async video job: status=success, file=upstream URL
-// (proxied on /content — never persisted), elapsed.
+// MarkVideoReady preserves the legacy URL-backed completion behavior.
 func (r *EventRepository) MarkVideoReady(ctx context.Context, eventID, fileURL string, elapsedMS int) error {
-	// Guard on a real transition (status <> success) so the success counter is
-	// incremented exactly once even if this fires twice / concurrently.
+	_, err := r.MarkAPIMediaReady(ctx, eventID, fileURL, fileURL, elapsedMS)
+	return err
+}
+
+// MarkAPIMediaReady records both the durable delivery reference and the
+// provider source URL, then completes the event exactly once.
+func (r *EventRepository) MarkAPIMediaReady(ctx context.Context, eventID, fileRef, upstreamURL string, elapsedMS int) (bool, error) {
+	// Only the pending owner may complete the event. A maintenance sweep may
+	// already have failed and refunded it; late work must not resurrect it.
 	res := r.db.WithContext(ctx).
 		Model(&model.EventLog{}).
-		Where("id = ? AND status <> ?", eventID, "success").
+		Where("id = ? AND status = ?", eventID, "pending").
 		Updates(map[string]any{
-			"status":     "success",
-			"file":       fileURL,
-			"error":      "",
-			"elapsed_ms": elapsedMS,
-			"updated_at": time.Now(),
+			"status":              "success",
+			"file":                fileRef,
+			"upstream_result_url": strings.TrimSpace(upstreamURL),
+			"error":               "",
+			"elapsed_ms":          elapsedMS,
+			"updated_at":          time.Now(),
 		})
 	if res.Error == nil && res.RowsAffected > 0 {
 		r.incrCounters(ctx, map[string]int64{"success": 1})
 	}
-	return res.Error
+	return res.RowsAffected == 1, res.Error
+}
+
+func (r *EventRepository) SetUpstreamResultURL(ctx context.Context, eventID, upstreamURL string) error {
+	return r.db.WithContext(ctx).
+		Model(&model.EventLog{}).
+		Where("id = ?", eventID).
+		Update("upstream_result_url", strings.TrimSpace(upstreamURL)).Error
 }
 
 // SetFile stores an arbitrary file reference (relative path OR upstream URL) on

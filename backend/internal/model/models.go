@@ -110,10 +110,12 @@ type EventLog struct {
 	// Refunded marks that this event's up-front charge has already been credited
 	// back, so the normal failure path and the abandoned-purge sweep can never
 	// double-refund the same generation.
-	Refunded  bool   `gorm:"not null;default:false"`
-	ElapsedMS int    `gorm:"not null;default:0"`
-	File      string `gorm:"size:500;index"`
-	Error     string `gorm:"type:text"`
+	Refunded  bool `gorm:"not null;default:false"`
+	ElapsedMS int  `gorm:"not null;default:0"`
+	// File can contain a legacy provider-signed URL as well as an object key.
+	// Signed URLs regularly exceed 500 characters, so keep the column unbounded.
+	File  string `gorm:"type:text;index"`
+	Error string `gorm:"type:text"`
 	// Durable user-side YCY video and session-image job metadata. Other generation
 	// paths leave these fields empty and continue using the existing lifecycle.
 	RequestID         string     `gorm:"size:64;index"`
@@ -121,7 +123,7 @@ type EventLog struct {
 	JobType           string     `gorm:"size:32;index"`
 	JobStage          string     `gorm:"size:32;index"`
 	UpstreamTaskID    string     `gorm:"size:128;index"`
-	UpstreamResultURL string     `gorm:"size:500"`
+	UpstreamResultURL string     `gorm:"type:text"`
 	NextPollAt        *time.Time `gorm:"index"`
 	LeaseOwner        string     `gorm:"size:64;index"`
 	LeaseUntil        *time.Time `gorm:"index"`

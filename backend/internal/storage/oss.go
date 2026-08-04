@@ -38,8 +38,13 @@ type ossAPI interface {
 	Presign(context.Context, any, ...func(*alioss.PresignOptions)) (*alioss.PresignResult, error)
 }
 
+type ossUploader interface {
+	UploadFrom(context.Context, *alioss.PutObjectRequest, io.Reader, ...func(*alioss.UploaderOptions)) (*alioss.UploadResult, error)
+}
+
 type ossDriver struct {
 	client   ossAPI
+	uploader ossUploader
 	region   string
 	endpoint string
 	bucket   string
@@ -67,8 +72,13 @@ func NewOSS(input OSSConfig) (*Client, error) {
 		sdkCfg.WithEndpoint(cfg.Endpoint)
 	}
 
+	sdkClient := alioss.NewClient(sdkCfg)
 	driver := &ossDriver{
-		client:   alioss.NewClient(sdkCfg),
+		client: sdkClient,
+		uploader: alioss.NewUploader(sdkClient, func(opts *alioss.UploaderOptions) {
+			opts.PartSize = 8 * 1024 * 1024
+			opts.ParallelNum = 2
+		}),
 		region:   cfg.Region,
 		endpoint: cfg.Endpoint,
 		bucket:   cfg.Bucket,
@@ -143,6 +153,31 @@ func (d *ossDriver) Put(ctx context.Context, key string, body []byte, contentTyp
 	}
 	if _, err := d.client.PutObject(ctx, req); err != nil {
 		return fmt.Errorf("oss put %q: %w", key, err)
+	}
+	return nil
+}
+
+func (d *ossDriver) PutStream(ctx context.Context, key string, body io.ReadSeeker, size int64, contentType string) error {
+	if body == nil || size < 0 {
+		return fmt.Errorf("oss put stream %q: invalid body or size", key)
+	}
+	if d.uploader == nil {
+		return fmt.Errorf("oss put stream %q: uploader unavailable", key)
+	}
+	if _, err := body.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("oss put stream %q: rewind: %w", key, err)
+	}
+	req := &alioss.PutObjectRequest{
+		Bucket:        alioss.Ptr(d.bucket),
+		Key:           alioss.Ptr(strings.TrimPrefix(key, "/")),
+		Body:          body,
+		ContentLength: alioss.Ptr(size),
+	}
+	if contentType = strings.TrimSpace(contentType); contentType != "" {
+		req.ContentType = alioss.Ptr(contentType)
+	}
+	if _, err := d.uploader.UploadFrom(ctx, req, body); err != nil {
+		return fmt.Errorf("oss put stream %q: %w", key, err)
 	}
 	return nil
 }

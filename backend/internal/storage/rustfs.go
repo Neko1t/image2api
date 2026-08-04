@@ -76,6 +76,31 @@ func (c *rustFSDriver) Put(ctx context.Context, key string, body []byte, content
 	return nil
 }
 
+func (c *rustFSDriver) PutStream(ctx context.Context, key string, body io.ReadSeeker, size int64, contentType string) error {
+	if body == nil || size < 0 {
+		return fmt.Errorf("rustfs put stream %q: invalid body or size", key)
+	}
+	if _, err := body.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rustfs put stream %q: rewind: %w", key, err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, body); err != nil {
+		return fmt.Errorf("rustfs put stream %q: hash: %w", key, err)
+	}
+	if _, err := body.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rustfs put stream %q: rewind after hash: %w", key, err)
+	}
+	resp, err := c.doSigned(ctx, http.MethodPut, c.bucket+"/"+key, nil, body, size, hex.EncodeToString(h.Sum(nil)), contentType, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return c.statusErr("put", key, resp)
+	}
+	return nil
+}
+
 // Get fetches key. The caller owns resp.Body (must Close it) and streams it. A
 // non-empty rangeHeader is forwarded verbatim (for video seeking). Returns the
 // raw *http.Response so headers/status can be passed through by the proxy.
@@ -175,6 +200,14 @@ func truncate(b []byte) string {
 // do builds, signs (SigV4) and sends a request. resourcePath is the path after
 // the host WITHOUT a leading slash (e.g. "bucket/dir/file.png" or "bucket").
 func (c *rustFSDriver) do(ctx context.Context, method, resourcePath string, query map[string]string, body []byte, contentType string, extraHeaders map[string]string) (*http.Response, error) {
+	var reader io.ReadSeeker
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	return c.doSigned(ctx, method, resourcePath, query, reader, int64(len(body)), hexSHA256(body), contentType, extraHeaders)
+}
+
+func (c *rustFSDriver) doSigned(ctx context.Context, method, resourcePath string, query map[string]string, body io.ReadSeeker, contentLength int64, payloadHash, contentType string, extraHeaders map[string]string) (*http.Response, error) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")
@@ -182,7 +215,6 @@ func (c *rustFSDriver) do(ctx context.Context, method, resourcePath string, quer
 	canonicalURI := "/" + uriEncode(resourcePath, true)
 	canonicalQuery := canonicalQueryString(query)
 
-	payloadHash := hexSHA256(body)
 	// Signed headers: always host + x-amz-content-sha256 + x-amz-date, plus
 	// content-type on PUT. Range etc. are sent unsigned.
 	signed := map[string]string{
@@ -216,11 +248,7 @@ func (c *rustFSDriver) do(ctx context.Context, method, resourcePath string, quer
 	if canonicalQuery != "" {
 		url += "?" + canonicalQuery
 	}
-	var rdr io.Reader
-	if body != nil {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, url, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
@@ -228,6 +256,9 @@ func (c *rustFSDriver) do(ctx context.Context, method, resourcePath string, quer
 	req.Header.Set("Authorization", auth)
 	req.Header.Set("x-amz-date", amzDate)
 	req.Header.Set("x-amz-content-sha256", payloadHash)
+	if body != nil {
+		req.ContentLength = contentLength
+	}
 	if ct := strings.TrimSpace(contentType); ct != "" {
 		req.Header.Set("Content-Type", ct)
 	}

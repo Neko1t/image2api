@@ -17,10 +17,11 @@ import (
 )
 
 type AppSettingsService struct {
-	settings *repo.SiteSettingRepository
-	events   *repo.EventRepository
-	smtp     *SMTPService
-	store    *storage.Client
+	settings              *repo.SiteSettingRepository
+	events                *repo.EventRepository
+	smtp                  *SMTPService
+	store                 *storage.Client
+	apiMediaRetentionDays int
 }
 
 type RegistrationSettings struct {
@@ -52,9 +53,9 @@ type CreditSettings struct {
 // 画图台 — charged on top of the model's image price when the toggle is on.
 type DeAISettings struct {
 	Enabled bool `json:"enabled"`
-	Price1K int `json:"price_1k"`
-	Price2K int `json:"price_2k"`
-	Price4K int `json:"price_4k"`
+	Price1K int  `json:"price_1k"`
+	Price2K int  `json:"price_2k"`
+	Price4K int  `json:"price_4k"`
 }
 
 type ProxySettings struct {
@@ -71,12 +72,13 @@ type MediaRetentionResult struct {
 	FreedBytes int64 `json:"freed_bytes"`
 }
 
-func NewAppSettingsService(settings *repo.SiteSettingRepository, events *repo.EventRepository, smtp *SMTPService, store *storage.Client) *AppSettingsService {
+func NewAppSettingsService(settings *repo.SiteSettingRepository, events *repo.EventRepository, smtp *SMTPService, store *storage.Client, apiMediaRetentionDays int) *AppSettingsService {
 	return &AppSettingsService{
-		settings: settings,
-		events:   events,
-		smtp:     smtp,
-		store:    store,
+		settings:              settings,
+		events:                events,
+		smtp:                  smtp,
+		store:                 store,
+		apiMediaRetentionDays: apiMediaRetentionDays,
 	}
 }
 
@@ -422,10 +424,10 @@ func (s *AppSettingsService) SaveCredits(ctx context.Context, in CreditSettings)
 		in.InviteReward = 0
 	}
 	if err := s.settings.UpsertValues(ctx, map[string]string{
-		"credits.checkin_enabled":   strconv.FormatBool(in.CheckinEnabled),
-		"credits.checkin_reward":    strconv.Itoa(in.CheckinReward),
-		"credits.invite_enabled":    strconv.FormatBool(in.InviteEnabled),
-		"credits.invite_reward":     strconv.Itoa(in.InviteReward),
+		"credits.checkin_enabled":    strconv.FormatBool(in.CheckinEnabled),
+		"credits.checkin_reward":     strconv.Itoa(in.CheckinReward),
+		"credits.invite_enabled":     strconv.FormatBool(in.InviteEnabled),
+		"credits.invite_reward":      strconv.Itoa(in.InviteReward),
 		"credits.cdk_redeem_enabled": strconv.FormatBool(in.CDKRedeemEnabled),
 	}); err != nil {
 		return nil, err
@@ -446,7 +448,7 @@ func (s *AppSettingsService) SaveLogs(ctx context.Context, days int) (*Retention
 		return nil, err
 	}
 	if s.events != nil {
-		_, _ = s.events.PurgeOlderThan(ctx, time.Duration(days)*24*time.Hour)
+		_, _ = s.events.PurgeOlderThan(ctx, time.Duration(days)*24*time.Hour, time.Duration(s.apiMediaRetentionDays)*24*time.Hour)
 	}
 	return s.Logs(ctx)
 }
@@ -555,6 +557,11 @@ func (s *AppSettingsService) pruneGeneratedFiles(ctx context.Context, maxAge tim
 	var freed int64
 	var clearedKeys []string
 	for _, o := range objs {
+		// API artifacts have their own environment-controlled retention window.
+		// Changing the website gallery setting must not shorten API availability.
+		if strings.HasPrefix(strings.TrimLeft(o.Key, "/"), "api/") {
+			continue
+		}
 		if !o.LastModified.Before(cutoff) {
 			continue
 		}
